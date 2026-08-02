@@ -346,6 +346,16 @@ pub struct MarkdownMedia {
     /// Pending `#d/#t/#e/#n` pill: kind plus accumulated text.
     #[rust]
     pill: Option<(PillKind, String)>,
+    /// Incremented whenever `body` changes, so the parse cache below can be
+    /// reused across frames without comparing strings.
+    #[rust]
+    body_version: u64,
+    /// Owned pulldown-cmark event stream (plus the body version it was parsed
+    /// from) for the current body. Cards inside a panning canvas re-draw every
+    /// frame; caching the parse turns the per-frame cost into a fast owned-vec
+    /// iteration.
+    #[rust]
+    cached_events: Option<(u64, Vec<MdEvent<'static>>)>,
     #[live(false)]
     use_math_widget: bool,
     #[rust]
@@ -385,6 +395,7 @@ impl Widget for MarkdownMedia {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         if self.body.as_ref() != v {
             self.body.set(v);
+            self.body_version += 1;
             self.redraw(cx);
         }
     }
@@ -401,12 +412,21 @@ impl MarkdownMedia {
         let mut table_alignments: Vec<Alignment> = Vec::new();
         let mut table_cell_index: usize = 0;
 
-        let parser = Parser::new_ext(
-            self.body.as_ref(),
-            Options::ENABLE_TABLES | Options::ENABLE_MATH,
-        );
+        // Parse once per body version; later frames reuse the owned event
+        // list (still re-dispatched every frame — the canvas redraws all
+        // children each pass — but the pulldown parse is skipped).
+        let events: Vec<MdEvent<'static>> = match self.cached_events.take() {
+            Some((version, events)) if version == self.body_version => events,
+            _ => Parser::new_ext(
+                self.body.as_ref(),
+                Options::ENABLE_TABLES | Options::ENABLE_MATH,
+            )
+            .into_iter()
+            .map(|e| e.into_static())
+            .collect(),
+        };
 
-        for event in parser.into_iter() {
+        for event in &events {
             match event {
                 MdEvent::Start(Tag::Heading { level, .. }) => {
                     if !is_first_block {
@@ -452,8 +472,8 @@ impl MarkdownMedia {
                 }
                 MdEvent::Start(Tag::List(first_number)) => {
                     list_stack.push(ListState {
-                        start_number: first_number,
-                        current_number: first_number.unwrap_or(1),
+                        start_number: *first_number,
+                        current_number: (*first_number).unwrap_or(1),
                     });
                 }
                 MdEvent::End(TagEnd::List(_is_ordered)) => {
@@ -503,7 +523,7 @@ impl MarkdownMedia {
                 MdEvent::Start(Tag::Link { dest_url, .. }) => {
                     self.auto_id += 1;
                     let item = tf.item(cx, LiveId(self.auto_id), live_id!(link));
-                    item.as_markdown_media_link().set_href(&dest_url);
+                    item.as_markdown_media_link().set_href(dest_url);
                     item.draw_all_unscoped(cx);
                 }
                 MdEvent::End(TagEnd::Link) => {
@@ -514,10 +534,10 @@ impl MarkdownMedia {
                 }) => {
                     self.auto_id += 1;
                     let base_dir = self.base_dir.clone();
-                    let url = dest_url.clone();
+                    let url = dest_url.as_ref();
                     let item = tf.item(cx, LiveId(self.auto_id), live_id!(image));
                     if let Some(base_dir) = &base_dir {
-                        let path = base_dir.join(&*url);
+                        let path = base_dir.join(url);
                         if path.exists() {
                             if url.to_lowercase().ends_with(".svg") {
                                 let data = self
@@ -538,7 +558,7 @@ impl MarkdownMedia {
                                     .load_image_file_by_path_async(cx, &path);
                             }
                         } else {
-                            let _ = item.as_image().load_image_http_by_url_async(cx, &url);
+                            let _ = item.as_image().load_image_http_by_url_async(cx, url);
                         }
                     }
                     item.draw_all(cx, &mut Scope::empty());
@@ -550,7 +570,7 @@ impl MarkdownMedia {
                     }
                     is_first_block = false;
                     // Check if this is a runsplash block
-                    let is_runsplash = matches!(&kind, CodeBlockKind::Fenced(lang) if lang.as_ref() == "runsplash");
+                    let is_runsplash = matches!(kind, CodeBlockKind::Fenced(lang) if lang.as_ref() == "runsplash");
                     if is_runsplash {
                         self.in_splash_block = true;
                         self.splash_block_string.clear();
@@ -609,7 +629,7 @@ impl MarkdownMedia {
                     tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
                     tf.fixed.push();
                     tf.inline_code.push();
-                    tf.draw_text(cx, &text);
+                    tf.draw_text(cx, text);
                     tf.font_sizes.pop();
                     tf.fixed.pop();
                     tf.inline_code.pop();
@@ -619,7 +639,7 @@ impl MarkdownMedia {
                     if self.use_math_widget {
                         let entry_id = tf.new_counted_id();
                         tf.item_with(cx, entry_id, live_id!(inline_math), |cx, item, _tf| {
-                            item.set_text(cx, &text);
+                            item.set_text(cx, text);
                             item.draw_all_unscoped(cx);
                         });
                     } else {
@@ -628,7 +648,7 @@ impl MarkdownMedia {
                         tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
                         tf.fixed.push();
                         tf.inline_code.push();
-                        tf.draw_text(cx, &text);
+                        tf.draw_text(cx, text);
                         tf.font_sizes.pop();
                         tf.fixed.pop();
                         tf.inline_code.pop();
@@ -644,23 +664,23 @@ impl MarkdownMedia {
                     if self.use_math_widget {
                         let entry_id = tf.new_counted_id();
                         tf.item_with(cx, entry_id, live_id!(display_math), |cx, item, _tf| {
-                            item.set_text(cx, &text);
+                            item.set_text(cx, text);
                             item.draw_all_unscoped(cx);
                         });
                     } else {
                         // Fallback: render as code block style
                         tf.begin_code(cx);
                         tf.fixed.push();
-                        tf.draw_text(cx, &text);
+                        tf.draw_text(cx, text);
                         tf.fixed.pop();
                         tf.end_code(cx);
                     }
                 }
                 MdEvent::Text(text) => {
                     if self.in_splash_block {
-                        self.splash_block_string.push_str(&text);
+                        self.splash_block_string.push_str(text);
                     } else if self.in_code_block {
-                        self.code_block_string.push_str(&text);
+                        self.code_block_string.push_str(text);
                     } else {
                         let text = text.trim_end_matches("\n");
                         for (kind, seg) in scan_pills(text) {
@@ -718,7 +738,7 @@ impl MarkdownMedia {
                     }
                     is_first_block = false;
                     tf.begin_table(cx, alignments.len());
-                    table_alignments = alignments;
+                    table_alignments = alignments.to_vec();
                     table_cell_index = 0;
                 }
                 MdEvent::End(TagEnd::Table) => {
@@ -787,6 +807,9 @@ impl MarkdownMedia {
                 _ => {} // Unimplemented or unnecessary events
             }
         }
+
+        // Put the event list back for the next frame.
+        self.cached_events = Some((self.body_version, events));
     }
 }
 
@@ -990,5 +1013,17 @@ mod tests {
         assert_eq!(scan_pills("#data"), vec![(None, "#data")]);
         assert_eq!(scan_pills("x #d"), vec![(None, "x ")]);
         assert_eq!(scan_pills("#t#e"), vec![(None, "#t")]);
+    }
+
+    #[test]
+    fn parse_cache_roundtrip_preserves_events() {
+        // The cached owned event stream must match a fresh parse exactly.
+        let src = "#d 描述 **加粗** `x` [链接](https://x)\n\n- 列表\n- 二\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+        let options = Options::ENABLE_TABLES | Options::ENABLE_MATH;
+        let owned: Vec<MdEvent<'static>> =
+            Parser::new_ext(src, options).into_iter().map(|e| e.into_static()).collect();
+        let reparsed: Vec<MdEvent<'static>> =
+            Parser::new_ext(src, options).into_iter().map(|e| e.into_static()).collect();
+        assert_eq!(owned, reparsed);
     }
 }

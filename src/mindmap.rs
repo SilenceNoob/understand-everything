@@ -424,6 +424,12 @@ pub struct MindMap {
     #[rust]
     editing_card: Option<usize>,
 
+    /// World-space viewport rect, cached from the last draw pass (mirrors the
+    /// card culling in draw_walk). Used by the event path to skip off-screen
+    /// cards cheaply.
+    #[rust]
+    view_rect: Rect,
+
     #[rust]
     card_template: Option<ScriptObjectRef>,
     #[rust]
@@ -551,6 +557,7 @@ impl Widget for MindMap {
                 pos: (view.pos - self.pan) / self.zoom,
                 size: view.size / self.zoom,
             };
+            self.view_rect = local_view;
             cx2d.push_clip_rect(local_view);
 
             let edges: Vec<(usize, usize)> = self
@@ -576,6 +583,9 @@ impl Widget for MindMap {
                     pos: dvec2(min_x, min_y),
                     size: dvec2(max_x - min_x, max_y - min_y),
                 };
+                if !local_view.intersects(rect) {
+                    continue;
+                }
                 let edge = &mut self.edges[ei];
                 let to_local = |p: DVec2| {
                     vec2(
@@ -704,8 +714,14 @@ impl Widget for MindMap {
         // button; animator_cut is instant and needs no frame ticks.
         if let Some(local) = &local_event {
             if !cx.fingers.any_areas_captured() {
-                let mut reset_visible_buttons = |cx: &mut Cx, over: Option<DVec2>| {
-                    for card in &self.cards {
+                let reset_visible_buttons = |cx: &mut Cx, over: Option<DVec2>| {
+                    for i in 0..self.cards.len() {
+                        // Only on-screen cards can hold a stale hover: the
+                        // cursor must be in the viewport to hover a button.
+                        if !self.view_rect.intersects(self.card_rect(i)) {
+                            continue;
+                        }
+                        let card = &self.cards[i];
                         for id in [ids!(edit_btn), ids!(done_btn)] {
                             let btn = card.button(cx, id);
                             if !btn.visible() {
