@@ -222,7 +222,13 @@ script_mod! {
             padding: Inset{left: 14 right: 10}
             draw_bg +: {
                 color: #1d2129
-                border_radius: 10.0
+
+                pixel: fn() {
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.box_y(0. 0. self.rect_size.x self.rect_size.y 10.0 0.0)
+                    sdf.fill(self.color)
+                    return sdf.result
+                }
             }
             title_box := mod.widgets.View{
                 width: Fill
