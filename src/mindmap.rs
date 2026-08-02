@@ -1,6 +1,6 @@
 use makepad_widgets::*;
 use crate::markdown_media::MarkdownMediaWidgetRefExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const CARD_W: f64 = 360.0;
@@ -18,12 +18,12 @@ const RESIZE_BOTTOM: u8 = 8;
 // centered title only (see CardTemplate's compact_title layer).
 const COMPACT_ZOOM: f64 = 0.6;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct MapFile {
     nodes: Vec<MapNodeFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct MapNodeFile {
     id: String,
     title: String,
@@ -175,6 +175,33 @@ script_mod! {
         }
     }
 
+    // Style type for the card edit/done buttons. The draw_bg overrides live
+    // at TYPE level (like the theme colors) so card clones from
+    // script_from_value get them on the first frame; instance-level uniform
+    // overrides are lost until the first animator apply (the "wrong color
+    // until hover" bug).
+    let CardIconButton = mod.widgets.ButtonFlatIcon{
+        padding: Inset{left: 3, right: 3, top: 3, bottom: 3}
+        margin: 0
+        draw_bg +: {
+            color: #232834
+            color_hover: #2a3140
+            color_down: #2a3140
+            color_focus: #232834
+            border_size: uniform(0.0)
+        }
+        // ponytail: hover.off animates 0.1s via NextFrame events, which stop
+        // firing when the mouse stops moving on X11 (Paint-driven), leaving
+        // the button stuck at the hover color. Snap applies instantly.
+        animator +: {
+            hover: {
+                off: {
+                    from: {all: Snap}
+                }
+            }
+        }
+    }
+
     let CardTemplate = mod.widgets.RoundedView{
         width: 360
         height: 520
@@ -183,24 +210,54 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             color: #232834
-            border_radius: 6.0
+            border_radius: 10.0
             border_size: 1.0
             border_color: #ffffff1a
         }
-        header := mod.widgets.View{
+        header := mod.widgets.RoundedView{
             height: 44
             flow: Right
             align: Align{y: 0.5}
+            spacing: 8
             padding: Inset{left: 14 right: 10}
-            show_bg: true
             draw_bg +: {
                 color: #1d2129
+                border_radius: 10.0
             }
-            title := mod.widgets.Label{
+            title_box := mod.widgets.View{
                 width: Fill
-                text: ""
-                draw_text.text_style.font_size: 15.0
-                draw_text.color: #e6e9f0
+                height: Fit
+                title := mod.widgets.Label{
+                    width: Fill
+                    text: ""
+                    draw_text.text_style.font_size: 15.0
+                    draw_text.color: #e6e9f0
+                }
+            }
+            title_edit_box := mod.widgets.View{
+                width: Fill
+                height: Fit
+                visible: false
+                title_edit := mod.widgets.TextInput{
+                    width: Fill
+                    height: Fit
+                    empty_text: ""
+                }
+            }
+            edit_btn := CardIconButton{
+                draw_icon +: {
+                    svg: crate_resource("self:resources/pen.svg")
+                    color: #e6e9f0
+                }
+                icon_walk: Walk{width: 9, height: 9}
+            }
+            done_btn := CardIconButton{
+                visible: false
+                draw_icon +: {
+                    svg: crate_resource("self:resources/book.svg")
+                    color: #e6e9f0
+                }
+                icon_walk: Walk{width: 9, height: 9}
             }
         }
         body := mod.widgets.ScrollYView{
@@ -209,10 +266,25 @@ script_mod! {
             // ponytail: makepad clips only rectangularly; keep content 8px
             // off the bottom so code blocks/images never poke past the
             // 6px rounded corners (markdown adds 4px more).
-            margin: Inset{bottom: 8}
-            markdown := mod.widgets.MarkdownMedia{
+            margin: Inset{bottom: 12}
+            read_view := mod.widgets.View{
                 width: Fill
                 height: Fit
+                markdown := mod.widgets.MarkdownMedia{
+                    width: Fill
+                    height: Fit
+                }
+            }
+            edit_view := mod.widgets.View{
+                width: Fill
+                height: Fill
+                visible: false
+                body_edit := mod.widgets.TextInput{
+                    width: Fill
+                    height: Fill
+                    is_multiline: true
+                    empty_text: ""
+                }
             }
         }
         compact_title := mod.widgets.View{
@@ -343,6 +415,8 @@ pub struct MindMap {
     drag_grab: DVec2,
     #[rust]
     resize_card: Option<(usize, u8)>,
+    #[rust]
+    editing_card: Option<usize>,
 
     #[rust]
     card_template: Option<ScriptObjectRef>,
@@ -528,10 +602,20 @@ impl Widget for MindMap {
                 }
                 let card = self.card_ref(cx2d, i);
                 // set_visible no-ops when the state is unchanged, so calling
-                // it every frame is free outside the zoom threshold.
+                // it every frame is free outside the zoom threshold. Only
+                // View implements set_visible, so every toggle target below
+                // is wrapped in a View.
                 card.view(cx2d, ids!(header)).set_visible(cx2d, !compact);
                 card.view(cx2d, ids!(body)).set_visible(cx2d, !compact);
                 card.view(cx2d, ids!(compact_title)).set_visible(cx2d, compact);
+                // edit mode swaps the read-only render for text inputs
+                let editing = self.editing_card == Some(i);
+                card.view(cx2d, ids!(title_box)).set_visible(cx2d, !editing);
+                card.view(cx2d, ids!(title_edit_box)).set_visible(cx2d, editing);
+                card.view(cx2d, ids!(read_view)).set_visible(cx2d, !editing);
+                card.view(cx2d, ids!(edit_view)).set_visible(cx2d, editing);
+                card.button(cx2d, ids!(edit_btn)).set_visible(cx2d, !editing);
+                card.button(cx2d, ids!(done_btn)).set_visible(cx2d, editing);
                 let _ = card.draw_walk(
                     cx2d,
                     scope,
@@ -581,10 +665,65 @@ impl Widget for MindMap {
             self.detail_open = None;
             self.redraw(cx);
         }
+        if let Event::Actions(actions) = event {
+            let clicked: Vec<usize> = self
+                .cards
+                .iter()
+                .enumerate()
+                .filter(|(_, card)| {
+                    card.button(cx, ids!(edit_btn)).clicked(actions)
+                        || card.button(cx, ids!(done_btn)).clicked(actions)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for i in clicked {
+                if self.editing_card == Some(i) {
+                    self.commit_edit(cx);
+                } else {
+                    self.enter_edit(cx, i);
+                }
+            }
+        }
         let local_event = self.remap_event(event);
         let card_event = local_event.as_ref().unwrap_or(event);
         for card in &self.cards {
             card.handle_event(cx, card_event, scope);
+        }
+
+        // ponytail: canvas buttons get no reliable FingerHoverOut — hover
+        // tracking is one shared slot that our own area overwrites every
+        // MouseMove, and the base hover.off animation only advances on
+        // NextFrame (Paint-driven, stops when the mouse is still). Snap the
+        // hover off ourselves whenever the pointer is outside a visible
+        // button; animator_cut is instant and needs no frame ticks.
+        if let Some(local) = &local_event {
+            if !cx.fingers.any_areas_captured() {
+                let mut reset_visible_buttons = |cx: &mut Cx, over: Option<DVec2>| {
+                    for card in &self.cards {
+                        for id in [ids!(edit_btn), ids!(done_btn)] {
+                            let btn = card.button(cx, id);
+                            if !btn.visible() {
+                                continue;
+                            }
+                            if let Some(p) = over {
+                                if btn.area().rect(cx).contains(p) {
+                                    continue;
+                                }
+                            }
+                            btn.reset_hover(cx);
+                        }
+                    }
+                };
+                match local {
+                    Event::MouseMove(e) => {
+                        reset_visible_buttons(cx, Some(e.abs));
+                    }
+                    Event::MouseLeave(_) => {
+                        reset_visible_buttons(cx, None);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Snapshot before event.hits(self.area) below captures the digit to our own
@@ -596,15 +735,21 @@ impl Widget for MindMap {
                 if self.detail_open.is_none() {
                     let world = (fe.abs - self.pan) / self.zoom;
                     if let Some((i, dir)) = self.resize_hit(world) {
-                        self.selected = Some(i);
-                        self.resize_card = Some((i, dir));
-                        self.redraw(cx);
+                        // layout ops are disabled while a card is being edited
+                        if self.editing_card.is_none() {
+                            self.selected = Some(i);
+                            self.resize_card = Some((i, dir));
+                            self.redraw(cx);
+                        }
                     } else if let Some(i) = self.hit_card(world) {
                         self.selected = Some(i);
                         if fe.tap_count >= 2 {
+                            if self.editing_card.is_some() {
+                                self.commit_edit(cx);
+                            }
                             self.detail_open = Some(i);
                             self.ensure_detail(cx);
-                        } else if !child_grabbed {
+                        } else if !child_grabbed && self.editing_card.is_none() {
                             // no card-internal widget (scrollbar, link) grabbed the press
                             self.drag_card = Some(i);
                             self.drag_grab = world - self.data.as_ref().unwrap().nodes[i].pos;
@@ -828,6 +973,116 @@ impl MindMap {
         }
         self.cards.push(w.clone());
         w
+    }
+
+    fn enter_edit(&mut self, cx: &mut Cx, i: usize) {
+        if self.editing_card.is_some() && self.editing_card != Some(i) {
+            self.commit_edit(cx);
+        }
+        if self.editing_card == Some(i) {
+            return;
+        }
+        let Some(card) = self.cards.get(i).cloned() else {
+            return;
+        };
+        let node = self.data.as_ref().unwrap().nodes[i].clone();
+        card.text_input(cx, ids!(title_edit)).set_text(cx, &node.title);
+        card.text_input(cx, ids!(body_edit)).set_text(cx, &node.body);
+        card.button(cx, ids!(edit_btn)).reset_hover(cx);
+        card.button(cx, ids!(done_btn)).reset_hover(cx);
+        self.editing_card = Some(i);
+        self.redraw(cx);
+    }
+
+    fn commit_edit(&mut self, cx: &mut Cx) {
+        let Some(i) = self.editing_card.take() else {
+            return;
+        };
+        let Some(card) = self.cards.get(i).cloned() else {
+            return;
+        };
+        let new_title = card.text_input(cx, ids!(title_edit)).text();
+        let new_body = card.text_input(cx, ids!(body_edit)).text();
+        let mut title_changed = false;
+        if let Some(data) = &mut self.data {
+            let node = &mut data.nodes[i];
+            title_changed = new_title != node.title;
+            node.title = new_title;
+            node.body = new_body;
+            if let Err(e) = std::fs::write(&node.path, &node.body) {
+                log!("mindmap: save {} failed: {e}", node.path.display());
+            }
+            let title = node.title.clone();
+            let body = node.body.clone();
+            card.label(cx, ids!(title)).set_text(cx, &title);
+            card.label(cx, ids!(compact_label)).set_text(cx, &title);
+            card.markdown_media(cx, ids!(markdown)).set_text(cx, &body);
+        }
+        if title_changed {
+            self.save_map();
+        }
+        self.redraw(cx);
+    }
+
+    fn save_map(&self) {
+        let Some(data) = &self.data else {
+            return;
+        };
+        write_map(&app_base_dir(), data);
+    }
+}
+
+fn write_map(base: &Path, data: &MindMapData) {
+    let nodes = data
+        .nodes
+        .iter()
+        .map(|n| MapNodeFile {
+            id: n.id.clone(),
+            title: n.title.clone(),
+            path: n
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            children: if n.children.is_empty() {
+                None
+            } else {
+                Some(n.children.iter().map(|&c| data.nodes[c].id.clone()).collect())
+            },
+        })
+        .collect();
+    let map = MapFile { nodes };
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(base.join("map.json"), json) {
+            log!("mindmap: save map.json failed: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_write_reload_preserves_title_and_children() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        std::fs::write(
+            dir.join("map.json"),
+            r#"{"nodes":[{"id":"root","title":"Rust","path":"a.md","children":["child"]},{"id":"child","title":"","path":"a.md","children":null}]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load(&dir).unwrap();
+        assert_eq!(data.nodes[0].title, "Rust");
+        data.nodes[0].title = "Rust2".into();
+        write_map(&dir, &data);
+        let again = MindMapData::load(&dir).unwrap();
+        assert_eq!(again.nodes[0].title, "Rust2");
+        assert_eq!(again.nodes[0].children, vec![1]);
+        assert_eq!(again.nodes[1].children, Vec::<usize>::new());
+        assert_eq!(again.nodes[0].body, "hello");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

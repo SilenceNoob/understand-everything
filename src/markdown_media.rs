@@ -198,6 +198,118 @@ script_mod! {
             fit: ImageFit.Horizontal
             margin: Inset{top: 4, bottom: 4}
         }
+
+        pill_d := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            align: Align{y: 0.5}
+            spacing: 3
+            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #2a3f66
+                border_radius: 5.0
+                border_size: 1.0
+                border_color: #3b82f680
+            }
+            icon := mod.widgets.Icon{
+                icon_walk: Walk{width: 9, height: 9}
+                draw_icon +: {
+                    svg: crate_resource("self:resources/book.svg")
+                    color: #93c5fd
+                }
+            }
+            label := mod.widgets.Label{
+                draw_text.text_style.font_size: 9.5
+                draw_text.color: #93c5fd
+            }
+        }
+
+        pill_t := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            align: Align{y: 0.5}
+            spacing: 3
+            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #55491f
+                border_radius: 5.0
+                border_size: 1.0
+                border_color: #eab30880
+            }
+            icon := mod.widgets.Icon{
+                icon_walk: Walk{width: 9, height: 9}
+                draw_icon +: {
+                    svg: crate_resource("self:resources/pill-t.svg")
+                    color: #fde047
+                }
+            }
+            label := mod.widgets.Label{
+                draw_text.text_style.font_size: 9.5
+                draw_text.color: #fde047
+            }
+        }
+
+        pill_e := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            align: Align{y: 0.5}
+            spacing: 3
+            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #5c2f35
+                border_radius: 5.0
+                border_size: 1.0
+                border_color: #ef444480
+            }
+            icon := mod.widgets.Icon{
+                icon_walk: Walk{width: 9, height: 9}
+                draw_icon +: {
+                    svg: crate_resource("self:resources/pill-e.svg")
+                    color: #fca5a5
+                }
+            }
+            label := mod.widgets.Label{
+                draw_text.text_style.font_size: 9.5
+                draw_text.color: #fca5a5
+            }
+        }
+
+        pill_n := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            align: Align{y: 0.5}
+            spacing: 3
+            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #3a4150
+                border_radius: 5.0
+                border_size: 1.0
+                border_color: #94a3b880
+            }
+            icon := mod.widgets.Icon{
+                icon_walk: Walk{width: 9, height: 9}
+                draw_icon +: {
+                    svg: crate_resource("self:resources/pill-n.svg")
+                    color: #cbd5e1
+                }
+            }
+            label := mod.widgets.Label{
+                draw_text.text_style.font_size: 9.5
+                draw_text.color: #cbd5e1
+            }
+        }
     }
 }
 
@@ -231,6 +343,9 @@ pub struct MarkdownMedia {
     in_splash_block: bool,
     #[rust]
     splash_block_string: String,
+    /// Pending `#d/#t/#e/#n` pill: kind plus accumulated text.
+    #[rust]
+    pill: Option<(PillKind, String)>,
     #[live(false)]
     use_math_widget: bool,
     #[rust]
@@ -311,6 +426,7 @@ impl MarkdownMedia {
                     tf.bold.push();
                 }
                 MdEvent::End(TagEnd::Heading(_level)) => {
+                    flush_pill(tf, cx, &mut self.pill);
                     tf.bold.pop();
                     tf.font_sizes.pop();
                     tf.new_line_collapsed(cx);
@@ -322,7 +438,7 @@ impl MarkdownMedia {
                     is_first_block = false;
                 }
                 MdEvent::End(TagEnd::Paragraph) => {
-                    // No special handling needed, turtle position is managed by content/following blocks
+                    flush_pill(tf, cx, &mut self.pill);
                 }
                 MdEvent::Start(Tag::BlockQuote(_)) => {
                     if !is_first_block {
@@ -546,7 +662,22 @@ impl MarkdownMedia {
                     } else if self.in_code_block {
                         self.code_block_string.push_str(&text);
                     } else {
-                        tf.draw_text(cx, &text.trim_end_matches("\n"));
+                        let text = text.trim_end_matches("\n");
+                        for (kind, seg) in scan_pills(text) {
+                            match kind {
+                                Some(kind) => {
+                                    flush_pill(tf, cx, &mut self.pill);
+                                    self.pill = Some((kind, seg.to_string()));
+                                }
+                                None => {
+                                    if let Some((_, pill_text)) = &mut self.pill {
+                                        pill_text.push_str(seg);
+                                    } else {
+                                        tf.draw_text(cx, seg);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 MdEvent::SoftBreak => {
@@ -554,6 +685,8 @@ impl MarkdownMedia {
                         self.splash_block_string.push('\n');
                     } else if self.in_code_block {
                         self.code_block_string.push('\n');
+                    } else if let Some((_, pill_text)) = &mut self.pill {
+                        pill_text.push(' ');
                     } else {
                         tf.draw_text(cx, " ");
                     }
@@ -564,6 +697,7 @@ impl MarkdownMedia {
                     } else if self.in_code_block {
                         self.code_block_string.push('\n');
                     } else {
+                        flush_pill(tf, cx, &mut self.pill);
                         tf.new_line_collapsed(cx);
                     }
                 }
@@ -622,6 +756,7 @@ impl MarkdownMedia {
                     if tf.in_table_header {
                         tf.bold.pop();
                     }
+                    flush_pill(tf, cx, &mut self.pill);
                     tf.end_table_cell(cx);
                     table_cell_index += 1;
                 }
@@ -661,6 +796,84 @@ fn alignment_to_x(alignment: &Alignment) -> f64 {
         Alignment::None | Alignment::Left => 0.0,
         Alignment::Center => 0.5,
         Alignment::Right => 1.0,
+    }
+}
+
+/// The kind of a `#d/#t/#e/#n` pill tag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PillKind {
+    /// `#d` — 描述, blue.
+    Desc,
+    /// `#t` — 迁移, yellow.
+    Move,
+    /// `#e` — 例子, red.
+    Example,
+    /// `#n` — 作用, gray.
+    Effect,
+}
+
+/// Splits a text run into plain-text and pill segments. A `#x` token
+/// (`x` in d/t/e/n) starts a pill that extends to the next token or the
+/// end of the run. A token is only recognized when not followed by an
+/// ASCII alphanumeric or `#`, so `#data`/`##d` don't match.
+fn scan_pills(text: &str) -> Vec<(Option<PillKind>, &str)> {
+    let mut out: Vec<(Option<PillKind>, &str)> = Vec::new();
+    let mut region: Option<PillKind> = None;
+    let mut region_start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'#' {
+            let kind = match bytes[i + 1] {
+                b'd' => Some(PillKind::Desc),
+                b't' => Some(PillKind::Move),
+                b'e' => Some(PillKind::Example),
+                b'n' => Some(PillKind::Effect),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let after = bytes.get(i + 2).copied().unwrap_or(0);
+                if !after.is_ascii_alphanumeric() && after != b'#' {
+                    if region_start < i {
+                        out.push((region, &text[region_start..i]));
+                    }
+                    region = Some(kind);
+                    region_start = i + 2;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if region_start < text.len() {
+        out.push((region, &text[region_start..]));
+    }
+    out
+}
+
+/// Draws a pill widget for `text` into the text flow.
+fn draw_pill(tf: &mut TextFlow, cx: &mut Cx2d, kind: PillKind, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let template = match kind {
+        PillKind::Desc => live_id!(pill_d),
+        PillKind::Move => live_id!(pill_t),
+        PillKind::Example => live_id!(pill_e),
+        PillKind::Effect => live_id!(pill_n),
+    };
+    let entry_id = tf.new_counted_id();
+    tf.item_with(cx, entry_id, template, |cx, item, _tf| {
+        item.widget(cx, ids!(label)).set_text(cx, text);
+        item.draw_all_unscoped(cx);
+    });
+}
+
+/// Flushes a pending pill (if any) into the text flow.
+fn flush_pill(tf: &mut TextFlow, cx: &mut Cx2d, pill: &mut Option<(PillKind, String)>) {
+    if let Some((kind, text)) = pill.take() {
+        draw_pill(tf, cx, kind, &text);
     }
 }
 
@@ -734,4 +947,48 @@ pub enum MarkdownAction {
     #[default]
     None,
     LinkNavigated(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_pills_basic() {
+        assert_eq!(
+            scan_pills("#d 描述文字 #e 例子文字"),
+            vec![
+                (Some(PillKind::Desc), " 描述文字 "),
+                (Some(PillKind::Example), " 例子文字"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_pills_all_kinds_and_plain() {
+        assert_eq!(
+            scan_pills("前置 #d 一 #t 二 #n 三 #e 四 后置"),
+            vec![
+                (None, "前置 "),
+                (Some(PillKind::Desc), " 一 "),
+                (Some(PillKind::Move), " 二 "),
+                (Some(PillKind::Effect), " 三 "),
+                (Some(PillKind::Example), " 四 后置"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_pills_no_tokens() {
+        assert_eq!(scan_pills("普通文本"), vec![(None, "普通文本")]);
+    }
+
+    #[test]
+    fn scan_pills_boundaries() {
+        // Alphanumeric right after the token: no match. `##` blocks the
+        // first token; a trailing token with no text draws nothing.
+        assert_eq!(scan_pills("#data"), vec![(None, "#data")]);
+        assert_eq!(scan_pills("x #d"), vec![(None, "x ")]);
+        assert_eq!(scan_pills("#t#e"), vec![(None, "#t")]);
+    }
 }
