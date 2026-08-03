@@ -194,12 +194,19 @@ script_mod! {
         p3: uniform(vec2(0.0, 0.0))
         p4: uniform(vec2(0.0, 0.0))
 
+        // Cubic bezier from p1 (parent's right edge) to p4 (child's left
+        // edge) with horizontal-tangent control points p2/p3, tessellated
+        // into 24 segments in the shader so the connector is a smooth S-curve.
         pixel: fn() {
             let sdf = Sdf2d.viewport(self.pos * self.rect_size)
             sdf.move_to(self.p1.x * self.rect_size.x self.p1.y * self.rect_size.y)
-            sdf.line_to(self.p2.x * self.rect_size.x self.p2.y * self.rect_size.y)
-            sdf.line_to(self.p3.x * self.rect_size.x self.p3.y * self.rect_size.y)
-            sdf.line_to(self.p4.x * self.rect_size.x self.p4.y * self.rect_size.y)
+            for i in 1..25 {
+                let t = f32(i) * (1.0 / 24.0)
+                let mt = 1.0 - t
+                let x = mt*mt*mt*self.p1.x + 3.0*mt*mt*t*self.p2.x + 3.0*mt*t*t*self.p3.x + t*t*t*self.p4.x
+                let y = mt*mt*mt*self.p1.y + 3.0*mt*mt*t*self.p2.y + 3.0*mt*t*t*self.p3.y + t*t*t*self.p4.y
+                sdf.line_to(x * self.rect_size.x y * self.rect_size.y)
+            }
             sdf.stroke(self.line_color self.line_width)
         }
     }
@@ -519,6 +526,13 @@ pub struct MindMap {
     /// Held navigation keys, bitmask: W=1 A=2 S=4 D=8 Q=16 E=32.
     #[rust]
     key_move: u8,
+    /// Held arrow keys, bitmask: Up=1 Down=2 Left=4 Right=8. Moves the
+    /// selected cards toward `card_targets` (see set_arrow_move).
+    #[rust]
+    arrow_move: u8,
+    /// Interpolation targets for the selected cards' positions.
+    #[rust]
+    card_targets: Vec<(usize, DVec2)>,
     #[rust]
     panning: bool,
     #[rust]
@@ -703,13 +717,17 @@ impl Widget for MindMap {
                 let c_rect = self.card_rect(c);
                 let p1 = p_rect.pos + dvec2(p_rect.size.x, p_rect.size.y * 0.5);
                 let p4 = c_rect.pos + dvec2(0.0, c_rect.size.y * 0.5);
-                let mid_x = (p1.x + p4.x) * 0.5;
-                let p2 = dvec2(mid_x, p1.y);
-                let p3 = dvec2(mid_x, p4.y);
-                let min_x = p1.x.min(p4.x).min(mid_x) - 4.0;
-                let max_x = p1.x.max(p4.x).max(mid_x) + 4.0;
-                let min_y = p1.y.min(p4.y).min(p2.y).min(p3.y) - 4.0;
-                let max_y = p1.y.max(p4.y).max(p2.y).max(p3.y) + 4.0;
+                // Horizontal-tangent bezier control points; clamped so short
+                // links (cards dragged close together) don't get a sharp kink.
+                let reach = ((p4.x - p1.x).abs() * 0.5).clamp(60.0, 220.0);
+                let p2 = p1 + dvec2(reach, 0.0);
+                let p3 = p4 - dvec2(reach, 0.0);
+                // The curve stays inside the control points' convex hull, so
+                // the bbox over all four points always covers it.
+                let min_x = p1.x.min(p2.x).min(p3.x).min(p4.x) - 4.0;
+                let max_x = p1.x.max(p2.x).max(p3.x).max(p4.x) + 4.0;
+                let min_y = p1.y.min(p2.y).min(p3.y).min(p4.y) - 4.0;
+                let max_y = p1.y.max(p2.y).max(p3.y).max(p4.y) + 4.0;
                 let rect = Rect {
                     pos: dvec2(min_x, min_y),
                     size: dvec2(max_x - min_x, max_y - min_y),
@@ -838,12 +856,16 @@ impl Widget for MindMap {
             match event {
                 Event::KeyDown(ke) => {
                     if ke.key_code == KeyCode::Space && !ke.is_repeat {
-                        self.select_view_center(cx);
+                        self.select_view_center(cx, ke.modifiers.shift);
                     } else {
                         self.set_key_move(ke.key_code, true, cx);
+                        self.set_arrow_move(ke.key_code, true, cx);
                     }
                 }
-                Event::KeyUp(ke) => self.set_key_move(ke.key_code, false, cx),
+                Event::KeyUp(ke) => {
+                    self.set_key_move(ke.key_code, false, cx);
+                    self.set_arrow_move(ke.key_code, false, cx);
+                }
                 _ => {}
             }
         }
@@ -956,6 +978,7 @@ impl Widget for MindMap {
                             // selected card, so dragging moves them all
                             if !self.selected.contains(&i) {
                                 self.selected = vec![i];
+                                self.reanchor_cards(cx);
                             }
                             if fe.tap_count >= 2 {
                                 if self.editing_card.is_some() {
@@ -1045,6 +1068,7 @@ impl Widget for MindMap {
                 self.drag_card = None;
                 self.resize_card = None;
                 self.mm_dragging = false;
+                self.rebuild_card_targets();
                 if let Some((s, e)) = self.marquee.take() {
                     // commit the selection: every card whose rect touches the
                     // marquee; a tiny box (mis-click) clears the selection
@@ -1059,6 +1083,7 @@ impl Widget for MindMap {
                             .filter(|&i| rect.intersects(self.card_rect(i)))
                             .collect();
                     }
+                    self.reanchor_cards(cx);
                     self.redraw(cx);
                 }
             }
@@ -1120,14 +1145,46 @@ impl MindMap {
                 self.pan_target = self.pan + wc * (self.zoom - self.zoom_target);
             }
         }
+        // Arrow keys: advance the selected cards' targets (screen-constant
+        // speed, like WASD), then ease every card toward its target.
+        if self.arrow_move != 0 {
+            let dir = dvec2(
+                ((self.arrow_move >> 3) & 1) as f64 - ((self.arrow_move >> 2) & 1) as f64, // Right - Left
+                ((self.arrow_move >> 1) & 1) as f64 - (self.arrow_move & 1) as f64, // Down - Up
+            );
+            let delta = dir * (MOVE_SPEED / self.zoom) * dt;
+            for (_, t) in &mut self.card_targets {
+                *t += delta;
+            }
+        }
         let k = 1.0 - (-dt * ZOOM_EASE_SPEED).exp();
         self.zoom += (self.zoom_target - self.zoom) * k;
         self.pan += (self.pan_target - self.pan) * k;
+        let mut cards_done = true;
+        // Drag/resize own the card position; skip the ease so they don't fight.
+        if self.drag_card.is_none() && self.resize_card.is_none() {
+            if let Some(data) = &mut self.data {
+                for &(i, t) in &self.card_targets {
+                    let n = &mut data.nodes[i];
+                    n.pos += (t - n.pos) * k;
+                    if (n.pos - t).length() >= 0.5 {
+                        cards_done = false;
+                    }
+                }
+            }
+        }
         if (self.zoom_target - self.zoom).abs() < 5e-4
             && (self.pan_target - self.pan).length() < 0.5
+            && self.arrow_move == 0
+            && cards_done
         {
             self.zoom = self.zoom_target;
             self.pan = self.pan_target;
+            if let Some(data) = &mut self.data {
+                for &(i, t) in &self.card_targets {
+                    data.nodes[i].pos = t;
+                }
+            }
             cx.stop_timer(timer);
             self.zoom_timer = None;
         }
@@ -1152,15 +1209,29 @@ impl MindMap {
         self.pan_target = self.pan;
     }
 
-    /// Select the card under the view center, or clear the selection if none.
-    fn select_view_center(&mut self, cx: &mut Cx) {
+    /// Select the card under the view center; with `add` (Shift+Space) the
+    /// card is added to the selection instead of replacing it.
+    fn select_view_center(&mut self, cx: &mut Cx, add: bool) {
         // view_rect is the world-space viewport rect, so its center is the
         // hit point directly (no screen->world conversion).
         let world = self.view_rect.pos + self.view_rect.size * 0.5;
-        self.selected = match self.hit_card(world) {
-            Some(i) => vec![i],
-            None => Vec::new(),
-        };
+        match self.hit_card(world) {
+            Some(i) => {
+                if add {
+                    if !self.selected.contains(&i) {
+                        self.selected.push(i);
+                    }
+                } else {
+                    self.selected = vec![i];
+                }
+            }
+            None => {
+                if !add {
+                    self.selected.clear();
+                }
+            }
+        }
+        self.reanchor_cards(cx);
         self.redraw(cx);
     }
 
@@ -1186,6 +1257,51 @@ impl MindMap {
             if keys != 0 {
                 self.start_zoom_anim(cx);
             }
+        }
+    }
+
+    /// Track held arrow keys in the `arrow_move` bitmask; the first press
+    /// re-anchors the selected cards' targets and starts the animation timer
+    /// that eases them toward the targets.
+    fn set_arrow_move(&mut self, code: KeyCode, down: bool, cx: &mut Cx) {
+        let mask = match code {
+            KeyCode::ArrowUp => 1,
+            KeyCode::ArrowDown => 2,
+            KeyCode::ArrowLeft => 4,
+            KeyCode::ArrowRight => 8,
+            _ => return,
+        };
+        let bits = if down {
+            self.arrow_move | mask
+        } else {
+            self.arrow_move & !mask
+        };
+        if bits != self.arrow_move {
+            self.arrow_move = bits;
+            if down {
+                self.rebuild_card_targets();
+                self.start_zoom_anim(cx);
+            }
+        }
+    }
+
+    /// Re-anchor card_targets to the selected cards' current positions, so a
+    /// stale in-flight target can't yank a card after a selection change or
+    /// a drag.
+    fn rebuild_card_targets(&mut self) {
+        self.card_targets = self
+            .data
+            .as_ref()
+            .map(|d| self.selected.iter().map(|&i| (i, d.nodes[i].pos)).collect())
+            .unwrap_or_default();
+    }
+
+    /// Re-anchor after a selection change; restart the timer if arrow keys
+    /// are still held so they keep driving the new selection.
+    fn reanchor_cards(&mut self, cx: &mut Cx) {
+        self.rebuild_card_targets();
+        if self.arrow_move != 0 {
+            self.start_zoom_anim(cx);
         }
     }
 
