@@ -713,15 +713,7 @@ impl Widget for MindMap {
                 let n = self.data.as_ref().map(|d| d.nodes.len()).unwrap_or(0);
 
                 for (ei, (p, c)) in edges.into_iter().enumerate() {
-                let p_rect = self.card_rect(p);
-                let c_rect = self.card_rect(c);
-                let p1 = p_rect.pos + dvec2(p_rect.size.x, p_rect.size.y * 0.5);
-                let p4 = c_rect.pos + dvec2(0.0, c_rect.size.y * 0.5);
-                // Horizontal-tangent bezier control points; clamped so short
-                // links (cards dragged close together) don't get a sharp kink.
-                let reach = ((p4.x - p1.x).abs() * 0.5).clamp(60.0, 220.0);
-                let p2 = p1 + dvec2(reach, 0.0);
-                let p3 = p4 - dvec2(reach, 0.0);
+                let [p1, p2, p3, p4] = self.edge_curve(p, c);
                 // The curve stays inside the control points' convex hull, so
                 // the bbox over all four points always covers it.
                 let min_x = p1.x.min(p2.x).min(p3.x).min(p4.x) - 4.0;
@@ -1352,6 +1344,18 @@ impl MindMap {
         }
     }
 
+    /// World-space bezier points for the connector between parent `p` and
+    /// child `c`: start/end at the card edge midpoints, horizontal-tangent
+    /// control points (clamped so short links don't get a sharp kink).
+    fn edge_curve(&self, p: usize, c: usize) -> [DVec2; 4] {
+        let p_rect = self.card_rect(p);
+        let c_rect = self.card_rect(c);
+        let p1 = p_rect.pos + dvec2(p_rect.size.x, p_rect.size.y * 0.5);
+        let p4 = c_rect.pos + dvec2(0.0, c_rect.size.y * 0.5);
+        let reach = ((p4.x - p1.x).abs() * 0.5).clamp(60.0, 220.0);
+        [p1, p1 + dvec2(reach, 0.0), p4 - dvec2(reach, 0.0), p4]
+    }
+
     fn draw_minimap(&mut self, cx: &mut Cx2d, view: Rect) {
         let mm_rect = Rect {
             pos: view.pos
@@ -1362,7 +1366,7 @@ impl MindMap {
         cx.push_clip_rect(mm_rect);
         self.draw_mm_bg.draw_abs(cx, mm_rect);
 
-        let card_rects: Vec<Rect> = self
+        let (scale, offset) = self
             .data
             .as_ref()
             .map(|data| {
@@ -1372,6 +1376,50 @@ impl MindMap {
                     + (mm_rect.size - dvec2(data.max_w * scale, data.max_h * scale)) * 0.5;
                 self.mm_scale = scale;
                 self.mm_offset = offset;
+                (scale, offset)
+            })
+            .unwrap_or((0.0, DVec2::default()));
+
+        // Connectors first, so the cards draw on top. Same bezier points as
+        // the canvas, just mapped into minimap space (identical S-curves).
+        if scale > 0.0 {
+            let to_mm = |p: DVec2| p * scale + offset;
+            let edges: Vec<(usize, usize)> = self
+                .data
+                .as_ref()
+                .map(|d| d.edges().collect())
+                .unwrap_or_default();
+            for (ei, (p, c)) in edges.into_iter().enumerate() {
+                let [p1, p2, p3, p4] = self.edge_curve(p, c).map(to_mm);
+                let min_x = p1.x.min(p2.x).min(p3.x).min(p4.x) - 4.0;
+                let max_x = p1.x.max(p2.x).max(p3.x).max(p4.x) + 4.0;
+                let min_y = p1.y.min(p2.y).min(p3.y).min(p4.y) - 4.0;
+                let max_y = p1.y.max(p2.y).max(p3.y).max(p4.y) + 4.0;
+                let rect = Rect {
+                    pos: dvec2(min_x, min_y),
+                    size: dvec2(max_x - min_x, max_y - min_y),
+                };
+                let edge = &mut self.edges[ei];
+                let to_local = |p: DVec2| {
+                    vec2(
+                        ((p.x - rect.pos.x) / rect.size.x) as f32,
+                        ((p.y - rect.pos.y) / rect.size.y) as f32,
+                    )
+                };
+                edge.draw_vars.set_uniform(cx, id!(p1), &[to_local(p1).x, to_local(p1).y]);
+                edge.draw_vars.set_uniform(cx, id!(p2), &[to_local(p2).x, to_local(p2).y]);
+                edge.draw_vars.set_uniform(cx, id!(p3), &[to_local(p3).x, to_local(p3).y]);
+                edge.draw_vars.set_uniform(cx, id!(p4), &[to_local(p4).x, to_local(p4).y]);
+                // Thinner than the canvas (2.0) so it fits the small panel.
+                edge.draw_vars.set_uniform(cx, id!(line_width), &[1.0]);
+                edge.draw_abs(cx, rect);
+            }
+        }
+
+        let card_rects: Vec<Rect> = self
+            .data
+            .as_ref()
+            .map(|data| {
                 let to_mm = |p: DVec2| p * scale + offset;
                 data.nodes
                     .iter()
