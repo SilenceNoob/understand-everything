@@ -204,8 +204,8 @@ script_mod! {
             height: Fit
             flow: Flow.Right
             align: Align{y: 0.5}
-            spacing: 3
-            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            spacing: 2
+            padding: Inset{left: 7, right: 4, top: 0, bottom: 0}
             margin: Inset{left: 2, right: 2}
             show_bg: true
             draw_bg +: {
@@ -215,14 +215,14 @@ script_mod! {
                 border_color: #3b82f680
             }
             icon := mod.widgets.Icon{
-                icon_walk: Walk{width: 9, height: 9}
+                icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
                     svg: crate_resource("self:resources/book.svg")
                     color: #93c5fd
                 }
             }
             label := mod.widgets.Label{
-                draw_text.text_style.font_size: 9.5
+                draw_text.text_style.font_size: 8.5
                 draw_text.color: #93c5fd
             }
         }
@@ -232,8 +232,8 @@ script_mod! {
             height: Fit
             flow: Flow.Right
             align: Align{y: 0.5}
-            spacing: 3
-            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            spacing: 2
+            padding: Inset{left: 7, right: 4, top: 0, bottom: 0}
             margin: Inset{left: 2, right: 2}
             show_bg: true
             draw_bg +: {
@@ -243,14 +243,14 @@ script_mod! {
                 border_color: #eab30880
             }
             icon := mod.widgets.Icon{
-                icon_walk: Walk{width: 9, height: 9}
+                icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
                     svg: crate_resource("self:resources/pill-t.svg")
                     color: #fde047
                 }
             }
             label := mod.widgets.Label{
-                draw_text.text_style.font_size: 9.5
+                draw_text.text_style.font_size: 8.5
                 draw_text.color: #fde047
             }
         }
@@ -260,8 +260,8 @@ script_mod! {
             height: Fit
             flow: Flow.Right
             align: Align{y: 0.5}
-            spacing: 3
-            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            spacing: 2
+            padding: Inset{left: 7, right: 4, top: 0, bottom: 0}
             margin: Inset{left: 2, right: 2}
             show_bg: true
             draw_bg +: {
@@ -271,14 +271,14 @@ script_mod! {
                 border_color: #ef444480
             }
             icon := mod.widgets.Icon{
-                icon_walk: Walk{width: 9, height: 9}
+                icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
                     svg: crate_resource("self:resources/pill-e.svg")
                     color: #fca5a5
                 }
             }
             label := mod.widgets.Label{
-                draw_text.text_style.font_size: 9.5
+                draw_text.text_style.font_size: 8.5
                 draw_text.color: #fca5a5
             }
         }
@@ -288,8 +288,8 @@ script_mod! {
             height: Fit
             flow: Flow.Right
             align: Align{y: 0.5}
-            spacing: 3
-            padding: Inset{left: 4, right: 4, top: 0, bottom: 0}
+            spacing: 2
+            padding: Inset{left: 7, right: 4, top: 0, bottom: 0}
             margin: Inset{left: 2, right: 2}
             show_bg: true
             draw_bg +: {
@@ -299,14 +299,14 @@ script_mod! {
                 border_color: #94a3b880
             }
             icon := mod.widgets.Icon{
-                icon_walk: Walk{width: 9, height: 9}
+                icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
                     svg: crate_resource("self:resources/pill-n.svg")
                     color: #cbd5e1
                 }
             }
             label := mod.widgets.Label{
-                draw_text.text_style.font_size: 9.5
+                draw_text.text_style.font_size: 8.5
                 draw_text.color: #cbd5e1
             }
         }
@@ -358,8 +358,6 @@ pub struct MarkdownMedia {
     cached_events: Option<(u64, Vec<MdEvent<'static>>)>,
     #[live(false)]
     use_math_widget: bool,
-    #[rust]
-    auto_id: u64,
     #[live]
     heading_base_scale: f64,
     /// Base directory for resolving relative image paths in the markdown body.
@@ -380,7 +378,6 @@ impl Widget for MarkdownMedia {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.auto_id = 0;
         self.begin(cx, walk);
         self.process_markdown_doc(cx);
         self.end(cx);
@@ -396,6 +393,7 @@ impl Widget for MarkdownMedia {
         if self.body.as_ref() != v {
             self.body.set(v);
             self.body_version += 1;
+            self.text_flow.clear_items();
             self.redraw(cx);
         }
     }
@@ -521,8 +519,8 @@ impl MarkdownMedia {
                     tf.underline.pop();
                 }
                 MdEvent::Start(Tag::Link { dest_url, .. }) => {
-                    self.auto_id += 1;
-                    let item = tf.item(cx, LiveId(self.auto_id), live_id!(link));
+                    let entry_id = tf.new_counted_id();
+                    let item = tf.item(cx, entry_id, live_id!(link));
                     item.as_markdown_media_link().set_href(dest_url);
                     item.draw_all_unscoped(cx);
                 }
@@ -532,10 +530,10 @@ impl MarkdownMedia {
                 MdEvent::Start(Tag::Image {
                     dest_url, title, ..
                 }) => {
-                    self.auto_id += 1;
                     let base_dir = self.base_dir.clone();
                     let url = dest_url.as_ref();
-                    let item = tf.item(cx, LiveId(self.auto_id), live_id!(image));
+                    let entry_id = tf.new_counted_id();
+                    let item = tf.item(cx, entry_id, live_id!(image));
                     if let Some(base_dir) = &base_dir {
                         let path = base_dir.join(url);
                         if path.exists() {
@@ -700,18 +698,7 @@ impl MarkdownMedia {
                         }
                     }
                 }
-                MdEvent::SoftBreak => {
-                    if self.in_splash_block {
-                        self.splash_block_string.push('\n');
-                    } else if self.in_code_block {
-                        self.code_block_string.push('\n');
-                    } else if let Some((_, pill_text)) = &mut self.pill {
-                        pill_text.push(' ');
-                    } else {
-                        tf.draw_text(cx, " ");
-                    }
-                }
-                MdEvent::HardBreak => {
+                MdEvent::SoftBreak | MdEvent::HardBreak => {
                     if self.in_splash_block {
                         self.splash_block_string.push('\n');
                     } else if self.in_code_block {
@@ -888,7 +875,7 @@ fn draw_pill(tf: &mut TextFlow, cx: &mut Cx2d, kind: PillKind, text: &str) {
     };
     let entry_id = tf.new_counted_id();
     tf.item_with(cx, entry_id, template, |cx, item, _tf| {
-        item.widget(cx, ids!(label)).set_text(cx, text);
+        item.widget(cx, ids!(label)).set_text(cx, text.trim());
         item.draw_all_unscoped(cx);
     });
 }
