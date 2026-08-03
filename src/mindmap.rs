@@ -18,6 +18,15 @@ const RESIZE_BOTTOM: u8 = 8;
 // centered title only (see CardTemplate's compact_title layer).
 const COMPACT_ZOOM: f64 = 0.6;
 
+// Ease-out speed for animated pan/zoom (higher = snappier), driven by a
+// repeating 60Hz timer with frame-rate-independent dt.
+const ZOOM_EASE_SPEED: f64 = 10.0;
+
+// WASD pan speed in screen px/sec (same coordinate space as drag-panning,
+// so it feels identical at any zoom). Q/E zoom as an exponential rate/sec.
+const MOVE_SPEED: f64 = 1200.0;
+const ZOOM_KEY_SPEED: f64 = 1.5;
+
 // Minimap panel, fixed to the bottom-left corner of the map view.
 const MM_W: f64 = 240.0;
 const MM_H: f64 = 150.0;
@@ -442,6 +451,9 @@ script_mod! {
         draw_mm_view +: {
             color: #ffffff30
         }
+        draw_crosshair +: {
+            color: #ffffff40
+        }
         card := CardTemplate{}
         detail := DetailTemplate{}
     }
@@ -469,6 +481,8 @@ pub struct MindMap {
     draw_mm_sel: DrawColor,
     #[live]
     draw_mm_view: DrawColor,
+    #[live]
+    draw_crosshair: DrawColor,
     #[rust]
     area: Area,
 
@@ -494,6 +508,17 @@ pub struct MindMap {
     pan: DVec2,
     #[rust(1.0)]
     zoom: f64,
+    #[rust(1.0)]
+    zoom_target: f64,
+    #[rust]
+    pan_target: DVec2,
+    #[rust]
+    zoom_timer: Option<Timer>,
+    #[rust]
+    last_timer_time: f64,
+    /// Held navigation keys, bitmask: W=1 A=2 S=4 D=8 Q=16 E=32.
+    #[rust]
+    key_move: u8,
     #[rust]
     panning: bool,
     #[rust]
@@ -777,6 +802,16 @@ impl Widget for MindMap {
         // card rects inside the panel.
         self.draw_minimap(cx, view);
 
+        // Center crosshair while WASD/QE navigation keys are held, showing
+        // where a Space press would select (same center as select_view_center).
+        if self.key_move != 0 {
+            let c = view.pos + view.size * 0.5;
+            self.draw_crosshair
+                .draw_abs(cx, Rect { pos: c + dvec2(-12.0, -1.25), size: dvec2(24.0, 2.5) });
+            self.draw_crosshair
+                .draw_abs(cx, Rect { pos: c + dvec2(-1.25, -12.0), size: dvec2(2.5, 24.0) });
+        }
+
         // detail overlay (untransformed, on top)
         if self.detail_open.is_some() {
             if let Some(detail) = &self.detail_ref {
@@ -796,6 +831,22 @@ impl Widget for MindMap {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.handle_zoom_anim(cx, event);
+        // WASD pan / QE zoom. Skipped while a card is being edited (TextInput
+        // owns the keys) or the detail panel is open (same rule as wheel zoom).
+        if self.editing_card.is_none() && self.detail_open.is_none() {
+            match event {
+                Event::KeyDown(ke) => {
+                    if ke.key_code == KeyCode::Space && !ke.is_repeat {
+                        self.select_view_center(cx);
+                    } else {
+                        self.set_key_move(ke.key_code, true, cx);
+                    }
+                }
+                Event::KeyUp(ke) => self.set_key_move(ke.key_code, false, cx),
+                _ => {}
+            }
+        }
         let mut close_clicked = false;
         if let Some(detail) = &self.detail_ref {
             detail.handle_event(cx, event, scope);
@@ -919,6 +970,7 @@ impl Widget for MindMap {
                             }
                             self.redraw(cx);
                         } else {
+                            self.cancel_zoom_anim(cx);
                             self.panning = true;
                             self.pan_last = fe.abs;
                         }
@@ -983,6 +1035,7 @@ impl Widget for MindMap {
                     self.redraw(cx);
                 } else if self.panning {
                     self.pan += fe.abs - self.pan_last;
+                    self.pan_target = self.pan;
                     self.pan_last = fe.abs;
                     self.redraw(cx);
                 }
@@ -1023,8 +1076,9 @@ impl Widget for MindMap {
                         let new_zoom = (self.zoom * factor).clamp(0.3, 2.5);
                         if (new_zoom - self.zoom).abs() > f64::EPSILON {
                             let w = (fe.abs - self.pan) / self.zoom;
-                            self.pan = fe.abs - w * new_zoom;
-                            self.zoom = new_zoom;
+                            self.pan_target = fe.abs - w * new_zoom;
+                            self.zoom_target = new_zoom;
+                            self.start_zoom_anim(cx);
                             self.redraw(cx);
                         }
                     }
@@ -1036,6 +1090,105 @@ impl Widget for MindMap {
 }
 
 impl MindMap {
+    /// Ease `pan`/`zoom` one step toward their targets on each timer tick.
+    fn handle_zoom_anim(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(timer) = self.zoom_timer else { return };
+        let Some(te) = timer.is_event(event) else { return };
+        let now = te.time.unwrap_or(0.0);
+        // first tick has no baseline; fall back to one 60Hz frame
+        let dt = if self.last_timer_time == 0.0 {
+            1.0 / 60.0
+        } else {
+            (now - self.last_timer_time).max(0.0)
+        };
+        self.last_timer_time = now;
+        // Held-key velocity: WASD moves the pan target (skipped while the
+        // mouse is drag-panning so they don't fight), QE zoom center-anchored.
+        if self.key_move != 0 && !self.panning {
+            let bits = self.key_move;
+            let dir = dvec2(
+                ((bits >> 1) & 1) as f64 - ((bits >> 3) & 1) as f64, // A - D
+                (bits & 1) as f64 - ((bits >> 2) & 1) as f64,        // W - S
+            );
+            self.pan_target += dir * (MOVE_SPEED * dt);
+            let rate = (((bits >> 5) & 1) as f64 - ((bits >> 4) & 1) as f64) * ZOOM_KEY_SPEED;
+            if rate != 0.0 {
+                // view_rect center is already in world coords; keep it at the
+                // same screen position: screen = wc*zoom + pan, solve for pan.
+                let wc = self.view_rect.pos + self.view_rect.size * 0.5;
+                self.zoom_target = (self.zoom_target * (rate * dt).exp()).clamp(0.3, 2.5);
+                self.pan_target = self.pan + wc * (self.zoom - self.zoom_target);
+            }
+        }
+        let k = 1.0 - (-dt * ZOOM_EASE_SPEED).exp();
+        self.zoom += (self.zoom_target - self.zoom) * k;
+        self.pan += (self.pan_target - self.pan) * k;
+        if (self.zoom_target - self.zoom).abs() < 5e-4
+            && (self.pan_target - self.pan).length() < 0.5
+        {
+            self.zoom = self.zoom_target;
+            self.pan = self.pan_target;
+            cx.stop_timer(timer);
+            self.zoom_timer = None;
+        }
+        self.redraw(cx);
+    }
+
+    /// Ensure the repeating zoom timer is running (idempotent).
+    fn start_zoom_anim(&mut self, cx: &mut Cx) {
+        if self.zoom_timer.is_none() {
+            self.zoom_timer = Some(cx.start_interval(1.0 / 60.0));
+            self.last_timer_time = 0.0;
+        }
+    }
+
+    /// Stop animating and pin the targets to the current view, so direct
+    /// panning isn't fought by a stale in-flight target.
+    fn cancel_zoom_anim(&mut self, cx: &mut Cx) {
+        if let Some(t) = self.zoom_timer.take() {
+            cx.stop_timer(t);
+        }
+        self.zoom_target = self.zoom;
+        self.pan_target = self.pan;
+    }
+
+    /// Select the card under the view center, or clear the selection if none.
+    fn select_view_center(&mut self, cx: &mut Cx) {
+        // view_rect is the world-space viewport rect, so its center is the
+        // hit point directly (no screen->world conversion).
+        let world = self.view_rect.pos + self.view_rect.size * 0.5;
+        self.selected = match self.hit_card(world) {
+            Some(i) => vec![i],
+            None => Vec::new(),
+        };
+        self.redraw(cx);
+    }
+
+    /// Track held WASD/QE keys in the `key_move` bitmask; the first key press
+    /// starts the animation timer, which drives the motion until all keys up.
+    fn set_key_move(&mut self, code: KeyCode, down: bool, cx: &mut Cx) {
+        let mask = match code {
+            KeyCode::KeyW => 1,
+            KeyCode::KeyA => 2,
+            KeyCode::KeyS => 4,
+            KeyCode::KeyD => 8,
+            KeyCode::KeyQ => 16,
+            KeyCode::KeyE => 32,
+            _ => return,
+        };
+        let keys = if down {
+            self.key_move | mask
+        } else {
+            self.key_move & !mask
+        };
+        if keys != self.key_move {
+            self.key_move = keys;
+            if keys != 0 {
+                self.start_zoom_anim(cx);
+            }
+        }
+    }
+
     fn ensure_loaded(&mut self, cx: &mut Cx) {
         self.loaded = true;
         let base = app_base_dir();
@@ -1055,6 +1208,7 @@ impl MindMap {
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
         self.pan = dvec2(120.0, 60.0);
+        self.pan_target = self.pan;
         log!(
             "mindmap ready: {} nodes, {} edges, card_template={}, detail_template={}",
             n,
@@ -1141,14 +1295,18 @@ impl MindMap {
     }
 
         // Jump the viewport so the minimap point under `abs` becomes the view
-        // center; used for click-to-jump and drag-to-navigate.
+        // center; used for click-to-jump and drag-to-navigate. Animates toward
+        // the target; during drag the target is re-aimed every move so the
+        // view smoothly chases the cursor.
         fn navigate_minimap(&mut self, cx: &mut Cx, abs: DVec2) {
             if self.mm_scale <= 0.0 {
                 return;
             }
             let world = (abs - self.mm_offset) / self.mm_scale;
             let view_center = (self.view_rect.pos + self.view_rect.size * 0.5) * self.zoom + self.pan;
-            self.pan = view_center - world * self.zoom;
+            self.pan_target = view_center - world * self.zoom;
+            self.zoom_target = self.zoom;
+            self.start_zoom_anim(cx);
             self.redraw(cx);
         }
 
