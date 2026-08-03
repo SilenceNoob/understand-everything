@@ -1,10 +1,15 @@
 use makepad_widgets::*;
+use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use crate::markdown_media::MarkdownMediaWidgetRefExt;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 pub const CARD_W: f64 = 360.0;
 pub const CARD_H: f64 = 520.0;
+// Resize limits (mouse and Shift+arrow keyboard resizing share these).
+const CARD_MIN_SIZE: f64 = 100.0;
+const CARD_MAX_SIZE: f64 = 1000.0;
 const GAP_X: f64 = 120.0;
 const GAP_Y: f64 = 40.0;
 const CANVAS_MARGIN: f64 = 60.0;
@@ -26,6 +31,15 @@ const ZOOM_EASE_SPEED: f64 = 10.0;
 // so it feels identical at any zoom). Q/E zoom as an exponential rate/sec.
 const MOVE_SPEED: f64 = 1200.0;
 const ZOOM_KEY_SPEED: f64 = 1.5;
+// Shift+arrow resize speed in screen px/sec (world = /zoom); slower than
+// MOVE_SPEED so the size can be dialed in precisely.
+const RESIZE_SPEED: f64 = 600.0;
+// Ctrl+arrow paging: one page = PAGE_TICKS small instant scrolls (is_mouse:
+// false takes ScrollBar's non-smoothing branch), paced at 60Hz by
+// `page_timer`. Constant speed, no pause between steps, refresh-rate
+// independent — unlike the wheel path, which keeps its own smooth glide
+// (smoothing: 0.05 on the card's ScrollYView).
+const PAGE_TICKS: u32 = 60; // 60 × 1/60s = 1.0s per page
 
 // Minimap panel, fixed to the bottom-left corner of the map view.
 const MM_W: f64 = 240.0;
@@ -354,6 +368,17 @@ script_mod! {
             // off the bottom so code blocks/images never poke past the
             // 6px rounded corners (markdown adds 4px more).
             margin: Inset{bottom: 10}
+            // Smooth glide for Ctrl+arrow paging (and wheel): ScrollBar's
+            // smoothing routes wheel-style deltas through set_scroll_target,
+            // which then animates itself frame-by-frame. ~0.05 → a page in
+            // ~0.3s. The explicit mod.widgets.ScrollBars proto is required:
+            // an anonymous {...} literal drops the type defaults
+            // (show_scroll_x/y, axis) and kills all scrolling.
+            scroll_bars: mod.widgets.ScrollBars {
+                scroll_bar_x.drag_scrolling: true
+                scroll_bar_y.drag_scrolling: true
+                scroll_bar_y.smoothing: 0.05
+            }
             read_view := mod.widgets.View{
                 width: Fill
                 height: Fit
@@ -523,16 +548,27 @@ pub struct MindMap {
     zoom_timer: Option<Timer>,
     #[rust]
     last_timer_time: f64,
+    /// Ctrl+arrow paging: timer pacing the page burst and the burst state
+    /// (card index, direction ±1, segments left).
+    #[rust]
+    page_timer: Option<Timer>,
+    #[rust]
+    page_burst: Option<(usize, f64, u32)>,
     /// Held navigation keys, bitmask: W=1 A=2 S=4 D=8 Q=16 E=32.
     #[rust]
     key_move: u8,
     /// Held arrow keys, bitmask: Up=1 Down=2 Left=4 Right=8. Moves the
-    /// selected cards toward `card_targets` (see set_arrow_move).
+    /// selected cards toward `rect_targets` (see set_arrow).
     #[rust]
     arrow_move: u8,
-    /// Interpolation targets for the selected cards' positions.
+    /// Held Shift+arrow keys, same bit layout as `arrow_move`; resizes the
+    /// selected cards toward `rect_targets` (top-left pinned, bottom-right
+    /// handle: Right/Down grow, Left/Up shrink).
     #[rust]
-    card_targets: Vec<(usize, DVec2)>,
+    resize_arrows: u8,
+    /// Interpolation targets for the selected cards' positions and sizes.
+    #[rust]
+    rect_targets: Vec<(usize, Rect)>,
     #[rust]
     panning: bool,
     #[rust]
@@ -842,6 +878,7 @@ impl Widget for MindMap {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_zoom_anim(cx, event);
+        self.handle_page_burst(cx, event, scope);
         // WASD pan / QE zoom. Skipped while a card is being edited (TextInput
         // owns the keys) or the detail panel is open (same rule as wheel zoom).
         if self.editing_card.is_none() && self.detail_open.is_none() {
@@ -849,14 +886,27 @@ impl Widget for MindMap {
                 Event::KeyDown(ke) => {
                     if ke.key_code == KeyCode::Space && !ke.is_repeat {
                         self.select_view_center(cx, ke.modifiers.shift);
+                    } else if ke.modifiers.control && arrow_mask(ke.key_code).is_some() {
+                        // Ctrl+arrow pages the selected card's markdown body;
+                        // repeats keep paging. Left/Right are deliberately
+                        // absorbed so they never fall through to card movement.
+                        self.page_card(ke.key_code, cx, scope);
                     } else {
                         self.set_key_move(ke.key_code, true, cx);
-                        self.set_arrow_move(ke.key_code, true, cx);
+                        // Shift+arrow resizes the selected cards instead of
+                        // moving them; also switches a still-held key's mode.
+                        let resize = ke.modifiers.shift;
+                        self.set_arrow(ke.key_code, false, !resize, cx);
+                        self.set_arrow(ke.key_code, true, resize, cx);
                     }
                 }
                 Event::KeyUp(ke) => {
                     self.set_key_move(ke.key_code, false, cx);
-                    self.set_arrow_move(ke.key_code, false, cx);
+                    self.set_arrow(ke.key_code, false, false, cx);
+                    self.set_arrow(ke.key_code, false, true, cx);
+                    if arrow_mask(ke.key_code).is_some() {
+                        self.cancel_page_burst(cx);
+                    }
                 }
                 _ => {}
             }
@@ -1020,22 +1070,23 @@ impl Widget for MindMap {
                 if let Some((i, dir)) = self.resize_card {
                     if let Some(data) = &mut self.data {
                         let node = &mut data.nodes[i];
-                        let min = dvec2(100.0, 100.0);
+                        let min = dvec2(CARD_MIN_SIZE, CARD_MIN_SIZE);
+                        let max = dvec2(CARD_MAX_SIZE, CARD_MAX_SIZE);
                         if dir & RESIZE_LEFT != 0 {
-                            let w = (node.size.x + node.pos.x - world.x).max(min.x);
+                            let w = (node.size.x + node.pos.x - world.x).clamp(min.x, max.x);
                             node.pos.x += node.size.x - w;
                             node.size.x = w;
                         }
                         if dir & RESIZE_RIGHT != 0 {
-                            node.size.x = (world.x - node.pos.x).max(min.x);
+                            node.size.x = (world.x - node.pos.x).clamp(min.x, max.x);
                         }
                         if dir & RESIZE_TOP != 0 {
-                            let h = (node.size.y + node.pos.y - world.y).max(min.y);
+                            let h = (node.size.y + node.pos.y - world.y).clamp(min.y, max.y);
                             node.pos.y += node.size.y - h;
                             node.size.y = h;
                         }
                         if dir & RESIZE_BOTTOM != 0 {
-                            node.size.y = (world.y - node.pos.y).max(min.y);
+                            node.size.y = (world.y - node.pos.y).clamp(min.y, max.y);
                         }
                     }
                     self.redraw(cx);
@@ -1060,7 +1111,7 @@ impl Widget for MindMap {
                 self.drag_card = None;
                 self.resize_card = None;
                 self.mm_dragging = false;
-                self.rebuild_card_targets();
+                self.rebuild_targets();
                 if let Some((s, e)) = self.marquee.take() {
                     // commit the selection: every card whose rect touches the
                     // marquee; a tiny box (mis-click) clears the selection
@@ -1137,29 +1188,41 @@ impl MindMap {
                 self.pan_target = self.pan + wc * (self.zoom - self.zoom_target);
             }
         }
-        // Arrow keys: advance the selected cards' targets (screen-constant
-        // speed, like WASD), then ease every card toward its target.
+        // Arrow keys: advance the selected cards' position targets
+        // (screen-constant speed, like WASD), then ease toward the targets.
         if self.arrow_move != 0 {
             let dir = dvec2(
                 ((self.arrow_move >> 3) & 1) as f64 - ((self.arrow_move >> 2) & 1) as f64, // Right - Left
                 ((self.arrow_move >> 1) & 1) as f64 - (self.arrow_move & 1) as f64, // Down - Up
             );
             let delta = dir * (MOVE_SPEED / self.zoom) * dt;
-            for (_, t) in &mut self.card_targets {
-                *t += delta;
+            for (_, t) in &mut self.rect_targets {
+                t.pos += delta;
+            }
+        }
+        // Shift+arrow: bottom-right handle mode — the top-left corner is
+        // pinned, Right/Down grow and Left/Up shrink (100px floor).
+        if self.resize_arrows != 0 {
+            let rx = ((self.resize_arrows >> 3) & 1) as f64 - ((self.resize_arrows >> 2) & 1) as f64; // Right - Left
+            let ry = ((self.resize_arrows >> 1) & 1) as f64 - (self.resize_arrows & 1) as f64; // Down - Up
+            let s = (RESIZE_SPEED / self.zoom) * dt;
+            for (_, t) in &mut self.rect_targets {
+                t.size.x = (t.size.x + rx * s).clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
+                t.size.y = (t.size.y + ry * s).clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
             }
         }
         let k = 1.0 - (-dt * ZOOM_EASE_SPEED).exp();
         self.zoom += (self.zoom_target - self.zoom) * k;
         self.pan += (self.pan_target - self.pan) * k;
         let mut cards_done = true;
-        // Drag/resize own the card position; skip the ease so they don't fight.
+        // Drag/resize own the card geometry; skip the ease so they don't fight.
         if self.drag_card.is_none() && self.resize_card.is_none() {
             if let Some(data) = &mut self.data {
-                for &(i, t) in &self.card_targets {
+                for &(i, t) in &self.rect_targets {
                     let n = &mut data.nodes[i];
-                    n.pos += (t - n.pos) * k;
-                    if (n.pos - t).length() >= 0.5 {
+                    n.pos += (t.pos - n.pos) * k;
+                    n.size += (t.size - n.size) * k;
+                    if (n.pos - t.pos).length() >= 0.5 || (n.size - t.size).length() >= 0.5 {
                         cards_done = false;
                     }
                 }
@@ -1168,13 +1231,15 @@ impl MindMap {
         if (self.zoom_target - self.zoom).abs() < 5e-4
             && (self.pan_target - self.pan).length() < 0.5
             && self.arrow_move == 0
+            && self.resize_arrows == 0
             && cards_done
         {
             self.zoom = self.zoom_target;
             self.pan = self.pan_target;
             if let Some(data) = &mut self.data {
-                for &(i, t) in &self.card_targets {
-                    data.nodes[i].pos = t;
+                for &(i, t) in &self.rect_targets {
+                    data.nodes[i].pos = t.pos;
+                    data.nodes[i].size = t.size;
                 }
             }
             cx.stop_timer(timer);
@@ -1227,6 +1292,95 @@ impl MindMap {
         self.redraw(cx);
     }
 
+    /// Ctrl+arrow: page the first selected card's markdown body by one
+    /// viewport. One page = PAGE_TICKS small instant scrolls (is_mouse: false
+    /// skips the bar's smoothing glide) paced at 60Hz by `page_timer`, so the
+    /// motion is constant-speed and refresh-rate independent. Synthesizes
+    /// wheel-like Scroll events at the body's center and dispatches them
+    /// through the card's own event path, so makepad's scrollbar state
+    /// (clamp, position) stays the single source of truth. Key repeats
+    /// extend the burst.
+    fn page_card(&mut self, code: KeyCode, cx: &mut Cx, scope: &mut Scope) {
+        let Some(&i) = self.selected.first() else {
+            return;
+        };
+        let dir = match code {
+            KeyCode::ArrowDown => 1.0,
+            KeyCode::ArrowUp => -1.0,
+            _ => return,
+        };
+        if let Some((_, _, left)) = &mut self.page_burst {
+            *left += PAGE_TICKS;
+        } else {
+            self.page_burst = Some((i, dir, PAGE_TICKS));
+            self.page_timer = Some(cx.start_interval(1.0 / 60.0));
+        }
+        self.dispatch_page_tick(cx, scope);
+    }
+
+    /// Dispatch one 60Hz tick of the current page burst (a viewport/PAGE_TICKS
+    /// instant scroll).
+    fn dispatch_page_tick(&mut self, cx: &mut Cx, scope: &mut Scope) {
+        let Some((i, dir, _)) = self.page_burst else {
+            return;
+        };
+        let Some(card) = self.cards.get(i) else {
+            return;
+        };
+        // Cards live in world coords, so the body rect (from the last pass)
+        // is already world-space; stale/empty rects (compact mode, not yet
+        // drawn) fail the contains() check and safely no-op.
+        let body_rect = card.view(cx, ids!(body)).area().rect(cx);
+        if body_rect.size.y <= 0.0 {
+            return;
+        }
+        let mut e = ScrollEvent {
+            // The scroll handling only reads abs/scroll, so any id works.
+            window_id: WindowId(0, 0),
+            scroll: dvec2(0.0, dir * body_rect.size.y / PAGE_TICKS as f64),
+            abs: body_rect.pos + body_rect.size * 0.5,
+            modifiers: KeyModifiers::default(),
+            handled_x: Cell::new(false),
+            handled_y: Cell::new(false),
+            // False → instant set_scroll_pos branch: our timer paces the
+            // motion, the bar just applies each small step immediately.
+            is_mouse: false,
+            time: 0.0,
+            phase: ScrollPhase::None,
+        };
+        card.handle_event(cx, &Event::Scroll(e), scope);
+    }
+
+    /// Advance the page burst on each timer tick; stops when the held page
+    /// count is exhausted.
+    fn handle_page_burst(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let Some(timer) = self.page_timer else {
+            return;
+        };
+        if timer.is_event(event).is_none() {
+            return;
+        }
+        let done = if let Some((_, _, left)) = &mut self.page_burst {
+            *left -= 1;
+            *left == 0
+        } else {
+            true
+        };
+        self.dispatch_page_tick(cx, scope);
+        if done {
+            self.cancel_page_burst(cx);
+        }
+    }
+
+    /// Stop the page burst; the scroll position is already where the burst
+    /// left it (each tick applies instantly).
+    fn cancel_page_burst(&mut self, cx: &mut Cx) {
+        if let Some(t) = self.page_timer.take() {
+            cx.stop_timer(t);
+        }
+        self.page_burst = None;
+    }
+
     /// Track held WASD/QE keys in the `key_move` bitmask; the first key press
     /// starts the animation timer, which drives the motion until all keys up.
     fn set_key_move(&mut self, code: KeyCode, down: bool, cx: &mut Cx) {
@@ -1252,47 +1406,48 @@ impl MindMap {
         }
     }
 
-    /// Track held arrow keys in the `arrow_move` bitmask; the first press
-    /// re-anchors the selected cards' targets and starts the animation timer
-    /// that eases them toward the targets.
-    fn set_arrow_move(&mut self, code: KeyCode, down: bool, cx: &mut Cx) {
-        let mask = match code {
-            KeyCode::ArrowUp => 1,
-            KeyCode::ArrowDown => 2,
-            KeyCode::ArrowLeft => 4,
-            KeyCode::ArrowRight => 8,
-            _ => return,
+    /// Track held arrow keys in the `arrow_move` (move) or `resize_arrows`
+    /// (Shift+arrow resize) bitmask; the first press re-anchors the selected
+    /// cards' targets and starts the animation timer that eases toward them.
+    fn set_arrow(&mut self, code: KeyCode, down: bool, resize: bool, cx: &mut Cx) {
+        let Some(mask) = arrow_mask(code) else {
+            return;
+        };
+        let field = if resize {
+            &mut self.resize_arrows
+        } else {
+            &mut self.arrow_move
         };
         let bits = if down {
-            self.arrow_move | mask
+            *field | mask
         } else {
-            self.arrow_move & !mask
+            *field & !mask
         };
-        if bits != self.arrow_move {
-            self.arrow_move = bits;
+        if bits != *field {
+            *field = bits;
             if down {
-                self.rebuild_card_targets();
+                self.rebuild_targets();
                 self.start_zoom_anim(cx);
             }
         }
     }
 
-    /// Re-anchor card_targets to the selected cards' current positions, so a
+    /// Re-anchor rect_targets to the selected cards' current geometry, so a
     /// stale in-flight target can't yank a card after a selection change or
     /// a drag.
-    fn rebuild_card_targets(&mut self) {
-        self.card_targets = self
+    fn rebuild_targets(&mut self) {
+        self.rect_targets = self
             .data
             .as_ref()
-            .map(|d| self.selected.iter().map(|&i| (i, d.nodes[i].pos)).collect())
+            .map(|_| self.selected.iter().map(|&i| (i, self.card_rect(i))).collect())
             .unwrap_or_default();
     }
 
     /// Re-anchor after a selection change; restart the timer if arrow keys
     /// are still held so they keep driving the new selection.
     fn reanchor_cards(&mut self, cx: &mut Cx) {
-        self.rebuild_card_targets();
-        if self.arrow_move != 0 {
+        self.rebuild_targets();
+        if self.arrow_move != 0 || self.resize_arrows != 0 {
             self.start_zoom_anim(cx);
         }
     }
@@ -1649,6 +1804,17 @@ impl MindMap {
         };
         write_map(&app_base_dir(), data);
     }
+}
+
+/// Arrow-key bit for a key code (shared by `arrow_move` and `resize_arrows`).
+fn arrow_mask(code: KeyCode) -> Option<u8> {
+    Some(match code {
+        KeyCode::ArrowUp => 1,
+        KeyCode::ArrowDown => 2,
+        KeyCode::ArrowLeft => 4,
+        KeyCode::ArrowRight => 8,
+        _ => return None,
+    })
 }
 
 fn write_map(base: &Path, data: &MindMapData) {
