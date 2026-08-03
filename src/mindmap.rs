@@ -18,6 +18,12 @@ const RESIZE_BOTTOM: u8 = 8;
 // centered title only (see CardTemplate's compact_title layer).
 const COMPACT_ZOOM: f64 = 0.6;
 
+// Minimap panel, fixed to the bottom-left corner of the map view.
+const MM_W: f64 = 240.0;
+const MM_H: f64 = 150.0;
+const MM_MARGIN: f64 = 12.0;
+const MM_PAD: f64 = 8.0;
+
 #[derive(Deserialize, Serialize)]
 struct MapFile {
     nodes: Vec<MapNodeFile>,
@@ -151,6 +157,20 @@ pub struct DrawEdge {
     draw_super: DrawQuad,
 }
 
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawHighlight {
+    #[deref]
+    draw_super: DrawQuad,
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawMarquee {
+    #[deref]
+    draw_super: DrawQuad,
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -175,6 +195,51 @@ script_mod! {
         }
     }
 
+    // Feathered glow pad drawn behind the selected card; the card covers the
+    // center, so the visible result is a soft halo hugging the card edge.
+    // radius = card corner radius (6); width = halo falloff distance.
+    mod.widgets.DrawHighlight = set_type_default() do #(DrawHighlight::script_shader(vm)){
+        ..mod.draw.DrawQuad
+
+        // explicit vec4 (not 8-digit hex) so the alpha reaches the shader
+        // unambiguously on the uniform path
+        color: uniform(vec4(0.49, 0.55, 0.83, 0.45))
+        radius: uniform(6.0)
+        width: uniform(4.0)
+
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(self.width self.width self.rect_size.x - 2.0 * self.width self.rect_size.y - 2.0 * self.width self.radius)
+            // shape = signed distance from the card edge (neg inside, pos outside)
+            let f = clamp(1.0 - max(sdf.shape, 0.0) / self.width, 0.0, 1.0)
+            return vec4(self.color.rgb * self.color.a * f, self.color.a * f)
+        }
+    }
+
+    // Right-button marquee: faint fill + soft edge glow, same feathered-alpha
+    // technique as the card glow. NOTE: box radius 0 degenerates the SDF to
+    // dist=0 across the whole interior, which would paint glow/stroke over
+    // everything; radius 2 keeps the interior distance negative (2px corners
+    // are invisible). All colors are uniforms, tweakable in script.
+    mod.widgets.DrawMarquee = set_type_default() do #(DrawMarquee::script_shader(vm)){
+        ..mod.draw.DrawQuad
+
+        color: uniform(vec4(0.49, 0.55, 0.83, 0.45))
+        fill_alpha: uniform(0.08)
+        width: uniform(4.0)
+
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0. 0. self.rect_size.x self.rect_size.y 2.0)
+            // g: 1 inside the box, fading out over `width` px outside
+            let g = clamp(1.0 - max(sdf.shape, 0.0) / self.width, 0.0, 1.0)
+            // e: 1 on the border line, fading over `width` px on both sides
+            let e = clamp(1.0 - abs(sdf.shape) / self.width, 0.0, 1.0)
+            let a = self.fill_alpha * g + self.color.a * e
+            return vec4(self.color.rgb * a, a)
+        }
+    }
+
     // Style type for the card edit/done buttons. The draw_bg overrides live
     // at TYPE level (like the theme colors) so card clones from
     // script_from_value get them on the first frame; instance-level uniform
@@ -184,10 +249,10 @@ script_mod! {
         padding: Inset{left: 3, right: 3, top: 3, bottom: 3}
         margin: 0
         draw_bg +: {
-            color: #232834
-            color_hover: #2a3140
-            color_down: #2a3140
-            color_focus: #232834
+            color: #1d2129
+            color_hover: #232834
+            color_down: #232834
+            color_focus: #1d2129
             border_size: uniform(0.0)
         }
         // ponytail: hover.off animates 0.1s via NextFrame events, which stop
@@ -210,7 +275,7 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             color: #232834
-            border_radius: 10.0
+            border_radius: 6.0
             border_size: 1.0
             border_color: #ffffff1a
         }
@@ -225,7 +290,7 @@ script_mod! {
 
                 pixel: fn() {
                     let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                    sdf.box_y(0. 0. self.rect_size.x self.rect_size.y 10.0 0.0)
+                    sdf.box_y(0. 0. self.rect_size.x self.rect_size.y 6.0 0.0)
                     sdf.fill(self.color)
                     return sdf.result
                 }
@@ -269,10 +334,10 @@ script_mod! {
         body := mod.widgets.ScrollYView{
             width: Fill
             height: Fill
-            // ponytail: makepad clips only rectangularly; keep content 8px
+            // ponytail: makepad clips only rectangularly; keep content 6px
             // off the bottom so code blocks/images never poke past the
             // 6px rounded corners (markdown adds 4px more).
-            margin: Inset{bottom: 12}
+            margin: Inset{bottom: 10}
             read_view := mod.widgets.View{
                 width: Fill
                 height: Fit
@@ -365,6 +430,18 @@ script_mod! {
         draw_bg +: {
             color: #14171d
         }
+        draw_mm_bg +: {
+            color: #1f2430dd
+        }
+        draw_mm_card +: {
+            color: #39404f
+        }
+        draw_mm_sel +: {
+            color: #7d8bd4
+        }
+        draw_mm_view +: {
+            color: #ffffff30
+        }
         card := CardTemplate{}
         detail := DetailTemplate{}
     }
@@ -385,7 +462,13 @@ pub struct MindMap {
     #[live]
     draw_edge: DrawEdge,
     #[live]
-    draw_highlight: DrawColor,
+    draw_mm_bg: DrawColor,
+    #[live]
+    draw_mm_card: DrawColor,
+    #[live]
+    draw_mm_sel: DrawColor,
+    #[live]
+    draw_mm_view: DrawColor,
     #[rust]
     area: Area,
 
@@ -397,6 +480,10 @@ pub struct MindMap {
     cards: Vec<WidgetRef>,
     #[rust]
     edges: Vec<DrawEdge>,
+    #[rust]
+    highlight: Option<DrawHighlight>,
+    #[rust]
+    marquee_draw: Option<DrawMarquee>,
     #[rust]
     detail_ref: Option<WidgetRef>,
 
@@ -412,17 +499,30 @@ pub struct MindMap {
     #[rust]
     pan_last: DVec2,
     #[rust]
-    selected: Option<usize>,
+    selected: Vec<usize>,
+    #[rust]
+    marquee: Option<(DVec2, DVec2)>,
     #[rust]
     detail_open: Option<usize>,
     #[rust]
     drag_card: Option<usize>,
     #[rust]
-    drag_grab: DVec2,
+    drag_last: DVec2,
     #[rust]
     resize_card: Option<(usize, u8)>,
     #[rust]
     editing_card: Option<usize>,
+
+    // Minimap: panel rect in window coords plus the world->minimap map,
+    // cached on the last draw pass for event hit-testing and back-conversion.
+    #[rust]
+    minimap_rect: Rect,
+    #[rust]
+    mm_scale: f64,
+    #[rust]
+    mm_offset: DVec2,
+    #[rust]
+    mm_dragging: bool,
 
     /// World-space viewport rect, cached from the last draw pass (mirrors the
     /// card culling in draw_walk). Used by the event path to skip off-screen
@@ -545,29 +645,35 @@ impl Widget for MindMap {
             let dpi = cx.current_dpi_factor();
             let cx2d = &mut Cx2d::new(cx.cx);
             cx2d.set_current_pass_dpi_factor(dpi);
-            canvas.begin_always(cx2d);
-            canvas.set_view_transform(cx2d, &mat);
             cx2d.begin_root_turtle(dvec2(1e9, 1e9), Layout::flow_down());
-            // begin_root_turtle's clip starts at (0,0), which would clamp
-            // left/up (negative world coords) content at the origin; pop it
-            // and clip to this widget's own world rect instead, so canvas
-            // content never renders over the window title bar.
-            cx2d.pop_clip_rect();
-            let local_view = Rect {
+            // begin (not begin_always): skip re-recording when neither this
+            // canvas nor any ancestor is dirty, so a floating debug panel can
+            // repaint every frame while the map stays cached. The Fixed walk
+            // makes the rect check fire on window resize (peek needs a
+            // turtle), which begin_always never cared about.
+            let redrawing = canvas.begin(cx2d, Walk::fixed(view.size.x, view.size.y));
+            if redrawing.is_ok() {
+                canvas.set_view_transform(cx2d, &mat);
+                // begin_root_turtle's clip starts at (0,0), which would clamp
+                // left/up (negative world coords) content at the origin; pop it
+                // and clip to this widget's own world rect instead, so canvas
+                // content never renders over the window title bar.
+                cx2d.pop_clip_rect();
+                let local_view = Rect {
                 pos: (view.pos - self.pan) / self.zoom,
                 size: view.size / self.zoom,
-            };
-            self.view_rect = local_view;
-            cx2d.push_clip_rect(local_view);
+                };
+                self.view_rect = local_view;
+                cx2d.push_clip_rect(local_view);
 
-            let edges: Vec<(usize, usize)> = self
+                let edges: Vec<(usize, usize)> = self
                 .data
                 .as_ref()
                 .map(|d| d.edges().collect())
                 .unwrap_or_default();
-            let n = self.data.as_ref().map(|d| d.nodes.len()).unwrap_or(0);
+                let n = self.data.as_ref().map(|d| d.nodes.len()).unwrap_or(0);
 
-            for (ei, (p, c)) in edges.into_iter().enumerate() {
+                for (ei, (p, c)) in edges.into_iter().enumerate() {
                 let p_rect = self.card_rect(p);
                 let c_rect = self.card_rect(c);
                 let p1 = p_rect.pos + dvec2(p_rect.size.x, p_rect.size.y * 0.5);
@@ -585,69 +691,91 @@ impl Widget for MindMap {
                 };
                 if !local_view.intersects(rect) {
                     continue;
+                    }
+                    let edge = &mut self.edges[ei];
+                    let to_local = |p: DVec2| {
+                        vec2(
+                            ((p.x - rect.pos.x) / rect.size.x) as f32,
+                            ((p.y - rect.pos.y) / rect.size.y) as f32,
+                        )
+                    };
+                    edge.draw_vars.set_uniform(cx2d, id!(p1), &[to_local(p1).x, to_local(p1).y]);
+                    edge.draw_vars.set_uniform(cx2d, id!(p2), &[to_local(p2).x, to_local(p2).y]);
+                    edge.draw_vars.set_uniform(cx2d, id!(p3), &[to_local(p3).x, to_local(p3).y]);
+                    edge.draw_vars.set_uniform(cx2d, id!(p4), &[to_local(p4).x, to_local(p4).y]);
+                    edge.draw_vars.set_uniform(cx2d, id!(line_width), &[2.0]);
+                    edge.draw_abs(cx2d, rect);
                 }
-                let edge = &mut self.edges[ei];
-                let to_local = |p: DVec2| {
-                    vec2(
-                        ((p.x - rect.pos.x) / rect.size.x) as f32,
-                        ((p.y - rect.pos.y) / rect.size.y) as f32,
-                    )
-                };
-                edge.draw_vars.set_uniform(cx2d, id!(p1), &[to_local(p1).x, to_local(p1).y]);
-                edge.draw_vars.set_uniform(cx2d, id!(p2), &[to_local(p2).x, to_local(p2).y]);
-                edge.draw_vars.set_uniform(cx2d, id!(p3), &[to_local(p3).x, to_local(p3).y]);
-                edge.draw_vars.set_uniform(cx2d, id!(p4), &[to_local(p4).x, to_local(p4).y]);
-                edge.draw_vars.set_uniform(cx2d, id!(line_width), &[2.0]);
-                edge.draw_abs(cx2d, rect);
-            }
 
-            let compact = self.zoom < COMPACT_ZOOM;
-            for i in 0..n {
-                let r = self.card_rect(i);
-                if !local_view.intersects(r) {
-                    continue;
-                }
-                if self.selected == Some(i) {
-                    self.draw_highlight.draw_abs(
+                let compact = self.zoom < COMPACT_ZOOM;
+                for i in 0..n {
+                    let r = self.card_rect(i);
+                    if !local_view.intersects(r) {
+                        continue;
+                    }
+                    if self.selected.contains(&i) {
+                        if let Some(hl) = &mut self.highlight {
+                            hl.draw_abs(
+                                cx2d,
+                                Rect {
+                                    pos: r.pos - dvec2(4.0, 4.0),
+                                    size: r.size + dvec2(8.0, 8.0),
+                                },
+                            );
+                        }
+                    }
+                    let card = self.card_ref(cx2d, i);
+                    // set_visible no-ops when the state is unchanged, so calling
+                    // it every frame is free outside the zoom threshold. Only
+                    // View implements set_visible, so every toggle target below
+                    // is wrapped in a View.
+                    card.view(cx2d, ids!(header)).set_visible(cx2d, !compact);
+                    card.view(cx2d, ids!(body)).set_visible(cx2d, !compact);
+                    card.view(cx2d, ids!(compact_title)).set_visible(cx2d, compact);
+                    // edit mode swaps the read-only render for text inputs
+                    let editing = self.editing_card == Some(i);
+                    card.view(cx2d, ids!(title_box)).set_visible(cx2d, !editing);
+                    card.view(cx2d, ids!(title_edit_box)).set_visible(cx2d, editing);
+                    card.view(cx2d, ids!(read_view)).set_visible(cx2d, !editing);
+                    card.view(cx2d, ids!(edit_view)).set_visible(cx2d, editing);
+                    card.button(cx2d, ids!(edit_btn)).set_visible(cx2d, !editing);
+                    card.button(cx2d, ids!(done_btn)).set_visible(cx2d, editing);
+                    let _ = card.draw_walk(
                         cx2d,
-                        Rect {
-                            pos: r.pos - dvec2(3.0, 3.0),
-                            size: r.size + dvec2(6.0, 6.0),
+                        scope,
+                        Walk {
+                            abs_pos: Some(r.pos),
+                            width: Size::Fixed(r.size.x),
+                            height: Size::Fixed(r.size.y),
+                            ..Walk::default()
                         },
                     );
                 }
-                let card = self.card_ref(cx2d, i);
-                // set_visible no-ops when the state is unchanged, so calling
-                // it every frame is free outside the zoom threshold. Only
-                // View implements set_visible, so every toggle target below
-                // is wrapped in a View.
-                card.view(cx2d, ids!(header)).set_visible(cx2d, !compact);
-                card.view(cx2d, ids!(body)).set_visible(cx2d, !compact);
-                card.view(cx2d, ids!(compact_title)).set_visible(cx2d, compact);
-                // edit mode swaps the read-only render for text inputs
-                let editing = self.editing_card == Some(i);
-                card.view(cx2d, ids!(title_box)).set_visible(cx2d, !editing);
-                card.view(cx2d, ids!(title_edit_box)).set_visible(cx2d, editing);
-                card.view(cx2d, ids!(read_view)).set_visible(cx2d, !editing);
-                card.view(cx2d, ids!(edit_view)).set_visible(cx2d, editing);
-                card.button(cx2d, ids!(edit_btn)).set_visible(cx2d, !editing);
-                card.button(cx2d, ids!(done_btn)).set_visible(cx2d, editing);
-                let _ = card.draw_walk(
-                    cx2d,
-                    scope,
-                    Walk {
-                        abs_pos: Some(r.pos),
-                        width: Size::Fixed(r.size.x),
-                        height: Size::Fixed(r.size.y),
-                        ..Walk::default()
-                    },
-                );
-            }
 
-            cx2d.end_pass_sized_turtle();
-            canvas.end(cx2d);
+                // right-button marquee, drawn on top of the cards
+                if let Some((s, e)) = self.marquee {
+                    let rect = Rect {
+                        pos: dvec2(s.x.min(e.x), s.y.min(e.y)),
+                        size: dvec2((s.x - e.x).abs(), (s.y - e.y).abs()),
+                    };
+                    if local_view.intersects(rect) {
+                        if let Some(md) = &mut self.marquee_draw {
+                            md.draw_abs(cx2d, rect);
+                        }
+                    }
+                }
+
+                cx2d.end_pass_sized_turtle();
+                canvas.end(cx2d);
+            }
             self.canvas = Some(canvas);
         }
+
+        // Minimap: whole-map overview pinned to the bottom-left of the view.
+        // Drawn in the main turtle (screen coords), so it stays put while the
+        // canvas pans/zooms. The pushed clip keeps the viewport indicator and
+        // card rects inside the panel.
+        self.draw_minimap(cx, view);
 
         // detail overlay (untransformed, on top)
         if self.detail_open.is_some() {
@@ -700,10 +828,16 @@ impl Widget for MindMap {
                 }
             }
         }
+        let on_mm = self.on_minimap(event);
         let local_event = self.remap_event(event);
         let card_event = local_event.as_ref().unwrap_or(event);
-        for card in &self.cards {
-            card.handle_event(cx, card_event, scope);
+        // A press on the minimap must not reach the cards: the event's world
+        // back-mapping could coincidentally land inside a card's (untransformed)
+        // hit area and, e.g., focus a TextInput mid-edit.
+        if !on_mm {
+            for card in &self.cards {
+                card.handle_event(cx, card_event, scope);
+            }
         }
 
         // ponytail: canvas buttons get no reliable FingerHoverOut — hover
@@ -755,35 +889,66 @@ impl Widget for MindMap {
         match event.hits(cx, self.area) {
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 if self.detail_open.is_none() {
-                    let world = (fe.abs - self.pan) / self.zoom;
-                    if let Some((i, dir)) = self.resize_hit(world) {
-                        // layout ops are disabled while a card is being edited
-                        if self.editing_card.is_none() {
-                            self.selected = Some(i);
-                            self.resize_card = Some((i, dir));
-                            self.redraw(cx);
-                        }
-                    } else if let Some(i) = self.hit_card(world) {
-                        self.selected = Some(i);
-                        if fe.tap_count >= 2 {
-                            if self.editing_card.is_some() {
-                                self.commit_edit(cx);
-                            }
-                            self.detail_open = Some(i);
-                            self.ensure_detail(cx);
-                        } else if !child_grabbed && self.editing_card.is_none() {
-                            // no card-internal widget (scrollbar, link) grabbed the press
-                            self.drag_card = Some(i);
-                            self.drag_grab = world - self.data.as_ref().unwrap().nodes[i].pos;
-                        }
-                        self.redraw(cx);
+                    if self.minimap_rect.contains(fe.abs) {
+                        self.mm_dragging = true;
+                        self.navigate_minimap(cx, fe.abs);
                     } else {
-                        self.panning = true;
-                        self.pan_last = fe.abs;
+                        let world = (fe.abs - self.pan) / self.zoom;
+                        if let Some((i, dir)) = self.resize_hit(world) {
+                            // layout ops are disabled while a card is being edited
+                            if self.editing_card.is_none() {
+                                self.resize_card = Some((i, dir));
+                                self.redraw(cx);
+                            }
+                        } else if let Some(i) = self.hit_card(world) {
+                            // keep the group when re-pressing an already
+                            // selected card, so dragging moves them all
+                            if !self.selected.contains(&i) {
+                                self.selected = vec![i];
+                            }
+                            if fe.tap_count >= 2 {
+                                if self.editing_card.is_some() {
+                                    self.commit_edit(cx);
+                                }
+                                self.detail_open = Some(i);
+                                self.ensure_detail(cx);
+                            } else if !child_grabbed && self.editing_card.is_none() {
+                                // no card-internal widget (scrollbar, link) grabbed the press
+                                self.drag_card = Some(i);
+                                self.drag_last = world;
+                            }
+                            self.redraw(cx);
+                        } else {
+                            self.panning = true;
+                            self.pan_last = fe.abs;
+                        }
                     }
                 }
             }
+            Hit::FingerDown(fe)
+                if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary()) =>
+            {
+                // right-button marquee selection
+                if self.detail_open.is_none()
+                    && self.editing_card.is_none()
+                    && !self.minimap_rect.contains(fe.abs)
+                {
+                    let world = (fe.abs - self.pan) / self.zoom;
+                    self.marquee = Some((world, world));
+                    self.redraw(cx);
+                }
+            }
             Hit::FingerMove(fe) => {
+                if self.mm_dragging {
+                    self.navigate_minimap(cx, fe.abs);
+                    return;
+                }
+                if let Some((s, _)) = self.marquee {
+                    let world = (fe.abs - self.pan) / self.zoom;
+                    self.marquee = Some((s, world));
+                    self.redraw(cx);
+                    return;
+                }
                 let world = (fe.abs - self.pan) / self.zoom;
                 if let Some((i, dir)) = self.resize_card {
                     if let Some(data) = &mut self.data {
@@ -807,9 +972,13 @@ impl Widget for MindMap {
                         }
                     }
                     self.redraw(cx);
-                } else if let Some(i) = self.drag_card {
+                } else if self.drag_card.is_some() {
                     if let Some(data) = &mut self.data {
-                        data.nodes[i].pos = world - self.drag_grab;
+                        let delta = world - self.drag_last;
+                        for &j in &self.selected {
+                            data.nodes[j].pos += delta;
+                        }
+                        self.drag_last = world;
                     }
                     self.redraw(cx);
                 } else if self.panning {
@@ -822,9 +991,30 @@ impl Widget for MindMap {
                 self.panning = false;
                 self.drag_card = None;
                 self.resize_card = None;
+                self.mm_dragging = false;
+                if let Some((s, e)) = self.marquee.take() {
+                    // commit the selection: every card whose rect touches the
+                    // marquee; a tiny box (mis-click) clears the selection
+                    let rect = Rect {
+                        pos: dvec2(s.x.min(e.x), s.y.min(e.y)),
+                        size: dvec2((s.x - e.x).abs(), (s.y - e.y).abs()),
+                    };
+                    if rect.size.x < 4.0 && rect.size.y < 4.0 {
+                        self.selected.clear();
+                    } else if let Some(data) = &self.data {
+                        self.selected = (0..data.nodes.len())
+                            .filter(|&i| rect.intersects(self.card_rect(i)))
+                            .collect();
+                    }
+                    self.redraw(cx);
+                }
             }
             Hit::FingerScroll(fe) => {
-                if self.detail_open.is_none() && fe.scroll.y != 0.0 {
+                // Wheel over the minimap is swallowed so it never zooms the map.
+                if !self.minimap_rect.contains(fe.abs)
+                    && self.detail_open.is_none()
+                    && fe.scroll.y != 0.0
+                {
                     let world = (fe.abs - self.pan) / self.zoom;
                     // Compact cards have no scrollable body, so treat them
                     // like canvas: wheel always zooms.
@@ -860,6 +1050,8 @@ impl MindMap {
         let n = data.nodes.len();
         self.data = Some(data);
         self.edges = edges;
+        self.highlight = Some(cx.with_vm(|vm| DrawHighlight::script_new_with_default(vm)));
+        self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
         self.pan = dvec2(120.0, 60.0);
@@ -889,6 +1081,89 @@ impl MindMap {
             size: node.size,
         }
     }
+
+    fn draw_minimap(&mut self, cx: &mut Cx2d, view: Rect) {
+        let mm_rect = Rect {
+            pos: view.pos
+                + dvec2(view.size.x - MM_W - MM_MARGIN, view.size.y - MM_H - MM_MARGIN),
+            size: dvec2(MM_W, MM_H),
+        };
+        self.minimap_rect = mm_rect;
+        cx.push_clip_rect(mm_rect);
+        self.draw_mm_bg.draw_abs(cx, mm_rect);
+
+        let card_rects: Vec<Rect> = self
+            .data
+            .as_ref()
+            .map(|data| {
+                let scale = ((MM_W - 2.0 * MM_PAD) / data.max_w)
+                    .min((MM_H - 2.0 * MM_PAD) / data.max_h);
+                let offset = mm_rect.pos
+                    + (mm_rect.size - dvec2(data.max_w * scale, data.max_h * scale)) * 0.5;
+                self.mm_scale = scale;
+                self.mm_offset = offset;
+                let to_mm = |p: DVec2| p * scale + offset;
+                data.nodes
+                    .iter()
+                    .map(|n| Rect {
+                        pos: to_mm(n.pos),
+                        size: n.size * scale,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (i, r) in card_rects.iter().enumerate() {
+            let draw = if self.selected.contains(&i) {
+                &mut self.draw_mm_sel
+            } else {
+                &mut self.draw_mm_card
+            };
+            draw.draw_abs(cx, *r);
+        }
+
+        // Viewport indicator: the current pan/zoom view in world coords.
+        if self.mm_scale > 0.0 {
+            let world_view = Rect {
+                pos: (view.pos - self.pan) / self.zoom,
+                size: view.size / self.zoom,
+            };
+            let to_mm = |p: DVec2| p * self.mm_scale + self.mm_offset;
+            self.draw_mm_view.draw_abs(
+                cx,
+                Rect {
+                    pos: to_mm(world_view.pos),
+                    size: world_view.size * self.mm_scale,
+                },
+            );
+        }
+        cx.pop_clip_rect();
+    }
+
+        // Jump the viewport so the minimap point under `abs` becomes the view
+        // center; used for click-to-jump and drag-to-navigate.
+        fn navigate_minimap(&mut self, cx: &mut Cx, abs: DVec2) {
+            if self.mm_scale <= 0.0 {
+                return;
+            }
+            let world = (abs - self.mm_offset) / self.mm_scale;
+            let view_center = (self.view_rect.pos + self.view_rect.size * 0.5) * self.zoom + self.pan;
+            self.pan = view_center - world * self.zoom;
+            self.redraw(cx);
+        }
+
+        fn on_minimap(&self, event: &Event) -> bool {
+            let hit = |p: &DVec2| self.minimap_rect.contains(*p);
+            match event {
+                Event::MouseDown(e) => hit(&e.abs),
+                Event::MouseMove(e) => hit(&e.abs),
+                Event::MouseUp(e) => hit(&e.abs),
+                Event::Scroll(e) => hit(&e.abs),
+                Event::LongPress(e) => hit(&e.abs),
+                Event::TouchUpdate(e) => e.touches.iter().any(|t| hit(&t.abs)),
+                _ => false,
+            }
+        }
 
     fn hit_card(&self, world: DVec2) -> Option<usize> {
         let data = self.data.as_ref()?;

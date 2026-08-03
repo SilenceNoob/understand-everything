@@ -4,8 +4,11 @@ use makepad_widgets::*;
 
 app_main!(App);
 
+mod float_panel;
 mod markdown_media;
 mod mindmap;
+
+use crate::float_panel::FloatPanelWidgetRefExt;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -87,6 +90,16 @@ script_mod! {
                             border_size: uniform(0.0)
                         }
                     }
+                    debug_btn := mod.widgets.ButtonFlat{
+                        text: "Debug"
+                        draw_bg +: {
+                            color: #14171d
+                            color_hover: #232834
+                            color_down: #232834
+                            color_focus: #232834
+                            border_size: uniform(0.0)
+                        }
+                    }
                     caption_label := mod.widgets.View{
                         width: Fill
                         height: Fill
@@ -133,6 +146,7 @@ script_mod! {
                     mindmap := mod.widgets.MindMap{}
                     setting_popup := PopupTemplate{}
                     about_popup := PopupTemplate{}
+                    float_panel := mod.widgets.FloatPanel{}
                 }
             }
         }
@@ -152,10 +166,17 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         crate::markdown_media::script_mod(vm);
         crate::mindmap::script_mod(vm);
+        crate::float_panel::script_mod(vm);
         self::script_mod(vm)
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if let Event::Draw(de) = event {
+            // PerfGraph reads per-frame samples from Cx::perf_monitor, but the
+            // platform only feeds frame_boundary on macOS; without this the
+            // graph on Linux would be an empty shell. One line of wiring.
+            cx.perf_monitor.frame_boundary(de.time);
+        }
         self.match_event(cx, event);
         if let Event::Actions(actions) = event {
             if self.ui.button(cx, ids!(setting_btn)).clicked(actions) {
@@ -200,6 +221,16 @@ impl AppMain for App {
             {
                 self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
             }
+            if self.ui.button(cx, ids!(debug_btn)).clicked(actions) {
+                let panel = self.ui.float_panel(cx, ids!(float_panel));
+                if panel.opened() {
+                    panel.hide(cx);
+                } else {
+                    panel.show(cx);
+                    self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+                    self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+                }
+            }
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
         // The Window widget answers Caption for the whole caption bar (a
@@ -207,7 +238,7 @@ impl AppMain for App {
         // (last write wins, read by the platform after handle_event), so the
         // menu buttons inside the title bar stay clickable.
         if let Event::WindowDragQuery(dq) = event {
-            for id in [ids!(setting_btn), ids!(about_btn)] {
+            for id in [ids!(setting_btn), ids!(about_btn), ids!(debug_btn)] {
                 let a = self.ui.button(cx, id).area();
                 if a.is_valid(cx) && a.rect(cx).contains(dq.abs) {
                     dq.response.set(WindowDragQueryResponse::Client);
