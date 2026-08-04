@@ -168,6 +168,9 @@ pub struct App {
 impl App {
     fn open_map(&mut self, cx: &mut Cx, map_file: &str) {
         self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, map_file);
+        self.ui
+            .file_panel(cx, ids!(file_panel))
+            .set_current_map(cx, Some(map_file));
         self.map_opened = true;
         self.sync_title(cx);
     }

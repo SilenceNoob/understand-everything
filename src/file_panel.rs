@@ -90,6 +90,10 @@ script_mod! {
         draw_menu_hl +: {
             color: #ffffff1a
         }
+        // Highlight for the currently open map's row.
+        draw_sel_hl +: {
+            color: #7d8bd455
+        }
         // Top pane: map files (v1: the single map.json).
         canvas_pane := mod.widgets.View{
             width: Fill
@@ -495,7 +499,8 @@ fn scroll_rows(n: usize, list: Rect, dy: f64, scroll: &mut f64) -> bool {
 
 /// Draw one pane's row list (clipped to the list rect), lazily creating row
 /// widgets and registering the list hit area. `edit` marks the row showing
-/// the inline name input instead of the name label.
+/// the inline name input instead of the name label. Map rows whose value
+/// matches `selected` are highlighted (the currently open map).
 fn draw_rows(
     cx: &mut Cx2d,
     scope: &mut Scope,
@@ -508,6 +513,8 @@ fn draw_rows(
     area: &mut Area,
     edit: Option<usize>,
     expanded: &HashSet<String>,
+    selected: Option<&str>,
+    sel_hl: &mut DrawColor,
 ) {
     if rows.is_empty() || list_rect.size.y <= 0.0 {
         return;
@@ -520,6 +527,9 @@ fn draw_rows(
         };
         if !list_rect.intersects(r) {
             continue;
+        }
+        if list == LIST_MAP && selected == Some(row.value.as_str()) {
+            sel_hl.draw_abs(cx, r);
         }
         let fresh = refs.get(i).is_none();
         let w = row_ref(cx, template, refs, i, list, row, expanded);
@@ -739,6 +749,12 @@ pub struct FilePanel {
     draw_drop_hl: DrawColor,
     #[live]
     draw_menu_hl: DrawColor,
+    #[live]
+    draw_sel_hl: DrawColor,
+    /// The currently open map (rel path, e.g. "maps/foo.json"); its row gets
+    /// the selection highlight. Set by App::open_map alongside switch_map.
+    #[rust]
+    current_map: Option<String>,
 }
 
 /// What an inline edit will create / modify on confirm.
@@ -879,6 +895,8 @@ impl Widget for FilePanel {
                     &mut self.map_list_area,
                     edit,
                     expanded,
+                    self.current_map.as_deref(),
+                    &mut self.draw_sel_hl,
                 );
             }
             let card_list = Rect {
@@ -901,6 +919,8 @@ impl Widget for FilePanel {
                     &mut self.card_list_area,
                     edit,
                     expanded,
+                    None,
+                    &mut self.draw_sel_hl,
                 );
             }
             // Drop-target highlight while dragging a file over a dir row.
@@ -1761,6 +1781,16 @@ impl FilePanelRef {
             }
         }
         None
+    }
+
+    /// Highlight the row of the currently open map (`None` clears it).
+    pub fn set_current_map(&self, cx: &mut Cx, map_file: Option<&str>) {
+        if let Some(mut w) = self.borrow_mut() {
+            if w.current_map.as_deref() != map_file {
+                w.current_map = map_file.map(|s| s.to_string());
+                w.redraw(cx);
+            }
+        }
     }
 }
 

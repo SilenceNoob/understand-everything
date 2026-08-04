@@ -87,7 +87,7 @@ pub struct Node {
 
 pub struct MindMapData {
     pub nodes: Vec<Node>,
-    pub root: usize,
+    pub root: Option<usize>,
     pub max_w: f64,
     pub max_h: f64,
     /// View state (pan, zoom) restored from map.json, applied by the widget.
@@ -130,7 +130,12 @@ impl MindMapData {
             })
             .collect();
         let id_of = |nodes: &[Node], id: &str| nodes.iter().position(|n| n.id == id);
-        let root = id_of(&nodes, "root")?;
+        let root = id_of(&nodes, "root");
+        // Empty maps are valid (zero nodes); a non-empty map without a root
+        // is malformed and fails to load, as before.
+        if root.is_none() && !nodes.is_empty() {
+            return None;
+        }
         for i in 0..nodes_json.len() {
             if let Some(children) = &nodes_json[i].children {
                 for cid in children {
@@ -141,7 +146,7 @@ impl MindMapData {
             }
         }
         for i in 0..nodes.len() {
-            if nodes[i].body.is_empty() && nodes[i].title.is_empty() {
+            if nodes[i].body.is_empty() && nodes[i].title.is_empty() && !nodes_json[i].path.is_empty() {
                 if let Some(w) = nodes[i].path.file_stem() {
                     nodes[i].title = w.to_string_lossy().into_owned();
                 }
@@ -175,10 +180,15 @@ impl MindMapData {
     }
 
     fn layout(&mut self) {
-        self.calc_h(self.root);
+        let Some(root) = self.root else {
+            self.max_w = CANVAS_MARGIN;
+            self.max_h = CANVAS_MARGIN;
+            return;
+        };
+        self.calc_h(root);
         let mut cursor_y = 0.0;
         let mut max_w = 0.0;
-        self.place(self.root, 0, &mut cursor_y, &mut max_w);
+        self.place(root, 0, &mut cursor_y, &mut max_w);
         self.max_h = (cursor_y - GAP_Y).max(CARD_H) + CANVAS_MARGIN;
         self.max_w = max_w + CANVAS_MARGIN;
     }
@@ -2010,9 +2020,10 @@ pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
     }
 }
 
-/// Minimal map file content for a brand-new map: a single empty root card.
+/// Minimal map file content for a brand-new map: zero nodes (a truly empty
+/// map — the user starts from a blank canvas).
 pub fn new_map_json() -> String {
-    serde_json::json!({"nodes":[{"id":"root","title":"","path":"","children":[]}]}).to_string()
+    serde_json::json!({"nodes":[]}).to_string()
 }
 
 /// Rewrite node `path` references in every map under maps/ so a renamed
@@ -2158,19 +2169,24 @@ mod tests {
         .unwrap();
         let one = MindMapData::load_from(&dir, "maps/map.json").unwrap();
         let two = MindMapData::load_from(&dir, "maps/other.json").unwrap();
-        assert_eq!(one.nodes[one.root].title, "One");
-        assert_eq!(two.nodes[two.root].title, "Two");
+        assert_eq!(one.nodes[one.root.unwrap()].title, "One");
+        assert_eq!(two.nodes[two.root.unwrap()].title, "Two");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn new_map_json_loads_with_single_root() {
+    fn new_map_json_loads_empty() {
         let dir = std::env::temp_dir().join(format!("ue-mindmap-test4-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("maps")).unwrap();
         std::fs::write(dir.join("maps/x.json"), new_map_json()).unwrap();
         let data = MindMapData::load_from(&dir, "maps/x.json").unwrap();
-        assert_eq!(data.nodes.len(), 1);
-        assert_eq!(data.nodes[data.root].id, "root");
+        assert!(data.nodes.is_empty());
+        assert_eq!(data.root, None);
+        // An empty map survives save/reload (write_map iterates all nodes,
+        // zero of them, and produces a loadable file again).
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/x.json");
+        let again = MindMapData::load_from(&dir, "maps/x.json").unwrap();
+        assert!(again.nodes.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2246,7 +2262,7 @@ mod tests {
         // A and C removed; B and D re-parented to the root
         let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
         assert_eq!(data.nodes.len(), 3, "root + B + D");
-        assert_eq!(data.nodes[data.root].children, vec![1, 2]);
+        assert_eq!(data.nodes[data.root.unwrap()].children, vec![1, 2]);
         assert_eq!(data.nodes[1].title, "B");
         assert_eq!(data.nodes[2].title, "D");
         // root in the doomed dir is kept
