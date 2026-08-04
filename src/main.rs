@@ -161,6 +161,29 @@ script_mod! {
 pub struct App {
     #[live]
     ui: WidgetRef,
+    #[rust]
+    map_opened: bool,
+}
+
+impl App {
+    fn open_map(&mut self, cx: &mut Cx, map_file: &str) {
+        self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, map_file);
+        self.map_opened = true;
+        self.sync_title(cx);
+    }
+
+    fn sync_title(&mut self, cx: &mut Cx) {
+        let title = if self.map_opened {
+            self.ui
+                .mind_map(cx, ids!(mindmap))
+                .current_map_file()
+                .map(|f| file_panel::display_name(&f))
+                .unwrap_or_else(|| "Understand Everything".to_string())
+        } else {
+            "Understand Everything".to_string()
+        };
+        self.ui.label(cx, ids!(caption_label.label)).set_text(cx, &title);
+    }
 }
 
 impl MatchEvent for App {}
@@ -238,13 +261,13 @@ impl AppMain for App {
             }
             // File panel tree: clicking a map switches the mindmap to it.
             if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).map_clicked(actions) {
-                self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, &map_file);
+                self.open_map(cx, &map_file);
             }
             // Context menu: create map / dir, delete map, rename.
             let base = crate::mindmap::app_base_dir();
             if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
                 std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
-                self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, &map_file);
+                self.open_map(cx, &map_file);
             }
             if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
                 std::fs::create_dir(base.join(&dir)).ok();
@@ -270,7 +293,7 @@ impl AppMain for App {
                             .into_iter()
                             .next()
                             .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
-                        mind_map.switch_map(cx, &next);
+                        self.open_map(cx, &next);
                     }
                 } else {
                     std::fs::remove_file(base.join(&rel)).ok();
@@ -281,7 +304,7 @@ impl AppMain for App {
                             .into_iter()
                             .next()
                             .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
-                        mind_map.switch_map(cx, &next);
+                        self.open_map(cx, &next);
                     }
                 }
             }
@@ -295,7 +318,7 @@ impl AppMain for App {
                     // name (content is unchanged, the saved view survives).
                     let mind_map = self.ui.mind_map(cx, ids!(mindmap));
                     if mind_map.current_map_file().as_deref() == Some(from.as_str()) {
-                        mind_map.switch_map(cx, &to);
+                        self.open_map(cx, &to);
                     }
                 }
             }

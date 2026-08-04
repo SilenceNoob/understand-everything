@@ -323,7 +323,7 @@ fn menu_item_index(menu_rect: Rect, items: usize, abs: DVec2) -> Option<usize> {
 /// Display name for a list row value (rel path, dirs carry a trailing "/"):
 /// just the last path segment — files show their stem (no extension), dirs
 /// their name without the trailing "/".
-fn display_name(rel: &str) -> String {
+pub(crate) fn display_name(rel: &str) -> String {
     let name = rel
         .trim_end_matches('/')
         .rsplit('/')
