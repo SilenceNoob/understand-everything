@@ -4,6 +4,7 @@ use makepad_widgets::*;
 
 app_main!(App);
 
+mod file_panel;
 mod float_panel;
 mod markdown_media;
 mod mindmap;
@@ -147,6 +148,7 @@ script_mod! {
                     setting_popup := PopupTemplate{}
                     about_popup := PopupTemplate{}
                     float_panel := mod.widgets.FloatPanel{}
+                    file_panel := mod.widgets.FilePanel{}
                 }
             }
         }
@@ -167,6 +169,7 @@ impl AppMain for App {
         crate::markdown_media::script_mod(vm);
         crate::mindmap::script_mod(vm);
         crate::float_panel::script_mod(vm);
+        crate::file_panel::script_mod(vm);
         self::script_mod(vm)
     }
 
