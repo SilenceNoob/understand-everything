@@ -276,7 +276,7 @@ const ARROW_W: f64 = 24.0;
 
 /// Trim `raw`; None when empty. Inputs without an extension get `default_ext`
 /// appended (maps `.json`, cards `.md`, dirs None).
-fn normalize_name(raw: &str, default_ext: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_name(raw: &str, default_ext: Option<&str>) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
         return None;

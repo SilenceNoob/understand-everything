@@ -145,13 +145,6 @@ impl MindMapData {
                 }
             }
         }
-        for i in 0..nodes.len() {
-            if nodes[i].body.is_empty() && nodes[i].title.is_empty() && !nodes_json[i].path.is_empty() {
-                if let Some(w) = nodes[i].path.file_stem() {
-                    nodes[i].title = w.to_string_lossy().into_owned();
-                }
-            }
-        }
         let mut data = MindMapData {
             nodes,
             root,
@@ -754,7 +747,7 @@ impl Widget for MindMap {
                 .map(|d| {
                     let node = &d.nodes[di];
                     (
-                        node.title.clone(),
+                        card_title(node),
                         node.body.clone(),
                         node.path.parent().map(|p| p.to_path_buf()),
                     )
@@ -1853,8 +1846,9 @@ impl MindMap {
         let value = t.as_object().into();
         let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
         let node = self.data.as_ref().unwrap().nodes[i].clone();
-        w.label(cx, ids!(title)).set_text(cx, &node.title);
-        w.label(cx, ids!(compact_label)).set_text(cx, &node.title);
+        let name = card_title(&node);
+        w.label(cx, ids!(title)).set_text(cx, &name);
+        w.label(cx, ids!(compact_label)).set_text(cx, &name);
         w.markdown_media(cx, ids!(markdown)).set_text(cx, &node.body);
         if let Some(dir) = node.path.parent() {
             w.markdown_media(cx, ids!(markdown)).set_base_dir(dir.to_path_buf());
@@ -1874,7 +1868,7 @@ impl MindMap {
             return;
         };
         let node = self.data.as_ref().unwrap().nodes[i].clone();
-        card.text_input(cx, ids!(title_edit)).set_text(cx, &node.title);
+        card.text_input(cx, ids!(title_edit)).set_text(cx, &card_title(&node));
         card.text_input(cx, ids!(body_edit)).set_text(cx, &node.body);
         card.button(cx, ids!(edit_btn)).reset_hover(cx);
         card.button(cx, ids!(done_btn)).reset_hover(cx);
@@ -1889,24 +1883,29 @@ impl MindMap {
         let Some(card) = self.cards.get(i).cloned() else {
             return;
         };
-        let new_title = card.text_input(cx, ids!(title_edit)).text();
+        // The title input now edits the card's body file name (the header
+        // shows the file stem), so committing may rename the .md file and
+        // rewrite its path in every map.
+        let new_name = card.text_input(cx, ids!(title_edit)).text();
         let new_body = card.text_input(cx, ids!(body_edit)).text();
-        let mut title_changed = false;
+        let mut renamed = false;
         if let Some(data) = &mut self.data {
             let node = &mut data.nodes[i];
-            title_changed = new_title != node.title;
-            node.title = new_title;
             node.body = new_body;
             if let Err(e) = std::fs::write(&node.path, &node.body) {
                 log!("mindmap: save {} failed: {e}", node.path.display());
             }
-            let title = node.title.clone();
+            if let Some(new_path) = rename_card_file(&app_base_dir(), &node.path, &new_name) {
+                renamed = new_path != node.path;
+                node.path = new_path;
+            }
+            let name = card_title(node);
             let body = node.body.clone();
-            card.label(cx, ids!(title)).set_text(cx, &title);
-            card.label(cx, ids!(compact_label)).set_text(cx, &title);
+            card.label(cx, ids!(title)).set_text(cx, &name);
+            card.label(cx, ids!(compact_label)).set_text(cx, &name);
             card.markdown_media(cx, ids!(markdown)).set_text(cx, &body);
         }
-        if title_changed {
+        if renamed {
             self.save_map();
         }
         self.redraw(cx);
@@ -2024,6 +2023,32 @@ pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
 /// map — the user starts from a blank canvas).
 pub fn new_map_json() -> String {
     serde_json::json!({"nodes":[]}).to_string()
+}
+
+/// Card display title: the stem of its body file (the same name the file
+/// panel shows); falls back to the legacy JSON title when there's no file.
+fn card_title(node: &Node) -> String {
+    node.path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| node.title.clone())
+}
+
+/// Rename a card's body file to `new_name` (extension defaults to .md when
+/// absent) and rewrite its path in every map under maps/ (reuses
+/// rewrite_node_paths). A no-op name returns the old path; rename failure or
+/// an empty name returns None and leaves everything unchanged.
+fn rename_card_file(base: &Path, old: &Path, new_name: &str) -> Option<PathBuf> {
+    let name = crate::file_panel::normalize_name(new_name, Some(".md"))?;
+    let new_path = old.with_file_name(name);
+    if new_path == old {
+        return Some(old.to_path_buf());
+    }
+    std::fs::rename(old, &new_path).ok()?;
+    let from_rel = old.strip_prefix(base).ok()?;
+    let to_rel = new_path.strip_prefix(base).ok()?;
+    rewrite_node_paths(base, &from_rel.to_string_lossy(), &to_rel.to_string_lossy());
+    Some(new_path)
 }
 
 /// Rewrite node `path` references in every map under maps/ so a renamed
@@ -2231,6 +2256,37 @@ mod tests {
         // non-referencing map is untouched
         let json = std::fs::read_to_string(dir.join("maps/untouched.json")).unwrap();
         assert!(json.contains("content/b.md"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_card_file_renames_file_and_updates_maps() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test7-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::write(dir.join("cards/a.md"), "body").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[{"id":"root","title":"","path":"cards/a.md","children":null}]}"#,
+        )
+        .unwrap();
+        let old = dir.join("cards/a.md");
+        let new = rename_card_file(&dir, &old, "b").unwrap();
+        assert_eq!(new, dir.join("cards/b.md"));
+        assert!(new.exists() && !old.exists());
+        // map.json now references the new path; the header title follows it
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let node = &data.nodes[data.root.unwrap()];
+        assert_eq!(node.path, dir.join("cards/b.md"));
+        assert_eq!(card_title(node), "b");
+        // unchanged name is a no-op
+        assert_eq!(
+            rename_card_file(&dir, &new, "b").unwrap(),
+            dir.join("cards/b.md")
+        );
+        // empty name leaves the file alone
+        assert_eq!(rename_card_file(&dir, &new, "  "), None);
+        assert!(new.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
