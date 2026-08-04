@@ -9,7 +9,9 @@ mod float_panel;
 mod markdown_media;
 mod mindmap;
 
+use crate::file_panel::FilePanelWidgetRefExt;
 use crate::float_panel::FloatPanelWidgetRefExt;
+use crate::mindmap::MindMapWidgetRefExt;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -232,6 +234,69 @@ impl AppMain for App {
                     panel.show(cx);
                     self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
                     self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+                }
+            }
+            // File panel tree: clicking a map switches the mindmap to it.
+            if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).map_clicked(actions) {
+                self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, &map_file);
+            }
+            // Context menu: create map / dir, delete map, rename.
+            let base = crate::mindmap::app_base_dir();
+            if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
+                std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
+                self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, &map_file);
+            }
+            if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
+                std::fs::create_dir(base.join(&dir)).ok();
+            }
+            if let Some(rel) = self.ui.file_panel(cx, ids!(file_panel)).delete_entry(actions) {
+                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                if rel.ends_with('/') {
+                    // Directory: maps/ dirs are deletable outright; a cards/
+                    // dir also drops the referencing nodes from every map.
+                    std::fs::remove_dir_all(base.join(&rel)).ok();
+                    if rel.starts_with("cards/") {
+                        crate::mindmap::remove_dir_nodes(&base, &rel);
+                        // Drop ghost cards from the in-memory map so a later
+                        // save can't resurrect the references.
+                        mind_map.reload_map(cx);
+                    }
+                    // The current map may live inside the deleted dir.
+                    if mind_map
+                        .current_map_file()
+                        .is_some_and(|c| c == rel || c.starts_with(&rel))
+                    {
+                        let next = file_panel::all_map_files(&base)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
+                        mind_map.switch_map(cx, &next);
+                    }
+                } else {
+                    std::fs::remove_file(base.join(&rel)).ok();
+                    if mind_map.current_map_file().as_deref() == Some(rel.as_str()) {
+                        // Switch to the first remaining map; none left → the
+                        // default, whose failed load empties the canvas.
+                        let next = file_panel::all_map_files(&base)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
+                        mind_map.switch_map(cx, &next);
+                    }
+                }
+            }
+            if let Some((from, to)) = self.ui.file_panel(cx, ids!(file_panel)).rename_file(actions) {
+                if std::fs::rename(base.join(&from), base.join(&to)).is_ok() {
+                    // Renaming a card/dir breaks map references; rewrite them.
+                    if from.starts_with("cards/") {
+                        crate::mindmap::rewrite_node_paths(&base, &from, &to);
+                    }
+                    // Renaming the current map: keep showing it under the new
+                    // name (content is unchanged, the saved view survives).
+                    let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                    if mind_map.current_map_file().as_deref() == Some(from.as_str()) {
+                        mind_map.switch_map(cx, &to);
+                    }
                 }
             }
         }

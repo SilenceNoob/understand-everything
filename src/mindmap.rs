@@ -49,6 +49,10 @@ const MM_PAD: f64 = 8.0;
 
 #[derive(Deserialize, Serialize)]
 struct MapFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pan: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zoom: Option<f64>,
     nodes: Vec<MapNodeFile>,
 }
 
@@ -58,6 +62,14 @@ struct MapNodeFile {
     title: String,
     path: String,
     children: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    w: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    h: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -78,12 +90,27 @@ pub struct MindMapData {
     pub root: usize,
     pub max_w: f64,
     pub max_h: f64,
+    /// View state (pan, zoom) restored from map.json, applied by the widget.
+    pub saved_view: Option<(DVec2, f64)>,
 }
 
 impl MindMapData {
+    /// Default map file, relative to the app base dir.
+    pub const DEFAULT_MAP: &'static str = "maps/map.json";
+
     pub fn load(base: &Path) -> Option<Self> {
-        let map_path = base.join("map.json");
+        Self::load_from(base, Self::DEFAULT_MAP)
+    }
+
+    /// Load the map JSON at `base/map_file`. Node body paths inside the JSON
+    /// stay relative to `base` (not the map file's directory).
+    pub fn load_from(base: &Path, map_file: &str) -> Option<Self> {
+        let map_path = base.join(map_file);
         let map: MapFile = serde_json::from_str(&std::fs::read_to_string(&map_path).ok()?).ok()?;
+        let saved_view = match (map.pan, map.zoom) {
+            (Some(p), Some(z)) => Some((dvec2(p[0], p[1]), z.clamp(0.3, 2.5))),
+            _ => None,
+        };
         let nodes_json = map.nodes;
         let mut nodes: Vec<Node> = nodes_json
             .iter()
@@ -91,7 +118,10 @@ impl MindMapData {
                 id: n.id.clone(),
                 title: n.title.clone(),
                 path: base.join(&n.path),
-                body: std::fs::read_to_string(base.join(&n.path)).unwrap_or_default(),
+                body: std::fs::read_to_string(base.join(&n.path)).unwrap_or_else(|_| {
+                    log!("mindmap: body file missing for node {}: {:?}", n.id, n.path);
+                    String::new()
+                }),
                 parent: None,
                 children: Vec::new(),
                 pos: DVec2::default(),
@@ -122,8 +152,25 @@ impl MindMapData {
             root,
             max_w: 0.0,
             max_h: 0.0,
+            saved_view,
         };
         data.layout();
+        // Restore saved card geometry; nodes without it keep the auto layout.
+        for (f, j) in nodes_json.iter().zip(&mut data.nodes) {
+            if let (Some(x), Some(y)) = (f.x, f.y) {
+                j.pos = dvec2(x, y);
+            }
+            if let (Some(w), Some(h)) = (f.w, f.h) {
+                j.size = dvec2(w, h);
+            }
+        }
+        let (mut max_w, mut max_h) = (0.0, 0.0);
+        for n in &data.nodes {
+            max_w = max_w.max(n.pos.x + n.size.x);
+            max_h = max_h.max(n.pos.y + n.size.y);
+        }
+        data.max_w = max_w + CANVAS_MARGIN;
+        data.max_h = max_h + CANVAS_MARGIN;
         Some(data)
     }
 
@@ -522,6 +569,10 @@ pub struct MindMap {
     data: Option<MindMapData>,
     #[rust]
     loaded: bool,
+    /// Map file (relative to the app base dir) this widget is showing and
+    /// saving to; switched via MindMapRef::switch_map.
+    #[rust("maps/map.json")]
+    map_file: String,
     #[rust]
     cards: Vec<WidgetRef>,
     #[rust]
@@ -880,8 +931,12 @@ impl Widget for MindMap {
         self.handle_zoom_anim(cx, event);
         self.handle_page_burst(cx, event, scope);
         // WASD pan / QE zoom. Skipped while a card is being edited (TextInput
-        // owns the keys) or the detail panel is open (same rule as wheel zoom).
-        if self.editing_card.is_none() && self.detail_open.is_none() {
+        // owns the keys), the detail panel is open (same rule as wheel zoom),
+        // or the file panel is naming a new map/dir inline.
+        if self.editing_card.is_none()
+            && self.detail_open.is_none()
+            && !crate::file_panel::is_name_editing()
+        {
             match event {
                 Event::KeyDown(ke) => {
                     if ke.key_code == KeyCode::Space && !ke.is_repeat {
@@ -1045,10 +1100,15 @@ impl Widget for MindMap {
             Hit::FingerDown(fe)
                 if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary()) =>
             {
-                // right-button marquee selection
+                // right-button marquee selection; skipped over the file panel,
+                // which uses right-clicks for its context menu
                 if self.detail_open.is_none()
                     && self.editing_card.is_none()
                     && !self.minimap_rect.contains(fe.abs)
+                    && !crate::file_panel::PANEL_RECT
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|r| r.contains(fe.abs))
                 {
                     let world = (fe.abs - self.pan) / self.zoom;
                     self.marquee = Some((world, world));
@@ -1112,6 +1172,7 @@ impl Widget for MindMap {
                 self.resize_card = None;
                 self.mm_dragging = false;
                 self.rebuild_targets();
+                self.save_map();
                 if let Some((s, e)) = self.marquee.take() {
                     // commit the selection: every card whose rect touches the
                     // marquee; a tiny box (mis-click) clears the selection
@@ -1131,10 +1192,15 @@ impl Widget for MindMap {
                 }
             }
             Hit::FingerScroll(fe) => {
-                // Wheel over the minimap is swallowed so it never zooms the map.
+                // Wheel over the minimap is swallowed so it never zooms the map;
+                // same for the file panel, whose lists scroll instead.
                 if !self.minimap_rect.contains(fe.abs)
                     && self.detail_open.is_none()
                     && fe.scroll.y != 0.0
+                    && !crate::file_panel::PANEL_RECT
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|r| r.contains(fe.abs))
                 {
                     let world = (fe.abs - self.pan) / self.zoom;
                     // Compact cards have no scrollable body, so treat them
@@ -1242,6 +1308,7 @@ impl MindMap {
                     data.nodes[i].size = t.size;
                 }
             }
+            self.save_map();
             cx.stop_timer(timer);
             self.zoom_timer = None;
         }
@@ -1454,9 +1521,27 @@ impl MindMap {
 
     fn ensure_loaded(&mut self, cx: &mut Cx) {
         self.loaded = true;
+        self.load_map(cx);
+    }
+
+    /// (Re)load `self.map_file` and rebuild all per-map state. Used both for
+    /// the initial load and for switching maps; the previous map is already
+    /// saved on every interaction, so nothing is flushed here. On failure the
+    /// canvas is emptied (so a deleted map can't be resurrected by save_map).
+    fn load_map(&mut self, cx: &mut Cx) {
         let base = app_base_dir();
-        let Some(data) = MindMapData::load(&base) else {
-            log!("mindmap: failed to load map.json in {:?}", base);
+        let map_file = self.map_file.clone();
+        let Some(data) = MindMapData::load_from(&base, &map_file) else {
+            log!("mindmap: failed to load {} in {:?}", map_file, base);
+            self.data = None;
+            self.cards.clear();
+            self.edges.clear();
+            self.selected.clear();
+            self.marquee = None;
+            self.editing_card = None;
+            self.detail_open = None;
+            self.cancel_zoom_anim(cx);
+            self.redraw(cx);
             return;
         };
         let mut edges = Vec::new();
@@ -1464,14 +1549,33 @@ impl MindMap {
             edges.push(cx.with_vm(|vm| DrawEdge::script_new_with_default(vm)));
         }
         let n = data.nodes.len();
+        let saved_view = data.saved_view;
         self.data = Some(data);
         self.edges = edges;
         self.highlight = Some(cx.with_vm(|vm| DrawHighlight::script_new_with_default(vm)));
         self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
+        // Per-map transient state must not leak across switches.
+        self.selected.clear();
+        self.marquee = None;
+        self.editing_card = None;
+        self.detail_open = None;
+        self.drag_card = None;
+        self.resize_card = None;
+        self.arrow_move = 0;
+        self.resize_arrows = 0;
+        self.key_move = 0;
+        self.page_burst = None;
+        self.cancel_zoom_anim(cx);
         self.pan = dvec2(120.0, 60.0);
+        self.zoom = 1.0;
+        if let Some((p, z)) = saved_view {
+            self.pan = p;
+            self.zoom = z;
+        }
         self.pan_target = self.pan;
+        self.zoom_target = self.zoom;
         log!(
             "mindmap ready: {} nodes, {} edges, card_template={}, detail_template={}",
             n,
@@ -1802,7 +1906,7 @@ impl MindMap {
         let Some(data) = &self.data else {
             return;
         };
-        write_map(&app_base_dir(), data);
+        write_map(&app_base_dir(), data, self.pan_target, self.zoom_target, &self.map_file);
     }
 }
 
@@ -1817,7 +1921,139 @@ fn arrow_mask(code: KeyCode) -> Option<u8> {
     })
 }
 
-fn write_map(base: &Path, data: &MindMapData) {
+/// Remove every node whose card path lives under the deleted dir `dir_rel`
+/// ("cards/docs/") from all maps under maps/. The root is never removed (its
+/// card body just goes missing), and surviving children of removed nodes are
+/// re-attached to their nearest surviving ancestor so no dangling children
+/// references remain. Only touched maps are written back.
+pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
+    let Some(entries) = std::fs::read_dir(base.join("maps")).ok() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Ok(json) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut map) = serde_json::from_str::<MapFile>(&json) else {
+            continue;
+        };
+        // Owned parent map: id -> parent id (children arrays may be missing).
+        let mut parent_of: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for n in &map.nodes {
+            if let Some(children) = &n.children {
+                for c in children {
+                    parent_of.insert(c.clone(), n.id.clone());
+                }
+            }
+        }
+        // The removed set, excluding the root (a map must keep a loadable root).
+        let root_id = map.nodes.iter().find(|n| n.id == "root").map(|n| n.id.clone());
+        let removed: Vec<String> = map
+            .nodes
+            .iter()
+            .filter(|n| Some(&n.id) != root_id.as_ref() && n.path.starts_with(dir_rel))
+            .map(|n| n.id.clone())
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let is_removed = |id: &str| removed.iter().any(|r| r == id);
+        // Strip removed ids from every children list (including the doomed
+        // nodes' own lists, so only survivors remain there for re-attach).
+        for n in &mut map.nodes {
+            if let Some(children) = n.children.as_mut() {
+                children.retain(|c| !is_removed(c));
+            }
+        }
+        // Re-attach each removed node's surviving children to its nearest
+        // surviving ancestor (walk past other removed nodes).
+        for n in &removed {
+            let mut ancestor = parent_of.get(n).cloned();
+            while let Some(a) = &ancestor {
+                if is_removed(a) {
+                    ancestor = parent_of.get(a).cloned();
+                } else {
+                    break;
+                }
+            }
+            let Some(ancestor) = ancestor else {
+                continue;
+            };
+            let survivors: Vec<String> = map
+                .nodes
+                .iter()
+                .find(|node| &node.id == n)
+                .and_then(|node| node.children.as_deref())
+                .unwrap_or(&[])
+                .to_vec();
+            if survivors.is_empty() {
+                continue;
+            }
+            if let Some(a) = map.nodes.iter_mut().find(|node| node.id == ancestor) {
+                let list = a.children.get_or_insert_with(Vec::new);
+                for s in survivors {
+                    if !list.contains(&s) {
+                        list.push(s);
+                    }
+                }
+            }
+        }
+        map.nodes.retain(|n| !is_removed(&n.id));
+        if let Ok(out) = serde_json::to_string_pretty(&map) {
+            std::fs::write(&p, out).ok();
+        }
+    }
+}
+
+/// Minimal map file content for a brand-new map: a single empty root card.
+pub fn new_map_json() -> String {
+    serde_json::json!({"nodes":[{"id":"root","title":"","path":"","children":[]}]}).to_string()
+}
+
+/// Rewrite node `path` references in every map under maps/ so a renamed
+/// card/dir keeps its content wired up. Files match exactly; dirs (trailing
+/// "/") match by prefix. Only touched maps are written back.
+pub(crate) fn rewrite_node_paths(base: &Path, from_rel: &str, to_rel: &str) {
+    let Some(entries) = std::fs::read_dir(base.join("maps")).ok() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Ok(json) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut map) = serde_json::from_str::<MapFile>(&json) else {
+            continue;
+        };
+        let mut changed = false;
+        for n in &mut map.nodes {
+            if from_rel.ends_with('/') {
+                if let Some(rest) = n.path.strip_prefix(from_rel) {
+                    n.path = format!("{to_rel}{rest}");
+                    changed = true;
+                }
+            } else if n.path == from_rel {
+                n.path = to_rel.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            if let Ok(out) = serde_json::to_string_pretty(&map) {
+                std::fs::write(&p, out).ok();
+            }
+        }
+    }
+}
+
+fn write_map(base: &Path, data: &MindMapData, pan: DVec2, zoom: f64, map_file: &str) {
     let nodes = data
         .nodes
         .iter()
@@ -1826,20 +2062,28 @@ fn write_map(base: &Path, data: &MindMapData) {
             title: n.title.clone(),
             path: n
                 .path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
+                .strip_prefix(base)
+                .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             children: if n.children.is_empty() {
                 None
             } else {
                 Some(n.children.iter().map(|&c| data.nodes[c].id.clone()).collect())
             },
+            x: Some(n.pos.x),
+            y: Some(n.pos.y),
+            w: Some(n.size.x),
+            h: Some(n.size.y),
         })
         .collect();
-    let map = MapFile { nodes };
+    let map = MapFile {
+        pan: Some([pan.x, pan.y]),
+        zoom: Some(zoom),
+        nodes,
+    };
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        if let Err(e) = std::fs::write(base.join("map.json"), json) {
-            log!("mindmap: save map.json failed: {e}");
+        if let Err(e) = std::fs::write(base.join(map_file), json) {
+            log!("mindmap: save {map_file} failed: {e}");
         }
     }
 }
@@ -1851,23 +2095,198 @@ mod tests {
     #[test]
     fn map_write_reload_preserves_title_and_children() {
         let dir = std::env::temp_dir().join(format!("ue-mindmap-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
         std::fs::write(dir.join("a.md"), "hello").unwrap();
         std::fs::write(
-            dir.join("map.json"),
+            dir.join("maps/map.json"),
             r#"{"nodes":[{"id":"root","title":"Rust","path":"a.md","children":["child"]},{"id":"child","title":"","path":"a.md","children":null}]}"#,
         )
         .unwrap();
         let mut data = MindMapData::load(&dir).unwrap();
         assert_eq!(data.nodes[0].title, "Rust");
+        assert_eq!(data.saved_view, None);
         data.nodes[0].title = "Rust2".into();
-        write_map(&dir, &data);
+        data.nodes[0].pos = dvec2(11.0, 22.0);
+        data.nodes[0].size = dvec2(300.0, 400.0);
+        write_map(&dir, &data, dvec2(5.0, 6.0), 1.5, MindMapData::DEFAULT_MAP);
         let again = MindMapData::load(&dir).unwrap();
         assert_eq!(again.nodes[0].title, "Rust2");
         assert_eq!(again.nodes[0].children, vec![1]);
         assert_eq!(again.nodes[1].children, Vec::<usize>::new());
         assert_eq!(again.nodes[0].body, "hello");
+        assert_eq!(again.nodes[0].pos, dvec2(11.0, 22.0));
+        assert_eq!(again.nodes[0].size, dvec2(300.0, 400.0));
+        assert_eq!(again.saved_view, Some((dvec2(5.0, 6.0), 1.5)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_map_preserves_subdir_path() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test2-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("content")).unwrap();
+        std::fs::write(dir.join("content/a.md"), "hello").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[{"id":"root","title":"Rust","path":"content/a.md","children":null}]}"#,
+        )
+        .unwrap();
+        let data = MindMapData::load(&dir).unwrap();
+        assert_eq!(data.nodes[0].body, "hello");
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, MindMapData::DEFAULT_MAP);
+        let json = std::fs::read_to_string(dir.join("maps/map.json")).unwrap();
+        assert!(json.contains("\"path\": \"content/a.md\""), "{json}");
+        let again = MindMapData::load(&dir).unwrap();
+        assert_eq!(again.nodes[0].body, "hello");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_from_switches_map_file() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test3-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::write(dir.join("a.md"), "hello").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[{"id":"root","title":"One","path":"a.md","children":null}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("maps/other.json"),
+            r#"{"nodes":[{"id":"root","title":"Two","path":"a.md","children":null}]}"#,
+        )
+        .unwrap();
+        let one = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let two = MindMapData::load_from(&dir, "maps/other.json").unwrap();
+        assert_eq!(one.nodes[one.root].title, "One");
+        assert_eq!(two.nodes[two.root].title, "Two");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_map_json_loads_with_single_root() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test4-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::write(dir.join("maps/x.json"), new_map_json()).unwrap();
+        let data = MindMapData::load_from(&dir, "maps/x.json").unwrap();
+        assert_eq!(data.nodes.len(), 1);
+        assert_eq!(data.nodes[data.root].id, "root");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewrite_node_paths_updates_all_referencing_maps() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test5-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("content/docs")).unwrap();
+        let map = |root, path| {
+            serde_json::json!({
+                "nodes": [
+                    {"id": "root", "title": root, "path": path, "children": ["kid"]},
+                    {"id": "kid", "title": "", "path": path, "children": null}
+                ]
+            })
+            .to_string()
+        };
+        std::fs::write(
+            dir.join("maps/map.json"),
+            map("One", "content/docs/a.md"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("maps/other.json"),
+            map("Two", "content/docs/a.md"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("maps/untouched.json"), map("Three", "content/b.md")).unwrap();
+        // file rename rewrites exact matches in every map
+        rewrite_node_paths(&dir, "content/docs/a.md", "content/docs/b.md");
+        for f in ["maps/map.json", "maps/other.json"] {
+            let json = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(json.contains("content/docs/b.md"), "{f}: {json}");
+            assert!(!json.contains("content/docs/a.md"), "{f}: {json}");
+        }
+        // dir rename rewrites by prefix
+        rewrite_node_paths(&dir, "content/docs/", "content/renamed/");
+        for f in ["maps/map.json", "maps/other.json"] {
+            let json = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(json.contains("content/renamed/b.md"), "{f}: {json}");
+        }
+        // non-referencing map is untouched
+        let json = std::fs::read_to_string(dir.join("maps/untouched.json")).unwrap();
+        assert!(json.contains("content/b.md"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_dir_nodes_drops_cards_and_reparents_survivors() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test6-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        let json = r#"{"nodes":[
+            {"id":"root","title":"R","path":"cards/r.md","children":["A"]},
+            {"id":"A","title":"A","path":"cards/docs/a.md","children":["B","C"]},
+            {"id":"B","title":"B","path":"cards/b.md","children":null},
+            {"id":"C","title":"C","path":"cards/docs/c.md","children":["D"]},
+            {"id":"D","title":"D","path":"cards/d.md","children":null}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        // untouched: no refs under the doomed dir
+        std::fs::write(
+            dir.join("maps/other.json"),
+            r#"{"nodes":[{"id":"root","title":"O","path":"cards/x.md","children":null}]}"#,
+        )
+        .unwrap();
+        // root lives inside the doomed dir: it must survive anyway
+        std::fs::write(
+            dir.join("maps/rootdir.json"),
+            r#"{"nodes":[{"id":"root","title":"RD","path":"cards/docs/root.md","children":null}]}"#,
+        )
+        .unwrap();
+        remove_dir_nodes(&dir, "cards/docs/");
+        // A and C removed; B and D re-parented to the root
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(data.nodes.len(), 3, "root + B + D");
+        assert_eq!(data.nodes[data.root].children, vec![1, 2]);
+        assert_eq!(data.nodes[1].title, "B");
+        assert_eq!(data.nodes[2].title, "D");
+        // root in the doomed dir is kept
+        let data = MindMapData::load_from(&dir, "maps/rootdir.json").unwrap();
+        assert_eq!(data.nodes.len(), 1);
+        // untouched map unchanged
+        let json = std::fs::read_to_string(dir.join("maps/other.json")).unwrap();
+        assert!(json.contains("cards/x.md"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+impl MindMapRef {
+    /// Map file (relative to the app base dir) this widget is showing.
+    pub fn current_map_file(&self) -> Option<String> {
+        self.borrow().map(|w| w.map_file.clone())
+    }
+
+    /// Reload the current map from disk (no same-path early return); used
+    /// after external edits like card-dir deletion, so ghost cards don't get
+    /// written back on the next save.
+    pub fn reload_map(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.load_map(cx);
+            inner.redraw(cx);
+        }
+    }
+
+    /// Switch the map this widget shows and edits; `map_file` is relative to
+    /// the app base dir (e.g. "maps/foo.json"). The previous map is already
+    /// saved on every interaction, so it is not flushed here.
+    pub fn switch_map(&self, cx: &mut Cx, map_file: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.map_file == map_file {
+                return;
+            }
+            inner.map_file = map_file.to_string();
+            inner.load_map(cx);
+            inner.redraw(cx);
+        }
     }
 }
 
