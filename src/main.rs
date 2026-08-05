@@ -14,10 +14,12 @@ mod file_panel;
 mod float_panel;
 mod markdown_media;
 mod mindmap;
+mod refs_panel;
 
 use crate::file_panel::FilePanelWidgetRefExt;
 use crate::float_panel::FloatPanelWidgetRefExt;
 use crate::mindmap::MindMapWidgetRefExt;
+use crate::refs_panel::RefsPanelWidgetRefExt;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -546,6 +548,7 @@ script_mod! {
                         }
                     }
                     file_panel := mod.widgets.FilePanel{}
+                    refs_panel := mod.widgets.RefsPanel{}
                 }
             }
         }
@@ -638,6 +641,9 @@ impl App {
         self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, map_file);
         self.ui
             .file_panel(cx, ids!(file_panel))
+            .set_current_map(cx, Some(map_file));
+        self.ui
+            .refs_panel(cx, ids!(refs_panel))
             .set_current_map(cx, Some(map_file));
         self.map_opened = true;
         self.sync_title(cx);
@@ -896,6 +902,9 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_http_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
+        self.ui
+            .refs_panel(cx, ids!(refs_panel))
+            .apply_link_fetch(cx, request_id, response);
         if request_id != self.test_id || !self.testing {
             return;
         }
@@ -918,6 +927,9 @@ impl MatchEvent for App {
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
+        self.ui
+            .refs_panel(cx, ids!(refs_panel))
+            .link_fetch_error(cx, request_id);
         if request_id == self.test_id && self.testing {
             self.testing = false;
             self.ui
@@ -983,6 +995,7 @@ impl AppMain for App {
         crate::float_panel::script_mod(vm);
         crate::file_panel::script_mod(vm);
         crate::chat_list::script_mod(vm);
+        crate::refs_panel::script_mod(vm);
         self::script_mod(vm)
     }
 

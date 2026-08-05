@@ -130,6 +130,18 @@ impl Widget for FloatPanel {
             .unwrap()
             .retain(|(u, _)| *u != self.uid);
         if self.opened {
+            // Initialize the panel position before the first draw: the first
+            // frame must already be drawn at the final pos, or the visible
+            // position (old pos) and the logical self.pos diverge and any
+            // drag grab computed against self.pos jumps the panel to the
+            // bottom-right on the first FingerMove.
+            if !self.inited {
+                self.inited = true;
+                let mut pos = self.window_size - self.panel_size - dvec2(10.0, 10.0);
+                pos.x = pos.x.max(0.0);
+                pos.y = pos.y.max(0.0);
+                self.pos = pos;
+            }
             if let Some(content) = self.content_widget(cx) {
                 // PerfGraph corner-pins its panel to the bottom-right of its
                 // walk rect (pos + size - panel - margin), so give it a
@@ -174,13 +186,6 @@ impl Widget for FloatPanel {
                 // at pass end, so clipped_rect == panel_rect.
                 cx.add_aligned_rect_area(&mut self.panel_area, panel_rect);
                 cx.pop_clip_rect();
-                if !self.inited {
-                    self.inited = true;
-                    let mut pos = self.window_size - self.panel_size - dvec2(10.0, 10.0);
-                    pos.x = pos.x.max(0.0);
-                    pos.y = pos.y.max(0.0);
-                    self.pos = pos;
-                }
             }
         }
         cx.end_turtle_with_area(&mut self.area);

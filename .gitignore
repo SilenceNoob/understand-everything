@@ -1,3 +1,5 @@
 /target
 .codegraph/
 .opencode/node_modules/
+/settings.json
+/refs/

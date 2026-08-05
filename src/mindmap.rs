@@ -940,6 +940,7 @@ impl Widget for MindMap {
             && self.detail_open.is_none()
             && !crate::file_panel::is_name_editing()
             && !crate::float_panel::is_chat_input_active()
+            && !crate::refs_panel::is_url_editing()
         {
             match event {
                 Event::KeyDown(ke) => {
@@ -1104,12 +1105,17 @@ impl Widget for MindMap {
             Hit::FingerDown(fe)
                 if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary()) =>
             {
-                // right-button marquee selection; skipped over the file panel,
-                // which uses right-clicks for its context menu
+                // right-button marquee selection; skipped over the file
+                // panel and the refs panel, which use right-clicks for
+                // their context menus
                 if self.detail_open.is_none()
                     && self.editing_card.is_none()
                     && !self.minimap_rect.contains(fe.abs)
                     && !crate::file_panel::PANEL_RECT
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|r| r.contains(fe.abs))
+                    && !crate::refs_panel::PANEL_RECT_RIGHT
                         .lock()
                         .unwrap()
                         .is_some_and(|r| r.contains(fe.abs))
@@ -1197,12 +1203,17 @@ impl Widget for MindMap {
             }
             Hit::FingerScroll(fe) => {
                 // Wheel over the minimap is swallowed so it never zooms the map;
-                // same for the file panel, whose lists scroll instead, and for
-                // open FloatPanels (their content scrolls instead).
+                // same for the file panel and the refs panel, whose lists
+                // scroll instead, and for open FloatPanels (their content
+                // scrolls instead).
                 if !self.minimap_rect.contains(fe.abs)
                     && self.detail_open.is_none()
                     && fe.scroll.y != 0.0
                     && !crate::file_panel::PANEL_RECT
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|r| r.contains(fe.abs))
+                    && !crate::refs_panel::PANEL_RECT_RIGHT
                         .lock()
                         .unwrap()
                         .is_some_and(|r| r.contains(fe.abs))
