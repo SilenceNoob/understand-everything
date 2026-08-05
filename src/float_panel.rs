@@ -1,5 +1,29 @@
 use makepad_widgets::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+const RESIZE_LEFT: u8 = 1;
+const RESIZE_RIGHT: u8 = 2;
+const RESIZE_TOP: u8 = 4;
+const RESIZE_BOTTOM: u8 = 8;
+/// Edge band (px) where a press starts a resize instead of a drag.
+const RESIZE_T: f64 = 6.0;
+/// Smallest panel size (header + input row fit inside).
+const RESIZE_MIN: DVec2 = dvec2(240.0, 160.0);
+
+/// True while a chat input inside a FloatPanel holds key focus; the mindmap
+/// skips its keyboard shortcuts so typing doesn't move the map.
+pub(crate) static CHAT_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_chat_input_active() -> bool {
+    CHAT_INPUT_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Rect of every open FloatPanel in window coords, keyed by widget uid; the
+/// mindmap skips wheel-zoom over them (their content scrolls instead).
+pub(crate) static FLOAT_PANEL_RECTS: Mutex<Vec<(WidgetUid, Rect)>> = Mutex::new(Vec::new());
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -11,6 +35,9 @@ script_mod! {
         height: Fit
         clip_x: false
         clip_y: false
+
+        // PerfGraph's default panel size (its draw_walk matches this).
+        panel_size: vec2(330.0, 150.0)
 
         content := mod.widgets.PerfGraph{
             // PerfGraph's template leaves draw_text without a text_style, so
@@ -50,13 +77,19 @@ pub struct FloatPanel {
     #[rust]
     dragging: bool,
     #[rust]
+    resizing: u8,
+    #[rust]
     grab: DVec2,
     #[rust]
     window_size: DVec2,
-    // PerfGraph's default panel_width/panel_height (matches the script
-    // defaults; the content pane is window-sized so the clamp never shrinks it).
-    #[rust(dvec2(330.0, 150.0))]
+    // Panel rect size; per-instance overridable from script.
+    #[live(dvec2(330.0, 150.0))]
     panel_size: DVec2,
+    /// Content anchors its panel to the bottom-right of its walk rect
+    /// (PerfGraph does this natively); false walks the content in an exact
+    /// rect at self.pos so a script View draws from its top-left.
+    #[live(true)]
+    pin_bottom_right: bool,
     #[rust]
     panel_area: Area,
     #[rust]
@@ -87,19 +120,34 @@ impl Widget for FloatPanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         self.window_size = cx.current_pass_size();
         cx.begin_turtle(self.walk, self.layout);
+        // Register/remove this panel's rect for the mindmap's wheel-zoom skip.
+        FLOAT_PANEL_RECTS
+            .lock()
+            .unwrap()
+            .retain(|(u, _)| *u != self.uid);
         if self.opened {
             if let Some(content) = self.content_widget(cx) {
                 // PerfGraph corner-pins its panel to the bottom-right of its
                 // walk rect (pos + size - panel - margin), so give it a
                 // window-sized walk shifted so the panel's top-left lands on
-                // self.pos.
-                let walk = Walk {
-                    abs_pos: Some(
-                        self.pos + self.panel_size + dvec2(10.0, 10.0) - self.window_size,
-                    ),
-                    width: Size::Fixed(self.window_size.x),
-                    height: Size::Fixed(self.window_size.y),
-                    ..Walk::default()
+                // self.pos. Top-left anchored content (pin_bottom_right:
+                // false) gets an exact rect at self.pos instead.
+                let walk = if self.pin_bottom_right {
+                    Walk {
+                        abs_pos: Some(
+                            self.pos + self.panel_size + dvec2(10.0, 10.0) - self.window_size,
+                        ),
+                        width: Size::Fixed(self.window_size.x),
+                        height: Size::Fixed(self.window_size.y),
+                        ..Walk::default()
+                    }
+                } else {
+                    Walk {
+                        abs_pos: Some(self.pos),
+                        width: Size::Fixed(self.panel_size.x),
+                        height: Size::Fixed(self.panel_size.y),
+                        ..Walk::default()
+                    }
                 };
                 // This turtle's clip is disabled (clip_x/y: false, required
                 // for visibility at a 0-size walk), so the content's instance
@@ -111,6 +159,7 @@ impl Widget for FloatPanel {
                     pos: self.pos,
                     size: self.panel_size,
                 };
+                FLOAT_PANEL_RECTS.lock().unwrap().push((self.uid, panel_rect));
                 cx.push_clip_rect(panel_rect);
                 let _ = content.draw_walk(cx, scope, walk);
                 // Own rect area over the panel: hit-testing against
@@ -153,12 +202,41 @@ impl Widget for FloatPanel {
         match event.hits_with_capture_overload(cx, self.panel_area, true) {
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 if !child_grabbed {
-                    self.dragging = true;
-                    self.grab = fe.abs - self.pos;
+                    let dir = self.resize_hit(fe.abs);
+                    if dir != 0 {
+                        self.resizing = dir;
+                    } else {
+                        self.dragging = true;
+                        self.grab = fe.abs - self.pos;
+                    }
                 }
             }
             Hit::FingerMove(fe) => {
-                if self.dragging {
+                if self.resizing != 0 {
+                    let dir = self.resizing;
+                    let mut pos = self.pos;
+                    let mut size = self.panel_size;
+                    let max = self.window_size;
+                    if dir & RESIZE_LEFT != 0 {
+                        let w = (size.x + pos.x - fe.abs.x).clamp(RESIZE_MIN.x, max.x);
+                        pos.x += size.x - w;
+                        size.x = w;
+                    }
+                    if dir & RESIZE_RIGHT != 0 {
+                        size.x = (fe.abs.x - pos.x).clamp(RESIZE_MIN.x, max.x);
+                    }
+                    if dir & RESIZE_TOP != 0 {
+                        let h = (size.y + pos.y - fe.abs.y).clamp(RESIZE_MIN.y, max.y);
+                        pos.y += size.y - h;
+                        size.y = h;
+                    }
+                    if dir & RESIZE_BOTTOM != 0 {
+                        size.y = (fe.abs.y - pos.y).clamp(RESIZE_MIN.y, max.y);
+                    }
+                    self.pos = pos;
+                    self.panel_size = size;
+                    self.redraw(cx);
+                } else if self.dragging {
                     let mut pos = fe.abs - self.grab;
                     let max_x = (self.window_size.x - self.panel_size.x - 20.0).max(0.0);
                     let max_y = (self.window_size.y - self.panel_size.y - 20.0).max(0.0);
@@ -170,13 +248,58 @@ impl Widget for FloatPanel {
             }
             Hit::FingerUp(_) => {
                 self.dragging = false;
+                self.resizing = 0;
             }
             _ => {}
+        }
+        if let Event::MouseMove(e) = event {
+            if self.resizing == 0 && !self.dragging {
+                let dir = self.resize_hit(e.abs);
+                let cursor = match (dir & (RESIZE_LEFT | RESIZE_RIGHT) != 0, dir & (RESIZE_TOP | RESIZE_BOTTOM) != 0) {
+                    (true, true) => {
+                        let ne_sw = dir & RESIZE_TOP != 0 && dir & RESIZE_RIGHT != 0
+                            || dir & RESIZE_BOTTOM != 0 && dir & RESIZE_LEFT != 0;
+                        if ne_sw {
+                            MouseCursor::NeswResize
+                        } else {
+                            MouseCursor::NwseResize
+                        }
+                    }
+                    (true, false) => MouseCursor::EwResize,
+                    (false, true) => MouseCursor::NsResize,
+                    (false, false) => MouseCursor::Default,
+                };
+                cx.set_cursor(cursor);
+            }
         }
     }
 }
 
 impl FloatPanel {
+    /// Edge band hit (window coords) as a direction bitmask, 0 when not on
+    /// any edge. Mirrors the mindmap's card resize_hit.
+    fn resize_hit(&self, p: DVec2) -> u8 {
+        let t = RESIZE_T;
+        let r = Rect {
+            pos: self.pos,
+            size: self.panel_size,
+        };
+        let on_l = (p.x - r.pos.x).abs() <= t;
+        let on_r = (p.x - (r.pos.x + r.size.x)).abs() <= t;
+        let on_t = (p.y - r.pos.y).abs() <= t;
+        let on_b = (p.y - (r.pos.y + r.size.y)).abs() <= t;
+        let in_x = p.x >= r.pos.x - t && p.x <= r.pos.x + r.size.x + t;
+        let in_y = p.y >= r.pos.y - t && p.y <= r.pos.y + r.size.y + t;
+        let mut dir = 0;
+        if (on_l || on_r) && in_y {
+            dir |= if on_l { RESIZE_LEFT } else { RESIZE_RIGHT };
+        }
+        if (on_t || on_b) && in_x {
+            dir |= if on_t { RESIZE_TOP } else { RESIZE_BOTTOM };
+        }
+        dir
+    }
+
     fn content_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
         if self.content_ref.is_none() {
             self.content_ref = Some(self.view.widget(cx, ids!(content)));
@@ -192,6 +315,9 @@ impl FloatPanel {
     pub fn hide(&mut self, cx: &mut Cx) {
         self.opened = false;
         self.dragging = false;
+        self.resizing = 0;
+        // The input can't emit KeyFocusLost once the panel is gone.
+        CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed);
         self.redraw(cx);
     }
 }

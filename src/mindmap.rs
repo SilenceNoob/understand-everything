@@ -939,6 +939,7 @@ impl Widget for MindMap {
         if self.editing_card.is_none()
             && self.detail_open.is_none()
             && !crate::file_panel::is_name_editing()
+            && !crate::float_panel::is_chat_input_active()
         {
             match event {
                 Event::KeyDown(ke) => {
@@ -1196,7 +1197,8 @@ impl Widget for MindMap {
             }
             Hit::FingerScroll(fe) => {
                 // Wheel over the minimap is swallowed so it never zooms the map;
-                // same for the file panel, whose lists scroll instead.
+                // same for the file panel, whose lists scroll instead, and for
+                // open FloatPanels (their content scrolls instead).
                 if !self.minimap_rect.contains(fe.abs)
                     && self.detail_open.is_none()
                     && fe.scroll.y != 0.0
@@ -1204,6 +1206,11 @@ impl Widget for MindMap {
                         .lock()
                         .unwrap()
                         .is_some_and(|r| r.contains(fe.abs))
+                    && !crate::float_panel::FLOAT_PANEL_RECTS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, r)| r.contains(fe.abs))
                 {
                     let world = (fe.abs - self.pan) / self.zoom;
                     // Compact cards have no scrollable body, so treat them

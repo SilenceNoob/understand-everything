@@ -2,6 +2,8 @@ pub use makepad_widgets;
 
 use makepad_widgets::*;
 
+use std::sync::atomic::Ordering;
+
 app_main!(App);
 
 mod file_panel;
@@ -103,6 +105,16 @@ script_mod! {
                             border_size: uniform(0.0)
                         }
                     }
+                    ai_btn := mod.widgets.ButtonFlat{
+                        text: "AI"
+                        draw_bg +: {
+                            color: #14171d
+                            color_hover: #232834
+                            color_down: #232834
+                            color_focus: #232834
+                            border_size: uniform(0.0)
+                        }
+                    }
                     caption_label := mod.widgets.View{
                         width: Fill
                         height: Fill
@@ -150,6 +162,76 @@ script_mod! {
                     setting_popup := PopupTemplate{}
                     about_popup := PopupTemplate{}
                     float_panel := mod.widgets.FloatPanel{}
+                    ai_panel := mod.widgets.FloatPanel{
+                        panel_size: vec2(360.0, 480.0)
+                        pin_bottom_right: false
+                        // Chat UI only for now; send is a no-op until the AI
+                        // infrastructure lands.
+                        content := mod.widgets.RoundedView{
+                            width: Fill
+                            height: Fill
+                            flow: Down
+                            show_bg: true
+                            clip_x: true
+                            clip_y: true
+                            draw_bg +: {
+                                color: #1f2430
+                                border_radius: 8.0
+                                border_size: 1.0
+                                border_color: #ffffff14
+                            }
+                            header := mod.widgets.View{
+                                width: Fill
+                                height: (36.0)
+                                flow: Right
+                                padding: Inset{left: 12, right: 12}
+                                align: Align{y: 0.5}
+                                title := mod.widgets.Label{
+                                    width: Fill
+                                    text: "AI 助手"
+                                    draw_text.text_style.font_size: 14.0
+                                    draw_text.color: #e6e9f0
+                                }
+                            }
+                            msgs := mod.widgets.ScrollYView{
+                                width: Fill
+                                height: Fill
+                                flow: Down
+                                msgs_content := mod.widgets.View{
+                                    width: Fill
+                                    height: Fit
+                                    flow: Down
+                                    padding: Inset{left: 12, right: 12, bottom: 12}
+                                    spacing: 8
+                                    greeting := mod.widgets.Label{
+                                        width: Fill
+                                        height: Fit
+                                        text: "你好，我是 AI 助手。\n对当前知识库有什么想问的吗？"
+                                        draw_text.text_style.font_size: 13.0
+                                        draw_text.color: #aab0bc
+                                    }
+                                }
+                            }
+                                input_row := mod.widgets.View{
+                                width: Fill
+                                height: Fit
+                                flow: Right
+                                spacing: 8
+                                padding: Inset{left: 12, right: 12, bottom: 12}
+                                align: Align{y: 1.0}
+                                chat_input := mod.widgets.TextInput{
+                                    width: Fill
+                                    height: Fit{max: FitBound.Abs(120.0)}
+                                    is_multiline: true
+                                    empty_text: "输入消息…"
+                                }
+                                send_btn := mod.widgets.ButtonFlat{
+                                    width: Fit
+                                    text: "发送"
+                                }
+                            }
+                        }
+                    }
                     file_panel := mod.widgets.FilePanel{}
                 }
             }
@@ -262,6 +344,32 @@ impl AppMain for App {
                     self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
                 }
             }
+            if self.ui.button(cx, ids!(ai_btn)).clicked(actions) {
+                let panel = self.ui.float_panel(cx, ids!(ai_panel));
+                if panel.opened() {
+                    panel.hide(cx);
+                } else {
+                    panel.show(cx);
+                    self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+                    self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+                }
+            }
+            // While the AI chat input holds key focus, the mindmap must skip
+            // its keyboard shortcuts (WASD/arrows/Space would otherwise fight
+            // the typing).
+            for action in actions.filter_widget_actions_cast::<TextInputAction>(
+                self.ui.text_input(cx, ids!(chat_input)).widget_uid(),
+            ) {
+                match action {
+                    TextInputAction::KeyFocus => {
+                        crate::float_panel::CHAT_INPUT_ACTIVE.store(true, Ordering::Relaxed)
+                    }
+                    TextInputAction::KeyFocusLost => {
+                        crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed)
+                    }
+                    _ => {}
+                }
+            }
             // File panel tree: clicking a map switches the mindmap to it.
             if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).map_clicked(actions) {
                 self.open_map(cx, &map_file);
@@ -332,7 +440,7 @@ impl AppMain for App {
         // (last write wins, read by the platform after handle_event), so the
         // menu buttons inside the title bar stay clickable.
         if let Event::WindowDragQuery(dq) = event {
-            for id in [ids!(setting_btn), ids!(about_btn), ids!(debug_btn)] {
+            for id in [ids!(setting_btn), ids!(about_btn), ids!(debug_btn), ids!(ai_btn)] {
                 let a = self.ui.button(cx, id).area();
                 if a.is_valid(cx) && a.rect(cx).contains(dq.abs) {
                     dq.response.set(WindowDragQueryResponse::Client);
