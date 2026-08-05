@@ -114,6 +114,10 @@ impl WidgetNode for FloatPanel {
     fn redraw(&mut self, cx: &mut Cx) {
         cx.redraw_area_and_children(self.area);
     }
+
+    fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+        self.view.children(visit);
+    }
 }
 
 impl Widget for FloatPanel {
@@ -337,5 +341,12 @@ impl FloatPanelRef {
         if let Some(mut w) = self.borrow_mut() {
             w.hide(cx);
         }
+    }
+
+    /// The panel's content widget (resolved and cached by the panel itself).
+    pub fn content(&self, cx: &Cx) -> WidgetRef {
+        self.borrow_mut()
+            .and_then(|mut w| w.content_widget(cx))
+            .unwrap_or_default()
     }
 }
