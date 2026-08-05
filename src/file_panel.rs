@@ -70,7 +70,7 @@ script_mod! {
             flow: Down
             show_bg: true
             draw_bg +: {
-                color: #1f2430
+                color: #1f2430f2
                 border_radius: 8.0
                 border_size: 1.0
                 border_color: #ffffff14
@@ -143,9 +143,9 @@ script_mod! {
             draw_text.text_style.font_size: 8.0
             padding: Inset{left: 0, right: 0}
             draw_bg +: {
-                color: #1f2430
-                color_hover: #232834
-                color_down: #232834
+                color: #1f2430f2
+                color_hover: #232834f2
+                color_down: #232834f2
                 border_size: uniform(1.0)
                 border_color: #ffffff14
             }
