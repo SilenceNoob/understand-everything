@@ -69,11 +69,11 @@ script_mod! {
             color_down: #232834
             color_focus: #1f2430
             border_size: uniform(0.0)
-            border_radius: uniform(10.0)
+            border_radius: uniform(2.0)
         }
         draw_text +: {
             text_style: theme.font_regular{
-                font_size: 11.0
+                font_size: 8.0
             }
             color: #7a8192
         }
@@ -88,11 +88,11 @@ script_mod! {
             color_down: #5c7cfa
             color_focus: #4c6ef5
             border_size: uniform(0.0)
-            border_radius: uniform(10.0)
+            border_radius: uniform(2.0)
         }
         draw_text +: {
             text_style: theme.font_bold{
-                font_size: 11.0
+                font_size: 8.0
             }
             color: #ffffff
         }
@@ -599,15 +599,19 @@ script_mod! {
                             height: Fill
                             flow: Right
                             align: Align{y: 1.0}
-                            margin: Inset{bottom: 14}
                             pad_l := mod.widgets.View{
                                 width: Fill{weight: 25}
                                 height: Fit
                             }
                             bar := mod.widgets.RoundedView{
-                            width: Fill{weight: 50}
-                            height: Fit
-                            flow: Right
+                            // Width = 4×34 slots + 3×12 gaps + 2×6 padding,
+                            // keep in sync with layout_dock's BASE_W/GAP.
+                            width: (184.0)
+                            height: (59.0)
+                            // Bottom gap lives on the bar (the content
+                            // margin is dropped by the manual walk).
+                            margin: Inset{bottom: 14}
+                            flow: Overlay
                             align: Align{y: 0.5}
                             spacing: 4
                             padding: Inset{left: 6, right: 6, top: 4, bottom: 4}
@@ -617,122 +621,6 @@ script_mod! {
                                 border_radius: 8.0
                                 border_size: 1.0
                                 border_color: #ffffff14
-                            }
-                            setting_col := mod.widgets.View{
-                                width: Fill{weight: 1}
-                                height: Fit
-                                flow: Down
-                                align: Align{x: 0.5}
-                                spacing: 0
-                                setting_btn := mod.widgets.ButtonFlatIcon{
-                                    text: ""
-                                    icon_walk: Walk{width: 16, height: 16}
-                                    margin: 0
-                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
-                                    draw_icon +: {
-                                        svg: crate_resource("self:resources/setting.svg")
-                                        color: #e6e9f0
-                                    }
-                                    draw_bg +: {
-                                        color: #1f2430f2
-                                        color_hover: #2a3242
-                                        color_down: #232834
-                                        color_focus: #1f2430f2
-                                        border_size: uniform(0.0)
-                                    }
-                                }
-                                setting_label := mod.widgets.Label{
-                                    text: "Setting"
-                                    draw_text.text_style.font_size: 8.0
-                                    draw_text.color: #e6e9f0
-                                }
-                            }
-                            about_col := mod.widgets.View{
-                                width: Fill{weight: 1}
-                                height: Fit
-                                flow: Down
-                                align: Align{x: 0.5}
-                                spacing: 0
-                                about_btn := mod.widgets.ButtonFlatIcon{
-                                    text: ""
-                                    icon_walk: Walk{width: 16, height: 16}
-                                    margin: 0
-                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
-                                    draw_icon +: {
-                                        svg: crate_resource("self:resources/about.svg")
-                                        color: #e6e9f0
-                                    }
-                                    draw_bg +: {
-                                        color: #1f2430f2
-                                        color_hover: #2a3242
-                                        color_down: #232834
-                                        color_focus: #1f2430f2
-                                        border_size: uniform(0.0)
-                                    }
-                                }
-                                about_label := mod.widgets.Label{
-                                    text: "About"
-                                    draw_text.text_style.font_size: 8.0
-                                    draw_text.color: #e6e9f0
-                                }
-                            }
-                            debug_col := mod.widgets.View{
-                                width: Fill{weight: 1}
-                                height: Fit
-                                flow: Down
-                                align: Align{x: 0.5}
-                                spacing: 0
-                                debug_btn := mod.widgets.ButtonFlatIcon{
-                                    text: ""
-                                    icon_walk: Walk{width: 16, height: 16}
-                                    margin: 0
-                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
-                                    draw_icon +: {
-                                        svg: crate_resource("self:resources/debug.svg")
-                                        color: #e6e9f0
-                                    }
-                                    draw_bg +: {
-                                        color: #1f2430f2
-                                        color_hover: #2a3242
-                                        color_down: #232834
-                                        color_focus: #1f2430f2
-                                        border_size: uniform(0.0)
-                                    }
-                                }
-                                debug_label := mod.widgets.Label{
-                                    text: "Debug"
-                                    draw_text.text_style.font_size: 8.0
-                                    draw_text.color: #e6e9f0
-                                }
-                            }
-                            ai_col := mod.widgets.View{
-                                width: Fill{weight: 1}
-                                height: Fit
-                                flow: Down
-                                align: Align{x: 0.5}
-                                spacing: 0
-                                ai_btn := mod.widgets.ButtonFlatIcon{
-                                    text: ""
-                                    icon_walk: Walk{width: 16, height: 16}
-                                    margin: 0
-                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
-                                    draw_icon +: {
-                                        svg: crate_resource("self:resources/ai.svg")
-                                        color: #e6e9f0
-                                    }
-                                    draw_bg +: {
-                                        color: #1f2430f2
-                                        color_hover: #2a3242
-                                        color_down: #232834
-                                        color_focus: #1f2430f2
-                                        border_size: uniform(0.0)
-                                    }
-                                }
-                                ai_label := mod.widgets.Label{
-                                    text: "AI"
-                                    draw_text.text_style.font_size: 8.0
-                                    draw_text.color: #e6e9f0
-                                }
                             }
                         }
                         pad_r := mod.widgets.View{
@@ -874,67 +762,8 @@ fn fmt_tokens(n: usize) -> String {
 }
 
 impl App {
-    /// Bottom-dock button, resolved by direct navigation (root tree lookups
-    /// don't index widgets nested inside custom-widget content).
-    fn dock_button(&self, cx: &Cx, col: LiveId, btn: LiveId) -> WidgetRef {
-        let content = self.ui.bottom_bar(cx, ids!(bottom_bar)).content(cx);
-        let bar = child_by_name(&content, live_id!(bar));
-        let col = child_by_name(&bar, col);
-        child_by_name(&col, btn)
-    }
-
-    /// Setting/About popup toggles and their close buttons.
-    fn handle_popup_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self
-            .dock_button(cx, live_id!(setting_col), live_id!(setting_btn))
-            .as_button()
-            .clicked(actions)
-        {
-            let p = self.ui.view(cx, ids!(setting_popup));
-            let show = !p.visible();
-            p.set_visible(cx, show);
-            if show {
-                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-                p.label(cx, ids!(title)).set_text(cx, "Setting");
-                p.view(cx, ids!(body_box)).set_visible(cx, false);
-                p.view(cx, ids!(settings_form)).set_visible(cx, true);
-                p.text_input(cx, ids!(key_input))
-                    .set_text(cx, &self.ai_config.api_key);
-                p.text_input(cx, ids!(url_input))
-                    .set_text(cx, &self.ai_config.base_url);
-                p.text_input(cx, ids!(model_input))
-                    .set_text(cx, &self.ai_config.model);
-                let thinking_idx = ai::THINKING_LEVELS
-                    .iter()
-                    .position(|l| *l == self.ai_config.thinking)
-                    .unwrap_or(3);
-                p.drop_down(cx, ids!(thinking_input))
-                    .set_selected_item(cx, thinking_idx);
-                p.label(cx, ids!(status)).set_text(cx, "");
-            }
-        }
-        if self
-            .dock_button(cx, live_id!(about_col), live_id!(about_btn))
-            .as_button()
-            .clicked(actions)
-        {
-            let p = self.ui.view(cx, ids!(about_popup));
-            let show = !p.visible();
-            p.set_visible(cx, show);
-            if show {
-                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                p.label(cx, ids!(title)).set_text(cx, "About");
-                p.view(cx, ids!(settings_form)).set_visible(cx, false);
-                p.view(cx, ids!(body_box)).set_visible(cx, true);
-                p.label(cx, ids!(body_box.body)).set_text(
-                    cx,
-                    &format!(
-                        "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
-                        env!("CARGO_PKG_VERSION")
-                    ),
-                );
-            }
-        }
+    /// Setting/About popup close buttons.
+    fn handle_popup_closes(&mut self, cx: &mut Cx, actions: &Actions) {
         if self
             .ui
             .view(cx, ids!(setting_popup))
@@ -953,36 +782,82 @@ impl App {
         }
     }
 
-    /// Perf/chat float panel show-hide toggles.
-    fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self
-            .dock_button(cx, live_id!(debug_col), live_id!(debug_btn))
-            .as_button()
-            .clicked(actions)
-        {
-            let panel = self.ui.float_panel(cx, ids!(float_panel));
-            if panel.opened() {
-                panel.hide(cx);
+    /// Bottom-dock slot taps (0=Setting, 1=About, 2=Debug, 3=AI) — the
+    /// dock hit-tests its own slots and reports taps here.
+    fn handle_dock_clicks(&mut self, cx: &mut Cx) {
+        let Some(col) = self.ui.bottom_bar(cx, ids!(bottom_bar)).take_clicked() else {
+            return;
+        };
+        match col {
+            0 => self.toggle_popup(cx, ids!(setting_popup)),
+            1 => self.toggle_popup(cx, ids!(about_popup)),
+            2 => self.toggle_debug_panel(cx),
+            3 => self.toggle_ai_panel(cx),
+            _ => {}
+        }
+    }
+
+    /// Toggle a Setting/About popup, filling its body when shown.
+    fn toggle_popup(&mut self, cx: &mut Cx, id: &[LiveId]) {
+        let p = self.ui.view(cx, id);
+        let show = !p.visible();
+        p.set_visible(cx, show);
+        if show {
+            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+            if id[0] == live_id!(setting_popup) {
+                p.label(cx, ids!(title)).set_text(cx, "Setting");
+                p.view(cx, ids!(body_box)).set_visible(cx, false);
+                p.view(cx, ids!(settings_form)).set_visible(cx, true);
+                p.text_input(cx, ids!(key_input))
+                    .set_text(cx, &self.ai_config.api_key);
+                p.text_input(cx, ids!(url_input))
+                    .set_text(cx, &self.ai_config.base_url);
+                p.text_input(cx, ids!(model_input))
+                    .set_text(cx, &self.ai_config.model);
+                let thinking_idx = ai::THINKING_LEVELS
+                    .iter()
+                    .position(|l| *l == self.ai_config.thinking)
+                    .unwrap_or(3);
+                p.drop_down(cx, ids!(thinking_input))
+                    .set_selected_item(cx, thinking_idx);
+                p.label(cx, ids!(status)).set_text(cx, "");
             } else {
-                panel.show(cx);
-                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+                p.label(cx, ids!(title)).set_text(cx, "About");
+                p.view(cx, ids!(settings_form)).set_visible(cx, false);
+                p.view(cx, ids!(body_box)).set_visible(cx, true);
+                p.label(cx, ids!(body_box.body)).set_text(
+                    cx,
+                    &format!(
+                        "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                );
             }
         }
-        if self
-            .dock_button(cx, live_id!(ai_col), live_id!(ai_btn))
-            .as_button()
-            .clicked(actions)
-        {
-            let panel = self.ui.float_panel(cx, ids!(ai_panel));
-            if panel.opened() {
-                panel.hide(cx);
-            } else {
-                panel.show(cx);
-                self.sync_jiangou_btns(cx);
-                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-            }
+    }
+
+    /// Perf/chat float panel show-hide toggles.
+    fn toggle_debug_panel(&mut self, cx: &mut Cx) {
+        let panel = self.ui.float_panel(cx, ids!(float_panel));
+        if panel.opened() {
+            panel.hide(cx);
+        } else {
+            panel.show(cx);
+            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+        }
+    }
+
+    fn toggle_ai_panel(&mut self, cx: &mut Cx) {
+        let panel = self.ui.float_panel(cx, ids!(ai_panel));
+        if panel.opened() {
+            panel.hide(cx);
+        } else {
+            panel.show(cx);
+            self.sync_jiangou_btns(cx);
+            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
         }
     }
 
@@ -1691,12 +1566,15 @@ impl AppMain for App {
         }
         self.match_event(cx, event);
         if let Event::Actions(actions) = event {
-            self.handle_popup_actions(cx, actions);
-            self.handle_panel_actions(cx, actions);
+            self.handle_popup_closes(cx, actions);
             self.handle_settings_actions(cx, actions);
             self.handle_chat_actions(cx, actions);
             self.handle_file_panel_actions(cx, actions);
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        // After ui.handle_event: the dock writes pending_click while the
+        // event propagates, so poll it afterwards — a click would otherwise
+        // wait for the next event (never comes with a still mouse).
+        self.handle_dock_clicks(cx);
     }
 }
