@@ -52,6 +52,14 @@ impl SlideState {
             self.last_timer_time = 0.0;
         }
     }
+
+    /// Drive the slide toward `opened` (no-op when already there).
+    pub fn set(&mut self, cx: &mut Cx, opened: bool) {
+        if self.opened == opened {
+            return;
+        }
+        self.toggle(cx);
+    }
 }
 
 /// Context-menu geometry (shared by both panels' DSL menus, which hardcode

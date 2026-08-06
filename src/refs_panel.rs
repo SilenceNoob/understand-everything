@@ -640,13 +640,16 @@ impl RefsPanel {
         self.window_size = cx.current_pass_size();
         let body_y = cx.turtle().rect().pos.y; // body top, window coords
         let body_h = (self.window_size.y - body_y).max(0.0);
+        // 85% of the body height, centered vertically.
+        let panel_h = body_h * crate::util::SIDE_PANEL_H_FRAC;
+        let y_off = (body_h - panel_h) * 0.5;
         let panel = Rect {
-            pos: dvec2(self.window_size.x - self.panel_w * self.slide.progress, body_y),
-            size: dvec2(self.panel_w, body_h),
+            pos: dvec2(self.window_size.x - self.panel_w * self.slide.progress, body_y + y_off),
+            size: dvec2(self.panel_w, panel_h),
         };
         self.panel_rect = panel;
         self.tab_rect = Rect {
-            pos: dvec2(panel.pos.x - TAB_W, body_y + body_h * 0.5 - TAB_H * 0.5),
+            pos: dvec2(panel.pos.x - TAB_W, panel.pos.y + panel.size.y * 0.5 - TAB_H * 0.5),
             size: dvec2(TAB_W, TAB_H),
         };
         self.edge_rect = Rect {

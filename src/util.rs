@@ -31,6 +31,10 @@ pub fn cached_widget(cache: &mut Option<WidgetRef>, f: impl FnOnce() -> WidgetRe
 /// uses this to skip pointer/wheel events over panels.
 static PANEL_RECTS: Mutex<Vec<(u64, Rect)>> = Mutex::new(Vec::new());
 
+/// Side (file/refs) panels occupy this fraction of the body height, centered
+/// vertically; the freed strips pass pointer events through to the canvas.
+pub const SIDE_PANEL_H_FRAC: f64 = 0.95;
+
 /// Register (or, with `None`, unregister) a panel's window-coord rect.
 pub fn set_panel_rect(uid: u64, rect: Option<Rect>) {
     let mut rects = PANEL_RECTS.lock().unwrap();

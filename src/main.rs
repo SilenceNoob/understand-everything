@@ -6,11 +6,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::ai::{AIConfig, SseParser};
+use crate::bottom_bar::BottomBarWidgetRefExt;
 use crate::util::cached_widget;
 
 app_main!(App);
 
 mod ai;
+mod bottom_bar;
 mod chat_list;
 mod file_panel;
 mod float_panel;
@@ -253,53 +255,14 @@ script_mod! {
                     visible: false
                     flow: Right
                     height: 34
-                    setting_btn := mod.widgets.ButtonFlat{
-                        text: "Setting"
-                        draw_bg +: {
-                            color: #14171d
-                            color_hover: #232834
-                            color_down: #232834
-                            color_focus: #232834
-                            border_size: uniform(0.0)
-                        }
-                    }
-                    about_btn := mod.widgets.ButtonFlat{
-                        text: "About"
-                        draw_bg +: {
-                            color: #14171d
-                            color_hover: #232834
-                            color_down: #232834
-                            color_focus: #232834
-                            border_size: uniform(0.0)
-                        }
-                    }
-                    debug_btn := mod.widgets.ButtonFlat{
-                        text: "Debug"
-                        draw_bg +: {
-                            color: #14171d
-                            color_hover: #232834
-                            color_down: #232834
-                            color_focus: #232834
-                            border_size: uniform(0.0)
-                        }
-                    }
-                    ai_btn := mod.widgets.ButtonFlat{
-                        text: "AI"
-                        draw_bg +: {
-                            color: #14171d
-                            color_hover: #232834
-                            color_down: #232834
-                            color_focus: #232834
-                            border_size: uniform(0.0)
-                        }
-                    }
                     caption_label := mod.widgets.View{
                         width: Fill
                         height: Fill
                         align: Center
                         // Balance the caption's right padding against the
                         // windows buttons (width = 3x46) so the title stays
-                        // truly centered with the left menu buttons.
+                        // centered on Windows; on macOS the buttons are
+                        // hidden, so the title sits slightly left of center.
                         padding: Inset{right: 138}
                         label := mod.widgets.Label{
                             text: ""
@@ -626,6 +589,158 @@ script_mod! {
                             }
                         }
                     }
+                    // Setting/About/Debug/AI buttons as an auto-hiding dock,
+                    // bottom-centered at half the window width (25/50/25
+                    // Fill weights keep it proportional on resize); slides up
+                    // while the cursor is in the bottom-edge hot zone.
+                    bottom_bar := mod.widgets.BottomBar{
+                        content := mod.widgets.View{
+                            width: Fill
+                            height: Fill
+                            flow: Right
+                            align: Align{y: 1.0}
+                            margin: Inset{bottom: 14}
+                            pad_l := mod.widgets.View{
+                                width: Fill{weight: 25}
+                                height: Fit
+                            }
+                            bar := mod.widgets.RoundedView{
+                            width: Fill{weight: 50}
+                            height: Fit
+                            flow: Right
+                            align: Align{y: 0.5}
+                            spacing: 4
+                            padding: Inset{left: 6, right: 6, top: 4, bottom: 4}
+                            show_bg: true
+                            draw_bg +: {
+                                color: #1f2430f2
+                                border_radius: 8.0
+                                border_size: 1.0
+                                border_color: #ffffff14
+                            }
+                            setting_col := mod.widgets.View{
+                                width: Fill{weight: 1}
+                                height: Fit
+                                flow: Down
+                                align: Align{x: 0.5}
+                                spacing: 0
+                                setting_btn := mod.widgets.ButtonFlatIcon{
+                                    text: ""
+                                    icon_walk: Walk{width: 16, height: 16}
+                                    margin: 0
+                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
+                                    draw_icon +: {
+                                        svg: crate_resource("self:resources/setting.svg")
+                                        color: #e6e9f0
+                                    }
+                                    draw_bg +: {
+                                        color: #1f2430f2
+                                        color_hover: #2a3242
+                                        color_down: #232834
+                                        color_focus: #1f2430f2
+                                        border_size: uniform(0.0)
+                                    }
+                                }
+                                setting_label := mod.widgets.Label{
+                                    text: "Setting"
+                                    draw_text.text_style.font_size: 8.0
+                                    draw_text.color: #e6e9f0
+                                }
+                            }
+                            about_col := mod.widgets.View{
+                                width: Fill{weight: 1}
+                                height: Fit
+                                flow: Down
+                                align: Align{x: 0.5}
+                                spacing: 0
+                                about_btn := mod.widgets.ButtonFlatIcon{
+                                    text: ""
+                                    icon_walk: Walk{width: 16, height: 16}
+                                    margin: 0
+                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
+                                    draw_icon +: {
+                                        svg: crate_resource("self:resources/about.svg")
+                                        color: #e6e9f0
+                                    }
+                                    draw_bg +: {
+                                        color: #1f2430f2
+                                        color_hover: #2a3242
+                                        color_down: #232834
+                                        color_focus: #1f2430f2
+                                        border_size: uniform(0.0)
+                                    }
+                                }
+                                about_label := mod.widgets.Label{
+                                    text: "About"
+                                    draw_text.text_style.font_size: 8.0
+                                    draw_text.color: #e6e9f0
+                                }
+                            }
+                            debug_col := mod.widgets.View{
+                                width: Fill{weight: 1}
+                                height: Fit
+                                flow: Down
+                                align: Align{x: 0.5}
+                                spacing: 0
+                                debug_btn := mod.widgets.ButtonFlatIcon{
+                                    text: ""
+                                    icon_walk: Walk{width: 16, height: 16}
+                                    margin: 0
+                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
+                                    draw_icon +: {
+                                        svg: crate_resource("self:resources/debug.svg")
+                                        color: #e6e9f0
+                                    }
+                                    draw_bg +: {
+                                        color: #1f2430f2
+                                        color_hover: #2a3242
+                                        color_down: #232834
+                                        color_focus: #1f2430f2
+                                        border_size: uniform(0.0)
+                                    }
+                                }
+                                debug_label := mod.widgets.Label{
+                                    text: "Debug"
+                                    draw_text.text_style.font_size: 8.0
+                                    draw_text.color: #e6e9f0
+                                }
+                            }
+                            ai_col := mod.widgets.View{
+                                width: Fill{weight: 1}
+                                height: Fit
+                                flow: Down
+                                align: Align{x: 0.5}
+                                spacing: 0
+                                ai_btn := mod.widgets.ButtonFlatIcon{
+                                    text: ""
+                                    icon_walk: Walk{width: 16, height: 16}
+                                    margin: 0
+                                    padding: Inset{left: 6, right: 6, top: 4, bottom: 2}
+                                    draw_icon +: {
+                                        svg: crate_resource("self:resources/ai.svg")
+                                        color: #e6e9f0
+                                    }
+                                    draw_bg +: {
+                                        color: #1f2430f2
+                                        color_hover: #2a3242
+                                        color_down: #232834
+                                        color_focus: #1f2430f2
+                                        border_size: uniform(0.0)
+                                    }
+                                }
+                                ai_label := mod.widgets.Label{
+                                    text: "AI"
+                                    draw_text.text_style.font_size: 8.0
+                                    draw_text.color: #e6e9f0
+                                }
+                            }
+                        }
+                        pad_r := mod.widgets.View{
+                            width: Fill{weight: 25}
+                            height: Fit
+                        }
+                        }
+                    }
                     file_panel := mod.widgets.FilePanel{}
                     refs_panel := mod.widgets.RefsPanel{}
                 }
@@ -759,9 +874,22 @@ fn fmt_tokens(n: usize) -> String {
 }
 
 impl App {
+    /// Bottom-dock button, resolved by direct navigation (root tree lookups
+    /// don't index widgets nested inside custom-widget content).
+    fn dock_button(&self, cx: &Cx, col: LiveId, btn: LiveId) -> WidgetRef {
+        let content = self.ui.bottom_bar(cx, ids!(bottom_bar)).content(cx);
+        let bar = child_by_name(&content, live_id!(bar));
+        let col = child_by_name(&bar, col);
+        child_by_name(&col, btn)
+    }
+
     /// Setting/About popup toggles and their close buttons.
     fn handle_popup_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.ui.button(cx, ids!(setting_btn)).clicked(actions) {
+        if self
+            .dock_button(cx, live_id!(setting_col), live_id!(setting_btn))
+            .as_button()
+            .clicked(actions)
+        {
             let p = self.ui.view(cx, ids!(setting_popup));
             let show = !p.visible();
             p.set_visible(cx, show);
@@ -785,7 +913,11 @@ impl App {
                 p.label(cx, ids!(status)).set_text(cx, "");
             }
         }
-        if self.ui.button(cx, ids!(about_btn)).clicked(actions) {
+        if self
+            .dock_button(cx, live_id!(about_col), live_id!(about_btn))
+            .as_button()
+            .clicked(actions)
+        {
             let p = self.ui.view(cx, ids!(about_popup));
             let show = !p.visible();
             p.set_visible(cx, show);
@@ -823,7 +955,11 @@ impl App {
 
     /// Perf/chat float panel show-hide toggles.
     fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.ui.button(cx, ids!(debug_btn)).clicked(actions) {
+        if self
+            .dock_button(cx, live_id!(debug_col), live_id!(debug_btn))
+            .as_button()
+            .clicked(actions)
+        {
             let panel = self.ui.float_panel(cx, ids!(float_panel));
             if panel.opened() {
                 panel.hide(cx);
@@ -833,7 +969,11 @@ impl App {
                 self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
             }
         }
-        if self.ui.button(cx, ids!(ai_btn)).clicked(actions) {
+        if self
+            .dock_button(cx, live_id!(ai_col), live_id!(ai_btn))
+            .as_button()
+            .clicked(actions)
+        {
             let panel = self.ui.float_panel(cx, ids!(ai_panel));
             if panel.opened() {
                 panel.hide(cx);
@@ -1514,6 +1654,7 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         crate::markdown_media::script_mod(vm);
         crate::mindmap::script_mod(vm);
+        crate::bottom_bar::script_mod(vm);
         crate::float_panel::script_mod(vm);
         crate::file_panel::script_mod(vm);
         crate::chat_list::script_mod(vm);
@@ -1557,18 +1698,5 @@ impl AppMain for App {
             self.handle_file_panel_actions(cx, actions);
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
-        // The Window widget answers Caption for the whole caption bar (a
-        // window-drag zone) BEFORE children see the event; this runs last
-        // (last write wins, read by the platform after handle_event), so the
-        // menu buttons inside the title bar stay clickable.
-        if let Event::WindowDragQuery(dq) = event {
-            for id in [ids!(setting_btn), ids!(about_btn), ids!(debug_btn), ids!(ai_btn)] {
-                let a = self.ui.button(cx, id).area();
-                if a.is_valid(cx) && a.rect(cx).contains(dq.abs) {
-                    dq.response.set(WindowDragQueryResponse::Client);
-                    break;
-                }
-            }
-        }
     }
 }
