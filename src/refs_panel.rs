@@ -1,15 +1,12 @@
 use makepad_widgets::*;
 
-use std::sync::Mutex;
-
 use serde::{Deserialize, Serialize};
 
-use crate::mindmap::app_base_dir;
+use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD, SlideState};
+use crate::util::{app_base_dir, cached_widget, set_panel_rect};
 
 const TAB_W: f64 = 14.0;
 const TAB_H: f64 = 48.0;
-/// Exponential ease rate (1/s); settles in ~0.2s (mirrors FilePanel).
-const SLIDE_EASE: f64 = 14.0;
 /// Default panel width and drag limits (px), same as the file panel.
 const PANEL_W_DEFAULT: f64 = 520.0;
 const PANEL_W_MIN: f64 = 140.0;
@@ -25,18 +22,10 @@ const BAR_H: f64 = 60.0;
 /// Minimum row height (px) as a fallback when a row's laid-out height reads
 /// as zero; rows are otherwise sized by their real rendered content.
 const ROW_MIN: f64 = 40.0;
-/// Context-menu geometry.
-const MENU_W: f64 = 220.0;
-const MENU_ITEM_H: f64 = 32.0;
-const MENU_PAD: f64 = 6.0;
 /// Excerpt length cap (chars) for file snippets.
 const EXCERPT_MAX: usize = 200;
 /// Shown (in red) as the excerpt of a document that failed to convert.
 const FAILED_TEXT: &str = "文件解析失败";
-
-/// Panel body rect in window coords, written every draw pass; the mindmap
-/// reads it to keep wheel zoom and marquee selection off the panel.
-pub(crate) static PANEL_RECT_RIGHT: Mutex<Option<Rect>> = Mutex::new(None);
 
 /// One reference item: an absolute path to a local Markdown document, plus
 /// its excerpt. `failed` marks a document whose conversion to Markdown
@@ -73,13 +62,6 @@ struct FileRef {
     failed: bool,
 }
 
-/// The pre-card format ("files": ["path"]); kept readable so old refs files
-/// still load (descriptions start empty).
-#[derive(Deserialize)]
-struct LegacyRefsFile {
-    files: Vec<String>,
-}
-
 /// Refs file for a map rel path ("maps/foo.json" -> "refs/foo.json", mirroring
 /// subdirectories so maps in different dirs never collide).
 fn refs_path(map_rel: &str) -> std::path::PathBuf {
@@ -91,35 +73,32 @@ fn load_items(map_rel: &str) -> Vec<RefItem> {
     let Ok(json) = std::fs::read_to_string(refs_path(map_rel)) else {
         return Vec::new();
     };
-    if let Ok(data) = serde_json::from_str::<RefsFile>(&json) {
-        return data
-            .files
-            .into_iter()
-            .map(|f| RefItem {
-                desc: if f.failed {
-                    FAILED_TEXT.to_string()
-                } else {
-                    // fresh excerpt from disk beats the stored one
-                    file_excerpt(&f.path).unwrap_or(f.desc)
-                },
-                value: f.path,
-                failed: f.failed,
-            })
-            .collect();
-    }
-    // pre-card format: plain string list
-    if let Ok(old) = serde_json::from_str::<LegacyRefsFile>(&json) {
-        return old
-            .files
-            .into_iter()
-            .map(|p| RefItem {
-                desc: file_excerpt(&p).unwrap_or_default(),
-                value: p,
-                failed: false,
-            })
-            .collect();
-    }
-    Vec::new()
+    let Ok(data) = serde_json::from_str::<RefsFile>(&json) else {
+        return Vec::new();
+    };
+    data.files
+        .into_iter()
+        .map(|f| RefItem {
+            desc: if f.failed {
+                FAILED_TEXT.to_string()
+            } else {
+                // fresh excerpt from disk beats the stored one
+                file_excerpt(&f.path).unwrap_or(f.desc)
+            },
+            value: f.path,
+            failed: f.failed,
+        })
+        .collect()
+}
+
+/// Document paths a map's refs list points at (failed conversions have no
+/// retrievable content and are skipped).
+pub(crate) fn ref_doc_paths(map_rel: &str) -> Vec<std::path::PathBuf> {
+    load_items(map_rel)
+        .into_iter()
+        .filter(|i| !i.failed)
+        .map(|i| std::path::PathBuf::from(i.value))
+        .collect()
 }
 
 fn save_items(map_rel: &str, items: &[RefItem]) {
@@ -427,16 +406,9 @@ pub struct RefsPanel {
     #[rust]
     ctx_menu_ref: Option<WidgetRef>,
 
-    #[rust(false)]
-    opened: bool,
-    /// 0 = collapsed off the right edge, 1 = fully open; eases toward the
-    /// target on timer ticks.
+    /// Slide-in/out animation state (shared with the file panel).
     #[rust]
-    slide: f64,
-    #[rust]
-    slide_timer: Option<Timer>,
-    #[rust]
-    last_timer_time: f64,
+    slide: SlideState,
     #[rust]
     window_size: DVec2,
     /// Panel body rect and its drawn hit area, in window coords.
@@ -547,23 +519,7 @@ impl WidgetNode for RefsPanel {
 
 impl Widget for RefsPanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
-        self.window_size = cx.current_pass_size();
-        let body_y = cx.turtle().rect().pos.y; // body top, window coords
-        let body_h = (self.window_size.y - body_y).max(0.0);
-        let panel = Rect {
-            pos: dvec2(self.window_size.x - self.panel_w * self.slide, body_y),
-            size: dvec2(self.panel_w, body_h),
-        };
-        self.panel_rect = panel;
-        self.tab_rect = Rect {
-            pos: dvec2(panel.pos.x - TAB_W, body_y + body_h * 0.5 - TAB_H * 0.5),
-            size: dvec2(TAB_W, TAB_H),
-        };
-        self.edge_rect = Rect {
-            pos: dvec2(panel.pos.x - (EDGE_W - EDGE_INSET), panel.pos.y),
-            size: dvec2(EDGE_W, panel.size.y),
-        };
-        PANEL_RECT_RIGHT.lock().unwrap().replace(panel);
+        let panel = self.compute_rects(cx);
 
         // Default to the default map until App::open_map sets one (mirrors the
         // mindmap, which loads maps/map.json on its own).
@@ -574,89 +530,10 @@ impl Widget for RefsPanel {
 
         cx.begin_turtle(self.walk, self.layout);
         if let Some(content) = self.content_widget(cx) {
-            // Same clip-rect trick as FilePanel/FloatPanel: the root turtle's
-            // clip is disabled (0-size walk), so push a real clip so draw_clip
-            // data and hit-testing resolve to the panel rect.
-            cx.push_clip_rect(panel);
-            let chrome = Walk {
-                abs_pos: Some(panel.pos),
-                width: Size::Fixed(panel.size.x),
-                height: Size::Fixed(panel.size.y),
-                ..Walk::default()
-            };
-            let _ = content.draw_walk(cx, scope, chrome);
-            let header = self.view.widget(cx, ids!(header));
-            let _ = header.draw_walk(
-                cx,
-                scope,
-                Walk {
-                    abs_pos: Some(panel.pos),
-                    width: Size::Fixed(panel.size.x),
-                    height: Size::Fixed(PANE_HEADER_H),
-                    ..Walk::default()
-                },
-            );
-            let bar = self.view.widget(cx, ids!(bottom_bar));
-            let _ = bar.draw_walk(
-                cx,
-                scope,
-                Walk {
-                    abs_pos: Some(panel.pos + dvec2(0.0, panel.size.y - BAR_H)),
-                    width: Size::Fixed(panel.size.x),
-                    height: Size::Fixed(BAR_H),
-                    ..Walk::default()
-                },
-            );
-            // Row list between the header and the bottom bar.
-            let list = Rect {
-                pos: panel.pos + dvec2(0.0, PANE_HEADER_H),
-                size: dvec2(panel.size.x, (panel.size.y - PANE_HEADER_H - BAR_H).max(0.0)),
-            };
-            self.list_rect = list;
-            if let Some(t) = &self.row_template {
-                let t = t.clone();
-                self.draw_rows(cx, scope, &t);
-            }
-            cx.add_aligned_rect_area(&mut self.panel_area, panel);
-            cx.add_aligned_rect_area(&mut self.edge_area, self.edge_rect);
-            cx.pop_clip_rect();
+            self.draw_chrome(cx, scope, content, panel);
         }
-        if let Some(tab) = self.tab_widget(cx) {
-            cx.push_clip_rect(self.tab_rect);
-            let walk = Walk {
-                abs_pos: Some(self.tab_rect.pos),
-                width: Size::Fixed(self.tab_rect.size.x),
-                height: Size::Fixed(self.tab_rect.size.y),
-                ..Walk::default()
-            };
-            let _ = tab.draw_walk(cx, scope, walk);
-            cx.add_aligned_rect_area(&mut self.tab_area, self.tab_rect);
-            cx.pop_clip_rect();
-        }
-        // Context menu on top of everything; hover highlight under the cursor.
-        if self.menu_open {
-            if let Some(menu) = self.ctx_menu_widget(cx) {
-                cx.push_clip_rect(self.menu_rect);
-                let walk = Walk {
-                    abs_pos: Some(self.menu_rect.pos),
-                    width: Size::Fixed(self.menu_rect.size.x),
-                    height: Size::Fixed(self.menu_rect.size.y),
-                    ..Walk::default()
-                };
-                let _ = menu.draw_walk(cx, scope, walk);
-                if let Some(i) = self.menu_hover {
-                    self.draw_menu_hl.draw_abs(
-                        cx,
-                        Rect {
-                            pos: self.menu_rect.pos
-                                + dvec2(MENU_PAD, MENU_PAD + i as f64 * MENU_ITEM_H),
-                            size: dvec2(self.menu_rect.size.x - 2.0 * MENU_PAD, MENU_ITEM_H),
-                        },
-                    );
-                }
-                cx.pop_clip_rect();
-            }
-        }
+        self.draw_tab(cx, scope);
+        self.draw_menu(cx, scope);
         // While the menu is open, a window-wide modal area captures every
         // press.
         if self.menu_open {
@@ -682,21 +559,7 @@ impl Widget for RefsPanel {
         if let Some(tab) = self.tab_widget(cx) {
             tab.handle_event(cx, event, scope);
         }
-        // Modal state (context menu) grabs every press first, so the
-        // list/tab/edge below can't fire behind it.
-        if self.menu_open {
-            match event.hits_with_capture_overload(cx, self.modal_area, true) {
-                Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                    if self.menu_rect.contains(fe.abs) {
-                        self.on_menu_press(cx, fe.abs);
-                    } else {
-                        self.menu_open = false;
-                        self.redraw(cx);
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.handle_modal_events(cx, event);
         // Button actions fire from the bottom bar's own event handling.
         if let Event::Actions(actions) = event {
             let bar = self.view.widget(cx, ids!(bottom_bar));
@@ -712,50 +575,9 @@ impl Widget for RefsPanel {
             }
             _ => {}
         }
-        // Left-edge drag to resize the panel width.
-        match event.hits_with_capture_overload(cx, self.edge_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                self.panel_w_dragging = true;
-                cx.set_cursor(MouseCursor::ColResize);
-                self.apply_width(cx, fe.abs.x);
-            }
-            Hit::FingerMove(fe) => {
-                if self.panel_w_dragging {
-                    cx.set_cursor(MouseCursor::ColResize);
-                    self.apply_width(cx, fe.abs.x);
-                }
-            }
-            Hit::FingerUp(_) => {
-                self.panel_w_dragging = false;
-            }
-            _ => {}
-        }
-        if let Event::MouseMove(e) = event {
-            if !self.panel_w_dragging && self.edge_rect.contains(e.abs) {
-                cx.set_cursor(MouseCursor::ColResize);
-            }
-            if self.menu_open {
-                let hover = self.menu_item_index(e.abs);
-                if hover != self.menu_hover {
-                    self.menu_hover = hover;
-                    self.redraw(cx);
-                }
-            }
-        }
-        match event.hits_with_capture_overload(cx, self.list_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.menu_open => {
-                if let Some(i) = row_index_at(&self.row_heights, self.list_rect, fe.abs, self.scroll)
-                {
-                    self.menu_row = Some(i);
-                }
-            }
-            Hit::FingerScroll(fe) => {
-                if scroll_rows(&self.row_heights, self.list_rect, fe.scroll.y, &mut self.scroll) {
-                    self.redraw(cx);
-                }
-            }
-            _ => {}
-        }
+        self.handle_edge_drag(cx, event);
+        self.handle_mouse_move(cx, event);
+        self.handle_list_events(cx, event);
         // Right-click anywhere on the panel opens (or repositions) the menu.
         match event.hits_with_capture_overload(cx, self.panel_area, true) {
             Hit::FingerDown(fe)
@@ -812,25 +634,208 @@ fn stage_document(src: &std::path::Path) -> (String, bool) {
 }
 
 impl RefsPanel {
-    fn content_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.content_ref.is_none() {
-            self.content_ref = Some(self.view.widget(cx, ids!(content)));
+    /// Panel/tab/edge rects from the current slide progress, in window
+    /// coords; registers the panel rect for the mindmap's pointer guards.
+    fn compute_rects(&mut self, cx: &Cx2d) -> Rect {
+        self.window_size = cx.current_pass_size();
+        let body_y = cx.turtle().rect().pos.y; // body top, window coords
+        let body_h = (self.window_size.y - body_y).max(0.0);
+        let panel = Rect {
+            pos: dvec2(self.window_size.x - self.panel_w * self.slide.progress, body_y),
+            size: dvec2(self.panel_w, body_h),
+        };
+        self.panel_rect = panel;
+        self.tab_rect = Rect {
+            pos: dvec2(panel.pos.x - TAB_W, body_y + body_h * 0.5 - TAB_H * 0.5),
+            size: dvec2(TAB_W, TAB_H),
+        };
+        self.edge_rect = Rect {
+            pos: dvec2(panel.pos.x - (EDGE_W - EDGE_INSET), panel.pos.y),
+            size: dvec2(EDGE_W, panel.size.y),
+        };
+        set_panel_rect(self.uid.0, Some(panel));
+        panel
+    }
+
+    /// Draw the panel content chrome: content view, header and bottom bar
+    /// (clipped to the panel rect — same trick as FilePanel/FloatPanel: the
+    /// root turtle's clip is disabled, so push a real clip so draw_clip data
+    /// and hit-testing resolve to the panel rect).
+    fn draw_chrome(&mut self, cx: &mut Cx2d, scope: &mut Scope, content: WidgetRef, panel: Rect) {
+        cx.push_clip_rect(panel);
+        let chrome = Walk {
+            abs_pos: Some(panel.pos),
+            width: Size::Fixed(panel.size.x),
+            height: Size::Fixed(panel.size.y),
+            ..Walk::default()
+        };
+        let _ = content.draw_walk(cx, scope, chrome);
+        let header = self.view.widget(cx, ids!(header));
+        let _ = header.draw_walk(
+            cx,
+            scope,
+            Walk {
+                abs_pos: Some(panel.pos),
+                width: Size::Fixed(panel.size.x),
+                height: Size::Fixed(PANE_HEADER_H),
+                ..Walk::default()
+            },
+        );
+        let bar = self.view.widget(cx, ids!(bottom_bar));
+        let _ = bar.draw_walk(
+            cx,
+            scope,
+            Walk {
+                abs_pos: Some(panel.pos + dvec2(0.0, panel.size.y - BAR_H)),
+                width: Size::Fixed(panel.size.x),
+                height: Size::Fixed(BAR_H),
+                ..Walk::default()
+            },
+        );
+        // Row list between the header and the bottom bar.
+        let list = Rect {
+            pos: panel.pos + dvec2(0.0, PANE_HEADER_H),
+            size: dvec2(panel.size.x, (panel.size.y - PANE_HEADER_H - BAR_H).max(0.0)),
+        };
+        self.list_rect = list;
+        if let Some(t) = &self.row_template {
+            let t = t.clone();
+            self.draw_rows(cx, scope, &t);
         }
-        self.content_ref.clone()
+        cx.add_aligned_rect_area(&mut self.panel_area, panel);
+        cx.add_aligned_rect_area(&mut self.edge_area, self.edge_rect);
+        cx.pop_clip_rect();
+    }
+
+    /// The slide-in tab button.
+    fn draw_tab(&mut self, cx: &mut Cx2d, scope: &mut Scope) {
+        if let Some(tab) = self.tab_widget(cx) {
+            cx.push_clip_rect(self.tab_rect);
+            let walk = Walk {
+                abs_pos: Some(self.tab_rect.pos),
+                width: Size::Fixed(self.tab_rect.size.x),
+                height: Size::Fixed(self.tab_rect.size.y),
+                ..Walk::default()
+            };
+            let _ = tab.draw_walk(cx, scope, walk);
+            cx.add_aligned_rect_area(&mut self.tab_area, self.tab_rect);
+            cx.pop_clip_rect();
+        }
+    }
+
+    /// The open context menu on top of everything; hover highlight under
+    /// the cursor.
+    fn draw_menu(&mut self, cx: &mut Cx2d, scope: &mut Scope) {
+        if self.menu_open {
+            if let Some(menu) = self.ctx_menu_widget(cx) {
+                cx.push_clip_rect(self.menu_rect);
+                let walk = Walk {
+                    abs_pos: Some(self.menu_rect.pos),
+                    width: Size::Fixed(self.menu_rect.size.x),
+                    height: Size::Fixed(self.menu_rect.size.y),
+                    ..Walk::default()
+                };
+                let _ = menu.draw_walk(cx, scope, walk);
+                if let Some(i) = self.menu_hover {
+                    self.draw_menu_hl.draw_abs(
+                        cx,
+                        Rect {
+                            pos: self.menu_rect.pos
+                                + dvec2(MENU_PAD, MENU_PAD + i as f64 * MENU_ITEM_H),
+                            size: dvec2(self.menu_rect.size.x - 2.0 * MENU_PAD, MENU_ITEM_H),
+                        },
+                    );
+                }
+                cx.pop_clip_rect();
+            }
+        }
+    }
+
+    /// Modal state (context menu) grabs every press first, so the
+    /// list/tab/edge below can't fire behind it.
+    fn handle_modal_events(&mut self, cx: &mut Cx, event: &Event) {
+        if self.menu_open {
+            match event.hits_with_capture_overload(cx, self.modal_area, true) {
+                Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                    if self.menu_rect.contains(fe.abs) {
+                        self.on_menu_press(cx, fe.abs);
+                    } else {
+                        self.menu_open = false;
+                        self.redraw(cx);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Left-edge drag to resize the panel width.
+    fn handle_edge_drag(&mut self, cx: &mut Cx, event: &Event) {
+        match event.hits_with_capture_overload(cx, self.edge_area, true) {
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                self.panel_w_dragging = true;
+                cx.set_cursor(MouseCursor::ColResize);
+                self.apply_width(cx, fe.abs.x);
+            }
+            Hit::FingerMove(fe) => {
+                if self.panel_w_dragging {
+                    cx.set_cursor(MouseCursor::ColResize);
+                    self.apply_width(cx, fe.abs.x);
+                }
+            }
+            Hit::FingerUp(_) => {
+                self.panel_w_dragging = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Edge hover cursor and the context-menu highlight (tracked from the
+    /// raw cursor, redraw only on change).
+    fn handle_mouse_move(&mut self, cx: &mut Cx, event: &Event) {
+        if let Event::MouseMove(e) = event {
+            if !self.panel_w_dragging && self.edge_rect.contains(e.abs) {
+                cx.set_cursor(MouseCursor::ColResize);
+            }
+            if self.menu_open {
+                let hover = menu_item_index(self.menu_rect, 1, e.abs);
+                if hover != self.menu_hover {
+                    self.menu_hover = hover;
+                    self.redraw(cx);
+                }
+            }
+        }
+    }
+
+    /// The row list: press marks the row for the context menu, wheel
+    /// scrolls (Scroll bypasses the handled flag).
+    fn handle_list_events(&mut self, cx: &mut Cx, event: &Event) {
+        match event.hits_with_capture_overload(cx, self.list_area, true) {
+            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.menu_open => {
+                if let Some(i) = row_index_at(&self.row_heights, self.list_rect, fe.abs, self.scroll)
+                {
+                    self.menu_row = Some(i);
+                }
+            }
+            Hit::FingerScroll(fe) => {
+                if scroll_rows(&self.row_heights, self.list_rect, fe.scroll.y, &mut self.scroll) {
+                    self.redraw(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn content_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
+        cached_widget(&mut self.content_ref, || self.view.widget(cx, ids!(content)))
     }
 
     fn tab_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.tab_ref.is_none() {
-            self.tab_ref = Some(self.view.widget(cx, ids!(tab)));
-        }
-        self.tab_ref.clone()
+        cached_widget(&mut self.tab_ref, || self.view.widget(cx, ids!(tab)))
     }
 
     fn ctx_menu_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.ctx_menu_ref.is_none() {
-            self.ctx_menu_ref = Some(self.view.widget(cx, ids!(ctx_menu)));
-        }
-        self.ctx_menu_ref.clone()
+        cached_widget(&mut self.ctx_menu_ref, || self.view.widget(cx, ids!(ctx_menu)))
     }
 
     /// Draw the reference rows (clipped to the list rect), lazily creating
@@ -870,37 +875,18 @@ impl RefsPanel {
         cx.pop_clip_rect();
     }
 
-    /// Ease `slide` toward its target on each timer tick (mirrors the
-    /// mindmap's zoom animation pattern).
+    /// Ease the slide animation on its timer tick.
     fn handle_slide_anim(&mut self, cx: &mut Cx, event: &Event) {
-        let Some(timer) = self.slide_timer else { return };
-        let Some(te) = timer.is_event(event) else { return };
-        let now = te.time.unwrap_or(0.0);
-        let dt = if self.last_timer_time == 0.0 {
-            1.0 / 60.0
-        } else {
-            (now - self.last_timer_time).max(0.0)
-        };
-        self.last_timer_time = now;
-        let target = if self.opened { 1.0 } else { 0.0 };
-        self.slide += (target - self.slide) * (1.0 - (-dt * SLIDE_EASE).exp());
-        if (target - self.slide).abs() < 1e-3 {
-            self.slide = target;
-            cx.stop_timer(timer);
-            self.slide_timer = None;
+        if self.slide.handle_event(cx, event) {
+            self.redraw(cx);
         }
-        self.redraw(cx);
     }
 
     fn toggle(&mut self, cx: &mut Cx) {
-        self.opened = !self.opened;
+        self.slide.toggle(cx);
         self.menu_open = false;
         if let Some(tab) = self.tab_widget(cx) {
-            tab.set_text(cx, if self.opened { "▶" } else { "◀" });
-        }
-        if self.slide_timer.is_none() {
-            self.slide_timer = Some(cx.start_interval(1.0 / 60.0));
-            self.last_timer_time = 0.0;
+            tab.set_text(cx, if self.slide.opened { "▶" } else { "◀" });
         }
         self.redraw(cx);
     }
@@ -956,25 +942,14 @@ impl RefsPanel {
     /// Open the context menu at `abs`, clamped inside the panel.
     fn open_menu(&mut self, cx: &mut Cx, abs: DVec2) {
         self.menu_row = row_index_at(&self.row_heights, self.list_rect, abs, self.scroll);
-        let panel = self.panel_rect;
-        let h = MENU_PAD * 2.0 + MENU_ITEM_H;
-        let max_x = (panel.pos.x + panel.size.x - MENU_W).max(panel.pos.x);
-        let max_y = (panel.pos.y + panel.size.y - h).max(panel.pos.y);
-        let pos = dvec2(
-            abs.x.clamp(panel.pos.x, max_x),
-            abs.y.clamp(panel.pos.y, max_y),
-        );
-        self.menu_rect = Rect {
-            pos,
-            size: dvec2(MENU_W, h),
-        };
-        self.menu_hover = self.menu_item_index(abs);
+        self.menu_rect = menu_rect(self.panel_rect, abs, 1);
+        self.menu_hover = menu_item_index(self.menu_rect, 1, abs);
         self.menu_open = true;
         self.redraw(cx);
     }
 
     fn on_menu_press(&mut self, cx: &mut Cx, abs: DVec2) {
-        let idx = self.menu_item_index(abs);
+        let idx = menu_item_index(self.menu_rect, 1, abs);
         self.menu_open = false;
         self.menu_hover = None;
         if idx == Some(0) {
@@ -987,19 +962,6 @@ impl RefsPanel {
             }
         }
         self.redraw(cx);
-    }
-
-    /// The single menu item's index under `abs` (None outside the item).
-    fn menu_item_index(&self, abs: DVec2) -> Option<usize> {
-        if !self.menu_rect.contains(abs) {
-            return None;
-        }
-        let idx = ((abs.y - self.menu_rect.pos.y - MENU_PAD) / MENU_ITEM_H).floor() as isize;
-        if idx == 0 {
-            Some(0)
-        } else {
-            None
-        }
     }
 
     /// Persist the current list to refs/<map>.json.
@@ -1083,13 +1045,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_refs_json_still_parses() {
-        let old = r#"{"files":["/a/b.md"]}"#;
-        let data: LegacyRefsFile = serde_json::from_str(old).unwrap();
-        assert_eq!(data.files, vec!["/a/b.md"]);
-    }
-
-    #[test]
     fn refs_json_roundtrip() {
         let items = vec![RefItem {
             desc: "excerpt".into(),
@@ -1159,12 +1114,5 @@ mod tests {
         assert_eq!(value, src.to_string_lossy());
         assert!(failed);
         std::fs::remove_file(&src).ok();
-    }
-
-    #[test]
-    fn files_with_links_key_still_parse() {
-        let old = r#"{"files":[{"path":"/a/b.md","desc":""}],"links":[{"url":"https://x.com","desc":"d"}]}"#;
-        let data: RefsFile = serde_json::from_str(old).unwrap();
-        assert_eq!(data.files.len(), 1);
     }
 }

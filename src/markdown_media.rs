@@ -518,10 +518,9 @@ impl MarkdownMedia {
                 MdEvent::End(TagEnd::Strikethrough) => {
                     tf.underline.pop();
                 }
-                MdEvent::Start(Tag::Link { dest_url, .. }) => {
+                MdEvent::Start(Tag::Link { .. }) => {
                     let entry_id = tf.new_counted_id();
                     let item = tf.item(cx, entry_id, live_id!(link));
-                    item.as_markdown_media_link().set_href(dest_url);
                     item.draw_all_unscoped(cx);
                 }
                 MdEvent::End(TagEnd::Link) => {
@@ -909,25 +908,11 @@ struct MarkdownMediaLink {
     source: ScriptObjectRef,
     #[deref]
     link: LinkLabel,
-    #[live]
-    href: String,
-}
-
-impl WidgetMatchEvent for MarkdownMediaLink {
-    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, _scope: &mut Scope) {
-        if self.link.clicked(actions) {
-            cx.widget_action(
-                self.widget_uid(),
-                MarkdownAction::LinkNavigated(self.href.clone()),
-            );
-        }
-    }
 }
 
 impl Widget for MarkdownMediaLink {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.link.handle_event(cx, event, scope);
-        self.widget_match_event(cx, event, scope)
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -941,22 +926,6 @@ impl Widget for MarkdownMediaLink {
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
         self.link.set_text(cx, v);
     }
-}
-
-impl MarkdownMediaLinkRef {
-    pub fn set_href(&self, v: &str) {
-        let Some(mut inner) = self.borrow_mut() else {
-            return;
-        };
-        inner.href = v.to_string();
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub enum MarkdownAction {
-    #[default]
-    None,
-    LinkNavigated(String),
 }
 
 #[cfg(test)]

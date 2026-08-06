@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::mindmap::app_base_dir;
+use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD, SlideState};
+use crate::util::{app_base_dir, cached_widget, set_panel_rect};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -238,15 +239,12 @@ script_mod! {
 
 const TAB_W: f64 = 14.0;
 const TAB_H: f64 = 48.0;
-/// Exponential ease rate (1/s); settles in ~0.2s.
-const SLIDE_EASE: f64 = 14.0;
 /// Splitter bar height and the grab margin around it.
 const SPLITTER_BAR: f64 = 12.0;
 const SPLITTER_MARGIN: f64 = 3.0;
 /// Minimum height (px) each section keeps when dragging the divider.
 const SPLIT_MIN: f64 = 60.0;
-/// Default panel width and drag limits (px).
-const PANEL_W_DEFAULT: f64 = 260.0;
+/// Panel width drag limits (px).
 const PANEL_W_MIN: f64 = 140.0;
 const PANEL_W_MAX: f64 = 520.0;
 /// Width-grab strip on the panel's right edge: 8px inside the panel,
@@ -261,10 +259,6 @@ const ROW_H: f64 = 30.0;
 /// Directories backing the two lists: maps live in `maps/`, cards in `cards/`.
 const MAPS_DIR: &str = "maps";
 const CARDS_DIR: &str = "cards";
-/// Context-menu geometry: fixed width, item height and padding.
-const MENU_W: f64 = 220.0;
-const MENU_ITEM_H: f64 = 32.0;
-const MENU_PAD: f64 = 6.0;
 /// Inline-edit list ids: 0 = map list, 1 = card list.
 const LIST_MAP: u8 = 0;
 const LIST_CARD: u8 = 1;
@@ -313,16 +307,6 @@ fn menu_items_for(target: Option<(u8, usize)>, target_is_dir: bool) -> Vec<MenuI
 
 /// The menu item index under `abs`, or None outside the items (blank strip,
 /// padding, out of the menu).
-fn menu_item_index(menu_rect: Rect, items: usize, abs: DVec2) -> Option<usize> {
-    if !menu_rect.contains(abs) {
-        return None;
-    }
-    let idx = ((abs.y - menu_rect.pos.y - MENU_PAD) / MENU_ITEM_H).floor() as isize;
-    if idx < 0 || idx as usize >= items {
-        return None;
-    }
-    Some(idx as usize)
-}
 
 /// Display name for a list row value (rel path, dirs carry a trailing "/"):
 /// just the last path segment — files show their stem (no extension), dirs
@@ -354,10 +338,6 @@ fn row_icon_svg(list: u8, row: &Row, expanded: &HashSet<String>) -> &'static str
         "card.svg"
     }
 }
-
-/// Panel body rect in window coords, written every draw pass; the mindmap
-/// reads it to keep wheel zoom off the panel.
-pub(crate) static PANEL_RECT: Mutex<Option<Rect>> = Mutex::new(None);
 
 /// True while an inline name edit (新建 map / 创建新目录) is active; the
 /// mindmap skips its keyboard shortcuts so typing doesn't move the map.
@@ -570,6 +550,19 @@ fn draw_rows(
 
 /// Lazily clone a row from the template, set its texts and load its type
 /// icon (folders by expansion state, files by list).
+/// Svg bytes for a row icon, cached per name (4 icons; avoids re-reading the
+/// same file for every row on every rebuild).
+fn icon_bytes(name: &'static str) -> Option<Vec<u8>> {
+    static CACHE: Mutex<Vec<(&'static str, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, b)) = cache.iter().find(|(n, _)| *n == name) {
+        return b.clone();
+    }
+    let b = std::fs::read(app_base_dir().join("resources").join(name)).ok();
+    cache.push((name, b.clone()));
+    b
+}
+
 fn row_ref(
     cx: &mut Cx,
     template: &ScriptObjectRef,
@@ -586,8 +579,7 @@ fn row_ref(
     let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
     w.label(cx, ids!(row_name)).set_text(cx, &display_name(&row.value));
     let icon = row_icon_svg(list, row, expanded);
-    let icon_path = app_base_dir().join("resources").join(icon);
-    if let Ok(bytes) = std::fs::read(&icon_path) {
+    if let Some(bytes) = icon_bytes(icon) {
         let _ = w
             .image(cx, ids!(row_icon))
             .load_svg_from_shared_data(cx, bytes.into());
@@ -622,16 +614,9 @@ pub struct FilePanel {
     #[live]
     draw_divider: DrawColor,
 
-    #[rust(false)]
-    opened: bool,
-    /// 0 = collapsed off the left edge, 1 = fully open; eases toward the
-    /// target on timer ticks.
+    /// Slide-in/out animation state (shared with the refs panel).
     #[rust]
-    slide: f64,
-    #[rust]
-    slide_timer: Option<Timer>,
-    #[rust]
-    last_timer_time: f64,
+    slide: SlideState,
     #[rust]
     window_size: DVec2,
     /// Panel body rect and its drawn hit area, in window coords.
@@ -814,12 +799,12 @@ impl Widget for FilePanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         self.window_size = cx.current_pass_size();
         let body_y = cx.turtle().rect().pos.y; // body top, window coords
-        let geo = panel_geometry(self.slide, self.split, self.panel_w, self.window_size, body_y);
+        let geo = panel_geometry(self.slide.progress, self.split, self.panel_w, self.window_size, body_y);
         self.panel_rect = geo.panel;
         self.tab_rect = geo.tab;
         self.splitter_rect = geo.splitter;
         self.edge_rect = geo.edge;
-        PANEL_RECT.lock().unwrap().replace(self.panel_rect);
+        set_panel_rect(self.uid.0, Some(self.panel_rect));
 
         cx.begin_turtle(self.walk, self.layout);
         if let Some(content) = self.content_widget(cx) {
@@ -880,49 +865,13 @@ impl Widget for FilePanel {
                 size: dvec2(panel.size.x, (a_h - PANE_HEADER_H).max(0.0)),
             };
             self.map_list_rect = map_list;
-            if let Some(t) = &self.row_template {
-                let edit = self.edit_index(LIST_MAP);
-                let expanded = &self.expanded;
-                draw_rows(
-                    cx,
-                    scope,
-                    LIST_MAP,
-                    &self.map_rows,
-                    t,
-                    &mut self.map_row_refs,
-                    map_list,
-                    self.map_scroll,
-                    &mut self.map_list_area,
-                    edit,
-                    expanded,
-                    self.current_map.as_deref(),
-                    &mut self.draw_sel_hl,
-                );
-            }
+            self.draw_list(cx, scope, LIST_MAP, map_list);
             let card_list = Rect {
                 pos: panel.pos + dvec2(0.0, a_h + 1.0 + PANE_HEADER_H),
                 size: dvec2(panel.size.x, (b_h - PANE_HEADER_H).max(0.0)),
             };
             self.card_list_rect = card_list;
-            if let Some(t) = &self.row_template {
-                let edit = self.edit_index(LIST_CARD);
-                let expanded = &self.expanded;
-                draw_rows(
-                    cx,
-                    scope,
-                    LIST_CARD,
-                    &self.card_rows,
-                    t,
-                    &mut self.card_row_refs,
-                    card_list,
-                    self.card_scroll,
-                    &mut self.card_list_area,
-                    edit,
-                    expanded,
-                    None,
-                    &mut self.draw_sel_hl,
-                );
-            }
+            self.draw_list(cx, scope, LIST_CARD, card_list);
             // Drop-target highlight while dragging a file over a dir row.
             if let Some((list, i)) = self.drag_target {
                 let (rows, rect, scroll) = self.list_geometry(list);
@@ -981,12 +930,7 @@ impl Widget for FilePanel {
         // Focus the inline name input once its row has been drawn.
         if self.edit_focus_pending {
             if let Some((list, i, _)) = self.editing {
-                let refs = if list == LIST_MAP {
-                    &self.map_row_refs
-                } else {
-                    &self.card_row_refs
-                };
-                if let Some(w) = refs.get(i) {
+                if let Some(w) = self.rows_refs(list).get(i) {
                     let input = w.text_input(cx, ids!(row_edit));
                     if input.area().is_valid(cx) {
                         cx.set_key_focus(input.area());
@@ -1022,17 +966,157 @@ impl Widget for FilePanel {
         // The inline edit input must see events itself to process keystrokes
         // (typing/IME); row widgets are not forwarded otherwise.
         if let Some((list, i, _)) = self.editing {
-            let refs = if list == LIST_MAP {
-                &self.map_row_refs
-            } else {
-                &self.card_row_refs
-            };
-            if let Some(w) = refs.get(i).cloned() {
+            if let Some(w) = self.rows_refs(list).get(i).cloned() {
                 w.handle_event(cx, event, scope);
             }
         }
-        // Modal state (context menu / inline name edit) grabs every press
-        // first, so the lists/tab/divider below can't fire behind it.
+        self.handle_modal_events(cx, event);
+        // capture_overload: the mindmap canvas (earlier in tree order, covering
+        // the whole body) hits first and marks t.handled, which makes plain
+        // hits() skip our areas entirely (same trick as FloatPanel).
+        match event.hits_with_capture_overload(cx, self.tab_area, true) {
+            Hit::FingerDown(fe) if fe.is_primary_hit() && self.editing.is_none() => {
+                self.toggle(cx);
+            }
+            _ => {}
+        }
+        self.handle_edge_drag(cx, event);
+        self.handle_splitter_drag(cx, event);
+        self.handle_mouse_move(cx, event);
+        self.handle_list_events(cx, event, LIST_MAP);
+        self.handle_list_events(cx, event, LIST_CARD);
+        // Right-click anywhere on the panel opens (or repositions) the context
+        // menu; right-clicking a map row enables the "删除" item.
+        match event.hits_with_capture_overload(cx, self.panel_area, true) {
+            Hit::FingerDown(fe)
+                if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary()) =>
+            {
+                self.open_menu(cx, fe.abs);
+            }
+            _ => {}
+        }
+        // Claim the press over the panel body so it never reaches the canvas;
+        // on FingerUp the tab button itself also fires a click action nobody
+        // listens to (toggle already happened on FingerDown).
+        let _ = event.hits_with_capture_overload(cx, self.panel_area, true);
+    }
+}
+
+impl FilePanel {
+    /// The row list for a list id.
+    fn rows(&self, list: u8) -> &[Row] {
+        if list == LIST_MAP {
+            &self.map_rows
+        } else {
+            &self.card_rows
+        }
+    }
+
+    fn rows_mut(&mut self, list: u8) -> &mut Vec<Row> {
+        if list == LIST_MAP {
+            &mut self.map_rows
+        } else {
+            &mut self.card_rows
+        }
+    }
+
+    /// The lazy row-widget refs for a list id.
+    fn rows_refs(&self, list: u8) -> &[WidgetRef] {
+        if list == LIST_MAP {
+            &self.map_row_refs
+        } else {
+            &self.card_row_refs
+        }
+    }
+
+    fn rows_refs_mut(&mut self, list: u8) -> &mut Vec<WidgetRef> {
+        if list == LIST_MAP {
+            &mut self.map_row_refs
+        } else {
+            &mut self.card_row_refs
+        }
+    }
+
+    /// The list's viewport rect.
+    fn list_rect(&self, list: u8) -> Rect {
+        if list == LIST_MAP {
+            self.map_list_rect
+        } else {
+            self.card_list_rect
+        }
+    }
+
+    /// The list's scroll offset.
+    fn list_scroll(&self, list: u8) -> f64 {
+        if list == LIST_MAP {
+            self.map_scroll
+        } else {
+            self.card_scroll
+        }
+    }
+
+    fn list_scroll_mut(&mut self, list: u8) -> &mut f64 {
+        if list == LIST_MAP {
+            &mut self.map_scroll
+        } else {
+            &mut self.card_scroll
+        }
+    }
+
+    /// The list's hit area.
+    fn list_area(&self, list: u8) -> Area {
+        if list == LIST_MAP {
+            self.map_list_area
+        } else {
+            self.card_list_area
+        }
+    }
+
+    /// Draw one list's rows (lazily creating row widgets), with the map list
+    /// highlighting the current map.
+    fn draw_list(&mut self, cx: &mut Cx2d, scope: &mut Scope, list: u8, rect: Rect) {
+        let Some(t) = &self.row_template else {
+            return;
+        };
+        let edit = self.edit_index(list);
+        let (rows, refs, scroll, area, selected) = if list == LIST_MAP {
+            (
+                &self.map_rows[..],
+                &mut self.map_row_refs,
+                self.map_scroll,
+                &mut self.map_list_area,
+                self.current_map.as_deref(),
+            )
+        } else {
+            (
+                &self.card_rows[..],
+                &mut self.card_row_refs,
+                self.card_scroll,
+                &mut self.card_list_area,
+                None,
+            )
+        };
+        draw_rows(
+            cx,
+            scope,
+            list,
+            rows,
+            t,
+            refs,
+            rect,
+            scroll,
+            area,
+            edit,
+            &self.expanded,
+            selected,
+            &mut self.draw_sel_hl,
+        );
+    }
+
+    /// Modal state (context menu / inline name edit) grabs every press
+    /// first, so the lists/tab/divider below can't fire behind it. Enter
+    /// confirms and Esc cancels an inline name edit.
+    fn handle_modal_events(&mut self, cx: &mut Cx, event: &Event) {
         if self.menu_open || self.editing.is_some() {
             match event.hits_with_capture_overload(cx, self.modal_area, true) {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
@@ -1061,7 +1145,6 @@ impl Widget for FilePanel {
                 _ => {}
             }
         }
-        // Inline name edit: Enter confirms, Esc cancels.
         if self.editing.is_some() {
             if let Event::KeyDown(ke) = event {
                 match ke.key_code {
@@ -1071,19 +1154,13 @@ impl Widget for FilePanel {
                 }
             }
         }
-        // capture_overload: the mindmap canvas (earlier in tree order, covering
-        // the whole body) hits first and marks t.handled, which makes plain
-        // hits() skip our areas entirely (same trick as FloatPanel).
-        match event.hits_with_capture_overload(cx, self.tab_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() && self.editing.is_none() => {
-                self.toggle(cx);
-            }
-            _ => {}
-        }
-        // Divider drag: capture_overload (the mindmap canvas shadows plain
-        // hits, same as FloatPanel) on the strip around the divider line.
-        // Right-edge drag to resize the panel width. Checked before the
-        // splitter so grabbing the corner of the strip resizes the width.
+    }
+
+    /// Right-edge drag to resize the panel width. capture_overload (the
+    /// mindmap canvas shadows plain hits, same as FloatPanel) on the edge
+    /// strip; checked before the splitter so grabbing the corner of the
+    /// strip resizes the width.
+    fn handle_edge_drag(&mut self, cx: &mut Cx, event: &Event) {
         match event.hits_with_capture_overload(cx, self.edge_area, true) {
             Hit::FingerDown(fe) if fe.is_primary_hit() && self.editing.is_none() => {
                 self.panel_w_dragging = true;
@@ -1101,6 +1178,10 @@ impl Widget for FilePanel {
             }
             _ => {}
         }
+    }
+
+    /// Divider drag to resize the two panes.
+    fn handle_splitter_drag(&mut self, cx: &mut Cx, event: &Event) {
         match event.hits_with_capture_overload(cx, self.splitter_area, true) {
             Hit::FingerDown(fe) if fe.is_primary_hit() && self.editing.is_none() => {
                 self.split_dragging = true;
@@ -1118,6 +1199,11 @@ impl Widget for FilePanel {
             }
             _ => {}
         }
+    }
+
+    /// Hover cursors over the edge/splitter and the context-menu highlight
+    /// (tracked from the raw cursor, redraw only on change).
+    fn handle_mouse_move(&mut self, cx: &mut Cx, event: &Event) {
         if let Event::MouseMove(e) = event {
             if !self.panel_w_dragging && !self.split_dragging {
                 if self.edge_rect.contains(e.abs) {
@@ -1126,7 +1212,6 @@ impl Widget for FilePanel {
                     cx.set_cursor(MouseCursor::RowResize);
                 }
             }
-            // Menu hover: tracked from the raw cursor, redraw only on change.
             if self.menu_open {
                 let hover = menu_item_index(self.menu_rect, self.menu_items.len(), e.abs);
                 if hover != self.menu_hover {
@@ -1135,139 +1220,71 @@ impl Widget for FilePanel {
                 }
             }
         }
-        // Map list: press a file row to drag it into a maps/ dir, or click to
-        // switch the map (fired on FingerUp so a drag never switches). Wheel
-        // scrolls both lists (Scroll bypasses the handled flag).
-        match event.hits_with_capture_overload(cx, self.map_list_area, true) {
+    }
+
+    /// One list's events: press a file row to drag it into a maps/ dir, or
+    /// click to switch the map (fired on FingerUp so a drag never switches);
+    /// dir rows toggle expansion on their arrow strip; wheel scrolls the
+    /// list (Scroll bypasses the handled flag).
+    fn handle_list_events(&mut self, cx: &mut Cx, event: &Event, list: u8) {
+        let rows_len = self.rows(list).len();
+        let (list_rect, scroll) = self.edit_geometry(list);
+        let list_area = self.list_area(list);
+        match event.hits_with_capture_overload(cx, list_area, true) {
             Hit::FingerDown(fe)
                 if fe.is_primary_hit() && self.editing.is_none() && !self.menu_open =>
             {
-                if let Some(i) = row_index_at(
-                    self.map_rows.len(),
-                    self.map_list_rect,
-                    fe.abs,
-                    self.map_scroll,
-                ) {
-                    if !self.map_rows[i].is_dir() {
+                if let Some(i) = row_index_at(rows_len, list_rect, fe.abs, scroll) {
+                    if !self.rows(list)[i].is_dir() {
                         // file rows start a drag (or a click on FingerUp)
-                        self.drag_press = Some((LIST_MAP, i, fe.abs));
+                        self.drag_press = Some((list, i, fe.abs));
                     } else {
                         // dir rows: the arrow strip toggles expansion
-                        let indent_x =
-                            self.map_list_rect.pos.x + self.map_rows[i].depth as f64 * INDENT;
+                        let indent_x = list_rect.pos.x + self.rows(list)[i].depth as f64 * INDENT;
                         if fe.abs.x < indent_x + ARROW_W {
-                            self.toggle_expand(cx, LIST_MAP, i);
+                            self.toggle_expand(cx, list, i);
                         }
                     }
                 }
             }
             Hit::FingerMove(fe) => {
-                self.track_drag(cx, fe.abs, LIST_MAP);
+                self.track_drag(cx, fe.abs, list);
             }
             Hit::FingerUp(_) => {
-                self.finish_drag(cx, LIST_MAP);
+                self.finish_drag(cx, list);
             }
             Hit::FingerScroll(fe) => {
-                if scroll_rows(self.map_rows.len(), self.map_list_rect, fe.scroll.y, &mut self.map_scroll) {
+                if scroll_rows(rows_len, list_rect, fe.scroll.y, self.list_scroll_mut(list)) {
                     self.redraw(cx);
                 }
             }
             _ => {}
         }
-        match event.hits_with_capture_overload(cx, self.card_list_area, true) {
-            Hit::FingerDown(fe)
-                if fe.is_primary_hit() && self.editing.is_none() && !self.menu_open =>
-            {
-                if let Some(i) = row_index_at(
-                    self.card_rows.len(),
-                    self.card_list_rect,
-                    fe.abs,
-                    self.card_scroll,
-                ) {
-                    if !self.card_rows[i].is_dir() {
-                        self.drag_press = Some((LIST_CARD, i, fe.abs));
-                    } else {
-                        let indent_x =
-                            self.card_list_rect.pos.x + self.card_rows[i].depth as f64 * INDENT;
-                        if fe.abs.x < indent_x + ARROW_W {
-                            self.toggle_expand(cx, LIST_CARD, i);
-                        }
-                    }
-                }
-            }
-            Hit::FingerMove(fe) => {
-                self.track_drag(cx, fe.abs, LIST_CARD);
-            }
-            Hit::FingerUp(_) => {
-                self.finish_drag(cx, LIST_CARD);
-            }
-            Hit::FingerScroll(fe) => {
-                if scroll_rows(self.card_rows.len(), self.card_list_rect, fe.scroll.y, &mut self.card_scroll) {
-                    self.redraw(cx);
-                }
-            }
-            _ => {}
-        }
-        // Right-click anywhere on the panel opens (or repositions) the context
-        // menu; right-clicking a map row enables the "删除" item.
-        match event.hits_with_capture_overload(cx, self.panel_area, true) {
-            Hit::FingerDown(fe)
-                if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary()) =>
-            {
-                self.open_menu(cx, fe.abs);
-            }
-            _ => {}
-        }
-        // Claim the press over the panel body so it never reaches the canvas;
-        // on FingerUp the tab button itself also fires a click action nobody
-        // listens to (toggle already happened on FingerDown).
-        let _ = event.hits_with_capture_overload(cx, self.panel_area, true);
     }
-}
 
-impl FilePanel {
     fn content_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.content_ref.is_none() {
-            self.content_ref = Some(self.view.widget(cx, ids!(content)));
-        }
-        self.content_ref.clone()
+        cached_widget(&mut self.content_ref, || self.view.widget(cx, ids!(content)))
     }
 
     fn canvas_pane_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.canvas_pane_ref.is_none() {
-            self.canvas_pane_ref = Some(self.view.widget(cx, ids!(canvas_pane)));
-        }
-        self.canvas_pane_ref.clone()
+        cached_widget(&mut self.canvas_pane_ref, || self.view.widget(cx, ids!(canvas_pane)))
     }
 
     fn card_pane_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.card_pane_ref.is_none() {
-            self.card_pane_ref = Some(self.view.widget(cx, ids!(card_pane)));
-        }
-        self.card_pane_ref.clone()
+        cached_widget(&mut self.card_pane_ref, || self.view.widget(cx, ids!(card_pane)))
     }
 
     fn tab_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.tab_ref.is_none() {
-            self.tab_ref = Some(self.view.widget(cx, ids!(tab)));
-        }
-        self.tab_ref.clone()
+        cached_widget(&mut self.tab_ref, || self.view.widget(cx, ids!(tab)))
     }
 
     fn ctx_menu_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {
-        if self.ctx_menu_ref.is_none() {
-            self.ctx_menu_ref = Some(self.view.widget(cx, ids!(ctx_menu)));
-        }
-        self.ctx_menu_ref.clone()
+        cached_widget(&mut self.ctx_menu_ref, || self.view.widget(cx, ids!(ctx_menu)))
     }
 
     /// The list being edited: (rect, scroll) for the given list id.
     fn edit_geometry(&self, list: u8) -> (Rect, f64) {
-        if list == LIST_MAP {
-            (self.map_list_rect, self.map_scroll)
-        } else {
-            (self.card_list_rect, self.card_scroll)
-        }
+        (self.list_rect(list), self.list_scroll(list))
     }
 
     /// The row index being edited in `list`, if any.
@@ -1278,27 +1295,11 @@ impl FilePanel {
         }
     }
 
-    /// Ease `slide` toward its target on each timer tick (mirrors the
-    /// mindmap's zoom animation pattern).
+    /// Ease the slide animation on its timer tick.
     fn handle_slide_anim(&mut self, cx: &mut Cx, event: &Event) {
-        let Some(timer) = self.slide_timer else { return };
-        let Some(te) = timer.is_event(event) else { return };
-        let now = te.time.unwrap_or(0.0);
-        // first tick has no baseline; fall back to one 60Hz frame
-        let dt = if self.last_timer_time == 0.0 {
-            1.0 / 60.0
-        } else {
-            (now - self.last_timer_time).max(0.0)
-        };
-        self.last_timer_time = now;
-        let target = if self.opened { 1.0 } else { 0.0 };
-        self.slide += (target - self.slide) * (1.0 - (-dt * SLIDE_EASE).exp());
-        if (target - self.slide).abs() < 1e-3 {
-            self.slide = target;
-            cx.stop_timer(timer);
-            self.slide_timer = None;
+        if self.slide.handle_event(cx, event) {
+            self.redraw(cx);
         }
-        self.redraw(cx);
     }
 
     /// Rebuild the row lists when the pane roots or any expanded subdir
@@ -1377,17 +1378,13 @@ impl FilePanel {
     }
 
     fn toggle(&mut self, cx: &mut Cx) {
-        self.opened = !self.opened;
+        self.slide.toggle(cx);
         self.menu_open = false;
         if self.editing.is_some() {
             self.cancel_edit(cx);
         }
         if let Some(tab) = self.tab_widget(cx) {
-            tab.set_text(cx, if self.opened { "◀" } else { "▶" });
-        }
-        if self.slide_timer.is_none() {
-            self.slide_timer = Some(cx.start_interval(1.0 / 60.0));
-            self.last_timer_time = 0.0;
+            tab.set_text(cx, if self.slide.opened { "◀" } else { "▶" });
         }
         self.redraw(cx);
     }
@@ -1416,20 +1413,7 @@ impl FilePanel {
             LIST_CARD
         };
         self.menu_items = menu_items_for(self.menu_row, target_is_dir);
-        let h = MENU_PAD * 2.0 + self.menu_items.len() as f64 * MENU_ITEM_H;
-        let panel = self.panel_rect;
-        // clamp(min > max) panics; keep the menu inside the panel, or at its
-        // edge when the panel is narrower than the menu.
-        let max_x = (panel.pos.x + panel.size.x - MENU_W).max(panel.pos.x);
-        let max_y = (panel.pos.y + panel.size.y - h).max(panel.pos.y);
-        let pos = dvec2(
-            abs.x.clamp(panel.pos.x, max_x),
-            abs.y.clamp(panel.pos.y, max_y),
-        );
-        self.menu_rect = Rect {
-            pos,
-            size: dvec2(MENU_W, h),
-        };
+        self.menu_rect = menu_rect(self.panel_rect, abs, self.menu_items.len());
         if let Some(menu) = self.ctx_menu_widget(cx) {
             let target_display = self
                 .menu_row
@@ -1464,21 +1448,12 @@ impl FilePanel {
 
     /// The row value at (list, index), if in bounds.
     fn row_value(&self, list: u8, i: usize) -> Option<String> {
-        let rows = if list == LIST_MAP {
-            &self.map_rows
-        } else {
-            &self.card_rows
-        };
-        rows.get(i).map(|r| r.value.clone())
+        self.rows(list).get(i).map(|r| r.value.clone())
     }
 
     /// (rows, viewport rect, scroll) for a list id.
     fn list_geometry(&self, list: u8) -> (&[Row], Rect, f64) {
-        if list == LIST_MAP {
-            (&self.map_rows, self.map_list_rect, self.map_scroll)
-        } else {
-            (&self.card_rows, self.card_list_rect, self.card_scroll)
-        }
+        (self.rows(list), self.list_rect(list), self.list_scroll(list))
     }
 
     /// Update the drag for a press in `list`: activate past the threshold and
@@ -1580,14 +1555,9 @@ impl FilePanel {
             EditKind::NewDir => 0,
             EditKind::Rename => self.menu_row.map(|(_, i)| i).unwrap_or(0),
         };
-        let rows = if list == LIST_MAP {
-            &mut self.map_rows
-        } else {
-            &mut self.card_rows
-        };
-        self.edit_snapshot = rows.clone();
+        self.edit_snapshot = self.rows(list).to_vec();
         if kind != EditKind::Rename {
-            rows.insert(
+            self.rows_mut(list).insert(
                 index,
                 Row {
                     value: String::new(),
@@ -1597,11 +1567,7 @@ impl FilePanel {
         }
         self.editing = Some((list, index, kind));
         self.edit_focus_pending = true;
-        if list == LIST_MAP {
-            self.map_row_refs.clear();
-        } else {
-            self.card_row_refs.clear();
-        }
+        self.rows_refs_mut(list).clear();
         NAME_EDITING.store(true, std::sync::atomic::Ordering::Relaxed);
         self.redraw(cx);
     }
@@ -1614,27 +1580,17 @@ impl FilePanel {
         self.editing = None;
         NAME_EDITING.store(false, std::sync::atomic::Ordering::Relaxed);
         self.drop_edit_focus(cx, list);
-        if list == LIST_MAP {
-            self.map_rows = std::mem::take(&mut self.edit_snapshot);
-            self.map_row_refs.clear();
-        } else {
-            self.card_rows = std::mem::take(&mut self.edit_snapshot);
-            self.card_row_refs.clear();
-        }
+        *self.rows_mut(list) = std::mem::take(&mut self.edit_snapshot);
+        self.rows_refs_mut(list).clear();
         self.redraw(cx);
     }
 
     /// Release key focus from the edit input so the map gets keys back.
     fn drop_edit_focus(&self, cx: &mut Cx, list: u8) {
-        let refs = if list == LIST_MAP {
-            &self.map_row_refs
-        } else {
-            &self.card_row_refs
-        };
         let Some(i) = self.edit_index(list) else {
             return;
         };
-        if let Some(w) = refs.get(i) {
+        if let Some(w) = self.rows_refs(list).get(i) {
             let input = w.text_input(cx, ids!(row_edit));
             if input.area() == cx.key_focus() {
                 cx.set_key_focus(Area::Empty);
@@ -1649,12 +1605,7 @@ impl FilePanel {
         let Some((list, i, kind)) = self.editing else {
             return;
         };
-        let refs = if list == LIST_MAP {
-            &self.map_row_refs
-        } else {
-            &self.card_row_refs
-        };
-        let Some(w) = refs.get(i).cloned() else {
+        let Some(w) = self.rows_refs(list).get(i).cloned() else {
             return;
         };
         let raw = w.text_input(cx, ids!(row_edit)).text();
@@ -1696,24 +1647,12 @@ impl FilePanel {
         // Replace the placeholder with the typed name; the dir mtime rebuild
         // will swap in the real scan result once the entry exists. Refs are
         // cleared so the row label (set at creation) shows the new name.
-        let depth = if list == LIST_MAP {
-            self.map_rows.get(i).map(|r| r.depth).unwrap_or(0)
-        } else {
-            self.card_rows.get(i).map(|r| r.depth).unwrap_or(0)
+        let depth = self.rows(list).get(i).map(|r| r.depth).unwrap_or(0);
+        self.rows_mut(list)[i] = Row {
+            value: to.clone(),
+            depth,
         };
-        if list == LIST_MAP {
-            self.map_rows[i] = Row {
-                value: to.clone(),
-                depth,
-            };
-            self.map_row_refs.clear();
-        } else {
-            self.card_rows[i] = Row {
-                value: to.clone(),
-                depth,
-            };
-            self.card_row_refs.clear();
-        }
+        self.rows_refs_mut(list).clear();
         self.editing = None;
         NAME_EDITING.store(false, std::sync::atomic::Ordering::Relaxed);
         self.drop_edit_focus(cx, list);

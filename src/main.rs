@@ -3,8 +3,10 @@ pub use makepad_widgets;
 use makepad_widgets::*;
 
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use crate::ai::{AIConfig, SseParser};
+use crate::util::cached_widget;
 
 app_main!(App);
 
@@ -14,7 +16,10 @@ mod file_panel;
 mod float_panel;
 mod markdown_media;
 mod mindmap;
+mod rag;
 mod refs_panel;
+mod slide_panel;
+mod util;
 
 use crate::file_panel::FilePanelWidgetRefExt;
 use crate::float_panel::FloatPanelWidgetRefExt;
@@ -251,9 +256,9 @@ script_mod! {
                         width: Fill
                         height: Fill
                         align: Center
-                        // Balance the padding.left that sync_caption_centering
-                        // applies (windows_buttons width = 3x46) so the title
-                        // stays truly centered with the left menu buttons.
+                        // Balance the caption's right padding against the
+                        // windows buttons (width = 3x46) so the title stays
+                        // truly centered with the left menu buttons.
                         padding: Inset{right: 138}
                         label := mod.widgets.Label{
                             text: ""
@@ -323,6 +328,12 @@ script_mod! {
                                     text: "AI 助手"
                                     draw_text.text_style.font_size: 14.0
                                     draw_text.color: #e6e9f0
+                                }
+                                rag_status := mod.widgets.Label{
+                                    width: Fit
+                                    text: ""
+                                    draw_text.text_style.font_size: 12.0
+                                    draw_text.color: #8a91a0
                                 }
                                 new_chat_btn := NewChatBtn{
                                     draw_icon +: {
@@ -555,6 +566,48 @@ script_mod! {
     }
 }
 
+/// Child of `parent` by name, via live children (graph-independent).
+fn child_by_name(parent: &WidgetRef, id: LiveId) -> WidgetRef {
+    let mut found = WidgetRef::empty();
+    parent.try_children(&mut |name, child| {
+        if name == id {
+            found = child;
+        }
+    });
+    found
+}
+
+/// A send_chat deferred until the background RAG retrieval answers (or the
+/// timeout falls back to the BM25 context computed at send time).
+struct RagWait {
+    query: String,
+    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    fallback: String,
+    started: Instant,
+}
+
+/// Upper bound for the retrieval pre-roll; on timeout the BM25 fallback
+/// context fires the request. Measured hybrid ≈ 11s (5 × ~2s rerank + embed),
+/// plus first-call reranker lazy load (~4s) and CPU contention from a
+/// concurrent index build, so the budget carries headroom.
+const RAG_RETRIEVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often the app re-syncs the index from disk (catches card edits and
+/// refs changes; fingerprint-diffed so unchanged snapshots are free).
+const RAG_RESYNC_SECS: u64 = 5;
+/// Token slack for the async hybrid context: 5 excerpts × 300 chars ≈ 1050
+/// CJK-weighted tokens, not yet known at the context gauge.
+const RAG_CONTEXT_SLACK: usize = 1100;
+
+/// Lazy lookup of a child of the ai_panel content by name; a failed lookup
+/// is never cached, so it retries.
+fn cached_ai_child(cx: &Cx, ui: &WidgetRef, cache: &mut Option<WidgetRef>, id: LiveId) -> WidgetRef {
+    cached_widget(cache, || {
+        let content = ui.float_panel(cx, ids!(ai_panel)).content(cx);
+        child_by_name(&content, id)
+    })
+    .unwrap_or_default()
+}
+
 #[derive(Script, ScriptHook)]
 pub struct App {
     #[live]
@@ -605,6 +658,22 @@ pub struct App {
     /// The ai_panel's input_row View, resolved the same way.
     #[rust]
     input_row_ref: Option<WidgetRef>,
+    /// RAG backend (two worker threads), created on first draw.
+    #[rust]
+    rag: Option<rag::RagService>,
+    /// Drives status label refresh, periodic re-sync and retrieval polling.
+    #[rust]
+    rag_timer: Option<Timer>,
+    /// Deferred chat send waiting on the background retrieval.
+    #[rust]
+    rag_wait: Option<RagWait>,
+    /// Last periodic index re-sync time.
+    #[rust]
+    last_resync: Option<Instant>,
+    /// Last text shown in the rag_status label (set_text only on change, to
+    /// avoid a redraw every 250ms tick).
+    #[rust]
+    last_rag_label: String,
 }
 
 /// Format a token count compactly: 860, 2.4K, 1M.
@@ -619,6 +688,234 @@ fn fmt_tokens(n: usize) -> String {
 }
 
 impl App {
+    /// Setting/About popup toggles and their close buttons.
+    fn handle_popup_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.ui.button(cx, ids!(setting_btn)).clicked(actions) {
+            let p = self.ui.view(cx, ids!(setting_popup));
+            let show = !p.visible();
+            p.set_visible(cx, show);
+            if show {
+                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+                p.label(cx, ids!(title)).set_text(cx, "Setting");
+                p.view(cx, ids!(body_box)).set_visible(cx, false);
+                p.view(cx, ids!(settings_form)).set_visible(cx, true);
+                p.text_input(cx, ids!(key_input))
+                    .set_text(cx, &self.ai_config.api_key);
+                p.text_input(cx, ids!(url_input))
+                    .set_text(cx, &self.ai_config.base_url);
+                p.text_input(cx, ids!(model_input))
+                    .set_text(cx, &self.ai_config.model);
+                let thinking_idx = ai::THINKING_LEVELS
+                    .iter()
+                    .position(|l| *l == self.ai_config.thinking)
+                    .unwrap_or(3);
+                p.drop_down(cx, ids!(thinking_input))
+                    .set_selected_item(cx, thinking_idx);
+                p.label(cx, ids!(status)).set_text(cx, "");
+            }
+        }
+        if self.ui.button(cx, ids!(about_btn)).clicked(actions) {
+            let p = self.ui.view(cx, ids!(about_popup));
+            let show = !p.visible();
+            p.set_visible(cx, show);
+            if show {
+                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+                p.label(cx, ids!(title)).set_text(cx, "About");
+                p.view(cx, ids!(settings_form)).set_visible(cx, false);
+                p.view(cx, ids!(body_box)).set_visible(cx, true);
+                p.label(cx, ids!(body_box.body)).set_text(
+                    cx,
+                    &format!(
+                        "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                );
+            }
+        }
+        if self
+            .ui
+            .view(cx, ids!(setting_popup))
+            .button(cx, ids!(close))
+            .clicked(actions)
+        {
+            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+        }
+        if self
+            .ui
+            .view(cx, ids!(about_popup))
+            .button(cx, ids!(close))
+            .clicked(actions)
+        {
+            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+        }
+    }
+
+    /// Perf/chat float panel show-hide toggles.
+    fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.ui.button(cx, ids!(debug_btn)).clicked(actions) {
+            let panel = self.ui.float_panel(cx, ids!(float_panel));
+            if panel.opened() {
+                panel.hide(cx);
+            } else {
+                panel.show(cx);
+                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+            }
+        }
+        if self.ui.button(cx, ids!(ai_btn)).clicked(actions) {
+            let panel = self.ui.float_panel(cx, ids!(ai_panel));
+            if panel.opened() {
+                panel.hide(cx);
+            } else {
+                panel.show(cx);
+                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
+                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+            }
+        }
+    }
+
+    /// Settings form: save and connection test.
+    fn handle_settings_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.ui.button(cx, ids!(save_btn)).clicked(actions) {
+            self.ai_config = self.form_config(cx);
+            ai::save_config(&self.ai_config);
+            self.update_ctx_label(cx);
+            self.ui
+                .label(cx, ids!(setting_popup.status))
+                .set_text(cx, "已保存");
+        }
+        if self.ui.button(cx, ids!(test_btn)).clicked(actions) {
+            if !self.testing {
+                self.testing = true;
+                self.test_id = LiveId::unique();
+                let cfg = self.form_config(cx);
+                ai::test_request(cx, self.test_id, &cfg);
+                self.ui
+                    .label(cx, ids!(setting_popup.status))
+                    .set_text(cx, "测试中…");
+            }
+        }
+    }
+
+    /// Chat panel: send/stop/new-chat buttons and the input's focus/return
+    /// actions (focus hands off the mindmap's keyboard shortcuts).
+    fn handle_chat_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let row = self.panel_input_row(cx);
+        if self
+            .child_by_name(&row, live_id!(send_btn))
+            .as_button()
+            .clicked(actions)
+        {
+            let text = self
+                .child_by_name(&row, live_id!(chat_input))
+                .as_text_input()
+                .text();
+            self.send_chat(cx, &text);
+        }
+        if self
+            .child_by_name(&row, live_id!(stop_btn))
+            .as_button()
+            .clicked(actions)
+        {
+            self.stop_chat(cx);
+        }
+        let header = self.panel_header(cx);
+        if self
+            .child_by_name(&header, live_id!(new_chat_btn))
+            .as_button()
+            .clicked(actions)
+        {
+            self.new_chat(cx);
+        }
+        // While the AI chat input holds key focus, the mindmap must skip
+        // its keyboard shortcuts (WASD/arrows/Space would otherwise fight
+        // the typing).
+        let chat_input = self
+            .child_by_name(&row, live_id!(chat_input))
+            .as_text_input();
+        for action in actions.filter_widget_actions_cast::<TextInputAction>(chat_input.widget_uid())
+        {
+            match action {
+                TextInputAction::KeyFocus => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(true, Ordering::Relaxed)
+                }
+                TextInputAction::KeyFocusLost => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed)
+                }
+                TextInputAction::Returned(text, _) => self.send_chat(cx, &text),
+                _ => {}
+            }
+        }
+    }
+
+    /// File panel tree: map click, context-menu create/delete/rename.
+    fn handle_file_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // File panel tree: clicking a map switches the mindmap to it.
+        if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).map_clicked(actions) {
+            self.open_map(cx, &map_file);
+        }
+        // Context menu: create map / dir, delete map, rename.
+        let base = crate::util::app_base_dir();
+        if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
+            std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
+            self.open_map(cx, &map_file);
+        }
+        if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
+            std::fs::create_dir(base.join(&dir)).ok();
+        }
+        if let Some(rel) = self.ui.file_panel(cx, ids!(file_panel)).delete_entry(actions) {
+            let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+            if rel.ends_with('/') {
+                // Directory: maps/ dirs are deletable outright; a cards/
+                // dir also drops the referencing nodes from every map.
+                std::fs::remove_dir_all(base.join(&rel)).ok();
+                if rel.starts_with("cards/") {
+                    crate::mindmap::remove_dir_nodes(&base, &rel);
+                    // Drop ghost cards from the in-memory map so a later
+                    // save can't resurrect the references.
+                    mind_map.reload_map(cx);
+                }
+                // The current map may live inside the deleted dir.
+                if mind_map
+                    .current_map_file()
+                    .is_some_and(|c| c == rel || c.starts_with(&rel))
+                {
+                    self.open_map(cx, &self.next_map(&base));
+                }
+            } else {
+                std::fs::remove_file(base.join(&rel)).ok();
+                if mind_map.current_map_file().as_deref() == Some(rel.as_str()) {
+                    // Switch to the first remaining map; none left → the
+                    // default, whose failed load empties the canvas.
+                    self.open_map(cx, &self.next_map(&base));
+                }
+            }
+        }
+        if let Some((from, to)) = self.ui.file_panel(cx, ids!(file_panel)).rename_file(actions) {
+            if std::fs::rename(base.join(&from), base.join(&to)).is_ok() {
+                // Renaming a card/dir breaks map references; rewrite them.
+                if from.starts_with("cards/") {
+                    crate::mindmap::rewrite_node_paths(&base, &from, &to);
+                }
+                // Renaming the current map: keep showing it under the new
+                // name (content is unchanged, the saved view survives).
+                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                if mind_map.current_map_file().as_deref() == Some(from.as_str()) {
+                    self.open_map(cx, &to);
+                }
+            }
+        }
+    }
+
+    /// The first remaining map under maps/ (the default when none is left;
+    /// a failed load of it empties the canvas).
+    fn next_map(&self, base: &std::path::Path) -> String {
+        file_panel::all_map_files(base)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string())
+    }
+
     /// Current config as typed in the settings form (empty base_url/model
     /// fall back to the DeepSeek defaults).
     fn form_config(&self, cx: &Cx) -> AIConfig {
@@ -645,6 +942,9 @@ impl App {
         self.ui
             .refs_panel(cx, ids!(refs_panel))
             .set_current_map(cx, Some(map_file));
+        if let Some(rag) = &self.rag {
+            rag.set_map(map_file);
+        }
         self.map_opened = true;
         self.sync_title(cx);
     }
@@ -688,57 +988,30 @@ impl App {
     /// the panel content (avoids the widget-tree graph, which does not index
     /// deep into FloatPanel subtrees).
     fn chat_list(&mut self, cx: &Cx) -> WidgetRef {
-        if self.chat_list_ref.is_none() {
-            let content = self.ui.float_panel(cx, ids!(ai_panel)).content(cx);
-            let found = self.child_by_name(&content, live_id!(chat_list));
-            if !found.is_empty() {
-                self.chat_list_ref = Some(found);
-            }
-        }
-        self.chat_list_ref.clone().unwrap_or_default()
+        cached_ai_child(cx, &self.ui, &mut self.chat_list_ref, live_id!(chat_list))
     }
 
     /// The ai_panel's ctx_row View (cached), via live children from the
     /// panel content.
     fn ctx_row(&mut self, cx: &Cx) -> WidgetRef {
-        if self.ctx_row_ref.is_none() {
-            let content = self.ui.float_panel(cx, ids!(ai_panel)).content(cx);
-            let found = self.child_by_name(&content, live_id!(ctx_row));
-            if !found.is_empty() {
-                self.ctx_row_ref = Some(found);
-            }
-        }
-        self.ctx_row_ref.clone().unwrap_or_default()
+        cached_ai_child(cx, &self.ui, &mut self.ctx_row_ref, live_id!(ctx_row))
     }
 
     /// The ai_panel's header View, via live children from the panel content.
     fn panel_header(&mut self, cx: &Cx) -> WidgetRef {
         let content = self.ui.float_panel(cx, ids!(ai_panel)).content(cx);
-        self.child_by_name(&content, live_id!(header))
+        child_by_name(&content, live_id!(header))
     }
 
     /// The ai_panel's input_row View (cached), via live children from the
     /// panel content.
     fn panel_input_row(&mut self, cx: &Cx) -> WidgetRef {
-        if self.input_row_ref.is_none() {
-            let content = self.ui.float_panel(cx, ids!(ai_panel)).content(cx);
-            let found = self.child_by_name(&content, live_id!(input_row));
-            if !found.is_empty() {
-                self.input_row_ref = Some(found);
-            }
-        }
-        self.input_row_ref.clone().unwrap_or_default()
+        cached_ai_child(cx, &self.ui, &mut self.input_row_ref, live_id!(input_row))
     }
 
     /// Child of `parent` by name, via live children (graph-independent).
     fn child_by_name(&self, parent: &WidgetRef, id: LiveId) -> WidgetRef {
-        let mut found = WidgetRef::empty();
-        parent.try_children(&mut |name, child| {
-            if name == id {
-                found = child;
-            }
-        });
-        found
+        child_by_name(parent, id)
     }
 
     /// Estimated tokens of the whole history.
@@ -821,7 +1094,16 @@ impl App {
         if text.is_empty() || self.chat_pending {
             return;
         }
-        let would_use = self.context_tokens() + ai::estimate_tokens(text);
+        // BM25 context first (µs): the gauge must count what will actually
+        // be injected, plus slack for the async hybrid upgrade.
+        let ctx = self.rag_bm25_context(text);
+        let upgradeable = self
+            .rag
+            .as_ref()
+            .is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
+        let rag_tokens = ai::estimate_tokens(&ctx)
+            + if upgradeable { RAG_CONTEXT_SLACK } else { 0 };
+        let would_use = self.context_tokens() + ai::estimate_tokens(text) + rag_tokens;
         if would_use >= ai::CONTEXT_WINDOW {
             if !self
                 .chat_extra
@@ -849,14 +1131,132 @@ impl App {
         self.chat_buf.clear();
         self.chat_think.clear();
         self.chat_parser = ai::SseParser::new();
-        self.chat_id = LiveId::unique();
-        let messages: Vec<(String, String)> = self
+        let mut messages: Vec<(String, String)> = self
             .chat_history
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        // RAG context: sync BM25 always (fast path); when the models are
+        // ready, defer the request until the background hybrid retrieval
+        // answers (or times out), so citations reflect reranked results.
+        let mut defer = false;
+        if let Some(rag) = &self.rag {
+            if upgradeable {
+                let rx = rag.retrieve(text);
+                self.rag_wait = Some(RagWait {
+                    query: text.to_string(),
+                    rx,
+                    fallback: ctx,
+                    started: Instant::now(),
+                });
+                defer = true;
+            } else if !ctx.is_empty() {
+                messages.insert(0, ("system".to_string(), ctx));
+            }
+        }
+        if !defer {
+            self.fire_chat(cx, messages);
+        }
+    }
+
+    /// Fire the chat request with the given (system-prefixed) messages.
+    fn fire_chat(&mut self, cx: &mut Cx, messages: Vec<(String, String)>) {
+        self.chat_id = LiveId::unique();
         ai::chat_stream_request(cx, self.chat_id, &self.ai_config, &messages);
         self.render_msgs(cx);
+    }
+
+    /// Synchronous BM25-only context from the shared index (µs; the
+    /// retrieval worker's hybrid upgrade replaces it when available).
+    fn rag_bm25_context(&self, query: &str) -> String {
+        let Some(rag) = &self.rag else {
+            return String::new();
+        };
+        let hits = rag.bm25_search(query, 5);
+        rag::service::format_context(&hits)
+    }
+
+    /// Status text for the ai_panel header label; "" when idle and ready.
+    fn rag_status_text(&self) -> String {
+        if self.rag_wait.is_some() {
+            return "检索中…".to_string();
+        }
+        let Some(rag) = &self.rag else {
+            return String::new();
+        };
+        let Some(models) = rag.models() else {
+            return "模型准备中…".to_string();
+        };
+        let st = models.status.read().unwrap();
+        match &*st {
+            rag::ModelStatus::Downloading(f) => format!("下载模型 {f}…"),
+            rag::ModelStatus::Loading => "加载模型…".to_string(),
+            rag::ModelStatus::Failed(e) => format!("RAG 不可用: {e}"),
+            rag::ModelStatus::Ready => {
+                if rag.indexing() {
+                    "索引中…".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+    }
+
+    /// Periodic rag timer: re-sync the index from disk, refresh the status
+    /// label, and fire a deferred chat once its retrieval answers.
+    fn handle_rag_tick(&mut self, cx: &mut Cx) {
+        let now = Instant::now();
+        let due = self
+            .last_resync
+            .map(|t| now.duration_since(t).as_secs() >= RAG_RESYNC_SECS)
+            .unwrap_or(false);
+        if self.map_opened && due {
+            self.last_resync = Some(now);
+            if let Some(rag) = &self.rag {
+                if let Some(map) = self.ui.mind_map(cx, ids!(mindmap)).current_map_file() {
+                    rag.set_map(&map);
+                }
+            }
+        }
+        let text = self.rag_status_text();
+        if text != self.last_rag_label {
+            self.last_rag_label = text.clone();
+            self.ui.label(cx, ids!(rag_status)).set_text(cx, &text);
+        }
+        let Some(wait) = &mut self.rag_wait else {
+            return;
+        };
+        let hits = match wait.rx.try_recv() {
+            Ok(r) if r.query == wait.query => Some(r.hits),
+            Ok(_) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
+            Err(_) => Some(Vec::new()),
+        };
+        let Some(hits) = hits else {
+            return;
+        };
+        let fallback = wait.fallback.clone();
+        self.rag_wait = None;
+        let ctx = if hits.is_empty() {
+            fallback
+        } else {
+            rag::service::format_context(&hits)
+        };
+        let mut messages: Vec<(String, String)> = self
+            .chat_history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        if !ctx.is_empty() {
+            messages.insert(0, ("system".to_string(), ctx));
+        }
+        self.fire_chat(cx, messages);
     }
 
     /// Start a fresh conversation: drop all history and extras.
@@ -864,6 +1264,7 @@ impl App {
         if self.chat_pending {
             cx.cancel_http_request(self.chat_id);
         }
+        self.rag_wait = None;
         self.chat_history.clear();
         self.chat_extra.clear();
         self.chat_buf.clear();
@@ -879,6 +1280,7 @@ impl App {
             return;
         }
         self.chat_pending = false;
+        self.rag_wait = None;
         cx.cancel_http_request(self.chat_id);
         if !self.chat_buf.is_empty() {
             let buf = std::mem::take(&mut self.chat_buf);
@@ -1003,216 +1405,30 @@ impl AppMain for App {
             // platform only feeds frame_boundary on macOS; without this the
             // graph on Linux would be an empty shell. One line of wiring.
             cx.perf_monitor.frame_boundary(de.time);
+            // Lazy RAG startup (threads need no cx, but the poll timer does).
+            if self.rag.is_none() {
+                self.rag = Some(rag::RagService::start());
+                self.rag_timer = Some(cx.start_interval(0.25));
+                self.last_resync = Some(Instant::now());
+                if let Some(map) = self.ui.mind_map(cx, ids!(mindmap)).current_map_file() {
+                    if let Some(rag) = &self.rag {
+                        rag.set_map(&map);
+                    }
+                }
+            }
+        }
+        if let Some(timer) = self.rag_timer {
+            if timer.is_event(event).is_some() {
+                self.handle_rag_tick(cx);
+            }
         }
         self.match_event(cx, event);
         if let Event::Actions(actions) = event {
-            if self.ui.button(cx, ids!(setting_btn)).clicked(actions) {
-                let p = self.ui.view(cx, ids!(setting_popup));
-                let show = !p.visible();
-                p.set_visible(cx, show);
-                if show {
-                    self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-                    p.label(cx, ids!(title)).set_text(cx, "Setting");
-                    p.view(cx, ids!(body_box)).set_visible(cx, false);
-                    p.view(cx, ids!(settings_form)).set_visible(cx, true);
-                    p.text_input(cx, ids!(key_input))
-                        .set_text(cx, &self.ai_config.api_key);
-                    p.text_input(cx, ids!(url_input))
-                        .set_text(cx, &self.ai_config.base_url);
-                    p.text_input(cx, ids!(model_input))
-                        .set_text(cx, &self.ai_config.model);
-                    let thinking_idx = ai::THINKING_LEVELS
-                        .iter()
-                        .position(|l| *l == self.ai_config.thinking)
-                        .unwrap_or(3);
-                    p.drop_down(cx, ids!(thinking_input))
-                        .set_selected_item(cx, thinking_idx);
-                    p.label(cx, ids!(status)).set_text(cx, "");
-                }
-            }
-            if self.ui.button(cx, ids!(about_btn)).clicked(actions) {
-                let p = self.ui.view(cx, ids!(about_popup));
-                let show = !p.visible();
-                p.set_visible(cx, show);
-                if show {
-                    self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                    p.label(cx, ids!(title)).set_text(cx, "About");
-                    p.view(cx, ids!(settings_form)).set_visible(cx, false);
-                    p.view(cx, ids!(body_box)).set_visible(cx, true);
-                    p.label(cx, ids!(body_box.body)).set_text(
-                        cx,
-                        &format!(
-                            "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                    );
-                }
-            }
-            if self
-                .ui
-                .view(cx, ids!(setting_popup))
-                .button(cx, ids!(close))
-                .clicked(actions)
-            {
-                self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-            }
-            if self
-                .ui
-                .view(cx, ids!(about_popup))
-                .button(cx, ids!(close))
-                .clicked(actions)
-            {
-                self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-            }
-            if self.ui.button(cx, ids!(debug_btn)).clicked(actions) {
-                let panel = self.ui.float_panel(cx, ids!(float_panel));
-                if panel.opened() {
-                    panel.hide(cx);
-                } else {
-                    panel.show(cx);
-                    self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                    self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-                }
-            }
-            if self.ui.button(cx, ids!(ai_btn)).clicked(actions) {
-                let panel = self.ui.float_panel(cx, ids!(ai_panel));
-                if panel.opened() {
-                    panel.hide(cx);
-                } else {
-                    panel.show(cx);
-                    self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-                    self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-                }
-            }
-            if self.ui.button(cx, ids!(save_btn)).clicked(actions) {
-                self.ai_config = self.form_config(cx);
-                ai::save_config(&self.ai_config);
-                self.update_ctx_label(cx);
-                self.ui
-                    .label(cx, ids!(setting_popup.status))
-                    .set_text(cx, "已保存");
-            }
-            if self.ui.button(cx, ids!(test_btn)).clicked(actions) {
-                if !self.testing {
-                    self.testing = true;
-                    self.test_id = LiveId::unique();
-                    let cfg = self.form_config(cx);
-                    ai::test_request(cx, self.test_id, &cfg);
-                    self.ui
-                        .label(cx, ids!(setting_popup.status))
-                        .set_text(cx, "测试中…");
-                }
-            }
-            let row = self.panel_input_row(cx);
-            if self
-                .child_by_name(&row, live_id!(send_btn))
-                .as_button()
-                .clicked(actions)
-            {
-                let text = self
-                    .child_by_name(&row, live_id!(chat_input))
-                    .as_text_input()
-                    .text();
-                self.send_chat(cx, &text);
-            }
-            if self
-                .child_by_name(&row, live_id!(stop_btn))
-                .as_button()
-                .clicked(actions)
-            {
-                self.stop_chat(cx);
-            }
-            let header = self.panel_header(cx);
-            if self
-                .child_by_name(&header, live_id!(new_chat_btn))
-                .as_button()
-                .clicked(actions)
-            {
-                self.new_chat(cx);
-            }
-            // While the AI chat input holds key focus, the mindmap must skip
-            // its keyboard shortcuts (WASD/arrows/Space would otherwise fight
-            // the typing).
-            let chat_input = self
-                .child_by_name(&row, live_id!(chat_input))
-                .as_text_input();
-            for action in
-                actions.filter_widget_actions_cast::<TextInputAction>(chat_input.widget_uid())
-            {
-                match action {
-                    TextInputAction::KeyFocus => {
-                        crate::float_panel::CHAT_INPUT_ACTIVE.store(true, Ordering::Relaxed)
-                    }
-                    TextInputAction::KeyFocusLost => {
-                        crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed)
-                    }
-                    TextInputAction::Returned(text, _) => self.send_chat(cx, &text),
-                    _ => {}
-                }
-            }
-            // File panel tree: clicking a map switches the mindmap to it.
-            if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).map_clicked(actions) {
-                self.open_map(cx, &map_file);
-            }
-            // Context menu: create map / dir, delete map, rename.
-            let base = crate::mindmap::app_base_dir();
-            if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
-                std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
-                self.open_map(cx, &map_file);
-            }
-            if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
-                std::fs::create_dir(base.join(&dir)).ok();
-            }
-            if let Some(rel) = self.ui.file_panel(cx, ids!(file_panel)).delete_entry(actions) {
-                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
-                if rel.ends_with('/') {
-                    // Directory: maps/ dirs are deletable outright; a cards/
-                    // dir also drops the referencing nodes from every map.
-                    std::fs::remove_dir_all(base.join(&rel)).ok();
-                    if rel.starts_with("cards/") {
-                        crate::mindmap::remove_dir_nodes(&base, &rel);
-                        // Drop ghost cards from the in-memory map so a later
-                        // save can't resurrect the references.
-                        mind_map.reload_map(cx);
-                    }
-                    // The current map may live inside the deleted dir.
-                    if mind_map
-                        .current_map_file()
-                        .is_some_and(|c| c == rel || c.starts_with(&rel))
-                    {
-                        let next = file_panel::all_map_files(&base)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
-                        self.open_map(cx, &next);
-                    }
-                } else {
-                    std::fs::remove_file(base.join(&rel)).ok();
-                    if mind_map.current_map_file().as_deref() == Some(rel.as_str()) {
-                        // Switch to the first remaining map; none left → the
-                        // default, whose failed load empties the canvas.
-                        let next = file_panel::all_map_files(&base)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string());
-                        self.open_map(cx, &next);
-                    }
-                }
-            }
-            if let Some((from, to)) = self.ui.file_panel(cx, ids!(file_panel)).rename_file(actions) {
-                if std::fs::rename(base.join(&from), base.join(&to)).is_ok() {
-                    // Renaming a card/dir breaks map references; rewrite them.
-                    if from.starts_with("cards/") {
-                        crate::mindmap::rewrite_node_paths(&base, &from, &to);
-                    }
-                    // Renaming the current map: keep showing it under the new
-                    // name (content is unchanged, the saved view survives).
-                    let mind_map = self.ui.mind_map(cx, ids!(mindmap));
-                    if mind_map.current_map_file().as_deref() == Some(from.as_str()) {
-                        self.open_map(cx, &to);
-                    }
-                }
-            }
+            self.handle_popup_actions(cx, actions);
+            self.handle_panel_actions(cx, actions);
+            self.handle_settings_actions(cx, actions);
+            self.handle_chat_actions(cx, actions);
+            self.handle_file_panel_actions(cx, actions);
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
         // The Window widget answers Caption for the whole caption bar (a

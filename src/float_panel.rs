@@ -1,12 +1,12 @@
 use makepad_widgets::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
-const RESIZE_LEFT: u8 = 1;
-const RESIZE_RIGHT: u8 = 2;
-const RESIZE_TOP: u8 = 4;
-const RESIZE_BOTTOM: u8 = 8;
+use crate::util::{
+    apply_resize, resize_dir, set_panel_rect, RESIZE_BOTTOM, RESIZE_LEFT, RESIZE_RIGHT,
+    RESIZE_TOP,
+};
+
 /// Edge band (px) where a press starts a resize instead of a drag.
 const RESIZE_T: f64 = 6.0;
 /// Smallest panel size (header + input row fit inside).
@@ -19,10 +19,6 @@ pub(crate) static CHAT_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub fn is_chat_input_active() -> bool {
     CHAT_INPUT_ACTIVE.load(Ordering::Relaxed)
 }
-
-/// Rect of every open FloatPanel in window coords, keyed by widget uid; the
-/// mindmap skips wheel-zoom over them (their content scrolls instead).
-pub(crate) static FLOAT_PANEL_RECTS: Mutex<Vec<(WidgetUid, Rect)>> = Mutex::new(Vec::new());
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -124,11 +120,9 @@ impl Widget for FloatPanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         self.window_size = cx.current_pass_size();
         cx.begin_turtle(self.walk, self.layout);
-        // Register/remove this panel's rect for the mindmap's wheel-zoom skip.
-        FLOAT_PANEL_RECTS
-            .lock()
-            .unwrap()
-            .retain(|(u, _)| *u != self.uid);
+        // Unregister unconditionally so a panel closed (opened: false) since
+        // the last draw drops its rect; re-registered below when open.
+        set_panel_rect(self.uid.0, None);
         if self.opened {
             // Initialize the panel position before the first draw: the first
             // frame must already be drawn at the final pos, or the visible
@@ -175,7 +169,7 @@ impl Widget for FloatPanel {
                     pos: self.pos,
                     size: self.panel_size,
                 };
-                FLOAT_PANEL_RECTS.lock().unwrap().push((self.uid, panel_rect));
+                set_panel_rect(self.uid.0, Some(panel_rect));
                 cx.push_clip_rect(panel_rect);
                 let _ = content.draw_walk(cx, scope, walk);
                 // Own rect area over the panel: hit-testing against
@@ -223,27 +217,15 @@ impl Widget for FloatPanel {
             Hit::FingerMove(fe) => {
                 if self.resizing != 0 {
                     let dir = self.resizing;
-                    let mut pos = self.pos;
-                    let mut size = self.panel_size;
                     let max = self.window_size;
-                    if dir & RESIZE_LEFT != 0 {
-                        let w = (size.x + pos.x - fe.abs.x).clamp(RESIZE_MIN.x, max.x);
-                        pos.x += size.x - w;
-                        size.x = w;
-                    }
-                    if dir & RESIZE_RIGHT != 0 {
-                        size.x = (fe.abs.x - pos.x).clamp(RESIZE_MIN.x, max.x);
-                    }
-                    if dir & RESIZE_TOP != 0 {
-                        let h = (size.y + pos.y - fe.abs.y).clamp(RESIZE_MIN.y, max.y);
-                        pos.y += size.y - h;
-                        size.y = h;
-                    }
-                    if dir & RESIZE_BOTTOM != 0 {
-                        size.y = (fe.abs.y - pos.y).clamp(RESIZE_MIN.y, max.y);
-                    }
-                    self.pos = pos;
-                    self.panel_size = size;
+                    apply_resize(
+                        &mut self.pos,
+                        &mut self.panel_size,
+                        fe.abs,
+                        dir,
+                        RESIZE_MIN,
+                        max,
+                    );
                     self.redraw(cx);
                 } else if self.dragging {
                     let mut pos = fe.abs - self.grab;
@@ -286,27 +268,13 @@ impl Widget for FloatPanel {
 
 impl FloatPanel {
     /// Edge band hit (window coords) as a direction bitmask, 0 when not on
-    /// any edge. Mirrors the mindmap's card resize_hit.
+    /// any edge. Shared math with the mindmap's card resize (util::resize_dir).
     fn resize_hit(&self, p: DVec2) -> u8 {
-        let t = RESIZE_T;
         let r = Rect {
             pos: self.pos,
             size: self.panel_size,
         };
-        let on_l = (p.x - r.pos.x).abs() <= t;
-        let on_r = (p.x - (r.pos.x + r.size.x)).abs() <= t;
-        let on_t = (p.y - r.pos.y).abs() <= t;
-        let on_b = (p.y - (r.pos.y + r.size.y)).abs() <= t;
-        let in_x = p.x >= r.pos.x - t && p.x <= r.pos.x + r.size.x + t;
-        let in_y = p.y >= r.pos.y - t && p.y <= r.pos.y + r.size.y + t;
-        let mut dir = 0;
-        if (on_l || on_r) && in_y {
-            dir |= if on_l { RESIZE_LEFT } else { RESIZE_RIGHT };
-        }
-        if (on_t || on_b) && in_x {
-            dir |= if on_t { RESIZE_TOP } else { RESIZE_BOTTOM };
-        }
-        dir
+        resize_dir(r, p, RESIZE_T)
     }
 
     fn content_widget(&mut self, cx: &Cx) -> Option<WidgetRef> {

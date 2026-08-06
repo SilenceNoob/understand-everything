@@ -3,3 +3,6 @@
 .opencode/node_modules/
 /settings.json
 /refs/
+/models/
+/.rag_cache/
+/docs/

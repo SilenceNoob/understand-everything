@@ -2,7 +2,7 @@ use makepad_widgets::*;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mindmap::app_base_dir;
+use crate::util::app_base_dir;
 
 /// DeepSeek defaults (OpenAI-compatible API; base_url has no /v1 suffix).
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
