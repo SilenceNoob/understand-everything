@@ -24,6 +24,37 @@ fn default_thinking() -> String {
     "max".to_string()
 }
 
+/// The 渐构 concept-card sections, in display order: (id, title). The
+/// ai_panel shows one pill button per section; enabled ids are persisted in
+/// settings.json and the prompt is built from them.
+pub const JIANGOU_SECTIONS: [(&str, &str); 7] = [
+    ("desc", "标准描述"),
+    ("plain", "通俗描述"),
+    ("pos", "正面例子"),
+    ("neg", "反面例子"),
+    ("affect", "影响什么"),
+    ("affected", "被啥影响"),
+    ("use", "概念作用"),
+];
+
+/// Instruction for one enabled section: (id, section body).
+fn jiangou_section_instruction(id: &str) -> &'static str {
+    match id {
+        "desc" => "用一两句话给出准确严谨的定义。",
+        "plain" => "用生活化的比喻或大白话解释这个概念。",
+        "pos" => "给出一个符合该概念的正面例子。",
+        "neg" => "给出一个不符合该概念的负面例子，并说明为什么不符合。",
+        "affect" => "说明这个概念会支持、影响或催生什么。",
+        "affected" => "说明什么因素会影响、决定或催生这个概念。",
+        "use" => "说明学会这个概念后有什么用，可以用在哪些场景。",
+        _ => "",
+    }
+}
+
+fn default_jiangou_sections() -> Vec<String> {
+    JIANGOU_SECTIONS.iter().map(|(id, _)| id.to_string()).collect()
+}
+
 /// AI provider config, persisted as settings.json in the app base dir.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AIConfig {
@@ -32,6 +63,10 @@ pub struct AIConfig {
     pub model: String,
     #[serde(default = "default_thinking")]
     pub thinking: String,
+    /// Enabled 渐构 format sections (ids from JIANGOU_SECTIONS); empty =
+    /// normal chat, non-empty = concept answers follow the enabled sections.
+    #[serde(default = "default_jiangou_sections")]
+    pub jiangou_sections: Vec<String>,
 }
 
 impl Default for AIConfig {
@@ -41,8 +76,30 @@ impl Default for AIConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             thinking: default_thinking(),
+            jiangou_sections: default_jiangou_sections(),
         }
     }
+}
+
+/// System-prompt instruction for 渐构-style concept answers, listing only
+/// the enabled sections. Injected on every request while any section is on
+/// (never stored in chat_history).
+pub fn jiangou_format_prompt(enabled: &[String]) -> String {
+    let mut out = String::from(
+        "当用户的问题是在解释或学习某个概念时，请按以下板块回答，板块标题用 markdown 标题：\n",
+    );
+    for (id, title) in JIANGOU_SECTIONS {
+        if enabled.iter().any(|s| s == id) {
+            out.push_str(&format!(
+                "## {title}\n{}\n",
+                jiangou_section_instruction(id)
+            ));
+        }
+    }
+    out.push_str(
+        "要求：每个板块简短精炼；回答优先依据提供的参考资料和卡片内容，并在引用处标注 [编号]；参考资料不足时明确说明并基于自己的知识补充；若用户的问题不是概念解释类（例如编程任务、总结、闲聊），则直接正常回答，不要套用上述格式。",
+    );
+    out
 }
 
 /// Load settings.json; a missing or malformed file yields the defaults.

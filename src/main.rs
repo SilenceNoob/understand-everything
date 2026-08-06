@@ -55,6 +55,47 @@ script_mod! {
         }
     }
 
+    // 渐构 section pills: gray (off) and blue (on) variants, swapped by
+    // visibility like the send/stop buttons.
+    let JiangouSectionBtn = mod.widgets.ButtonFlat{
+        width: Fit
+        margin: 0
+        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
+        draw_bg +: {
+            color: #1f2430
+            color_hover: #232834
+            color_down: #232834
+            color_focus: #1f2430
+            border_size: uniform(0.0)
+            border_radius: uniform(10.0)
+        }
+        draw_text +: {
+            text_style: theme.font_regular{
+                font_size: 11.0
+            }
+            color: #7a8192
+        }
+    }
+    let JiangouSectionBtnOn = mod.widgets.ButtonFlat{
+        width: Fit
+        margin: 0
+        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
+        draw_bg +: {
+            color: #4c6ef5
+            color_hover: #5c7cfa
+            color_down: #5c7cfa
+            color_focus: #4c6ef5
+            border_size: uniform(0.0)
+            border_radius: uniform(10.0)
+        }
+        draw_text +: {
+            text_style: theme.font_bold{
+                font_size: 11.0
+            }
+            color: #ffffff
+        }
+    }
+
     let PopupTemplate = mod.widgets.View{
         width: Fill
         height: Fill
@@ -300,7 +341,7 @@ script_mod! {
                     about_popup := PopupTemplate{}
                     float_panel := mod.widgets.FloatPanel{}
                     ai_panel := mod.widgets.FloatPanel{
-                        panel_size: vec2(520.0, 700.0)
+                        panel_size: vec2(720.0, 700.0)
                         pin_bottom_right: false
                         // Multi-turn streaming chat; bubbles are the
                         // msg_00..msg_31 slots below the greeting.
@@ -511,7 +552,7 @@ script_mod! {
                                     height: Fit{min: FitBound.Abs(44.0), max: FitBound.Abs(120.0)}
                                     is_multiline: true
                                     submit_on_enter: true
-                                    empty_text: "输入消息…"
+                                    empty_text: "提出要解释的概念…"
                                 }
                                 send_btn := SendBtn{
                                     draw_icon +: {
@@ -529,7 +570,34 @@ script_mod! {
                                     icon_walk: Walk{width: 16, height: 16}
                                 }
                             }
-                                ctx_row := mod.widgets.View{
+                            tools_row := mod.widgets.View{
+                                width: Fill
+                                height: Fit
+                                flow: Right
+                                spacing: 0
+                                padding: Inset{left: 12, right: 12, bottom: 8}
+                                desc_btn := JiangouSectionBtn{ text: "标准描述" }
+                                desc_on_btn := JiangouSectionBtnOn{ visible: false, text: "标准描述" }
+                                spacer1 := mod.widgets.View{ width: Fill, height: Fit }
+                                plain_btn := JiangouSectionBtn{ text: "通俗描述" }
+                                plain_on_btn := JiangouSectionBtnOn{ visible: false, text: "通俗描述" }
+                                spacer2 := mod.widgets.View{ width: Fill, height: Fit }
+                                pos_btn := JiangouSectionBtn{ text: "正面例子" }
+                                pos_on_btn := JiangouSectionBtnOn{ visible: false, text: "正面例子" }
+                                spacer3 := mod.widgets.View{ width: Fill, height: Fit }
+                                neg_btn := JiangouSectionBtn{ text: "反面例子" }
+                                neg_on_btn := JiangouSectionBtnOn{ visible: false, text: "反面例子" }
+                                spacer4 := mod.widgets.View{ width: Fill, height: Fit }
+                                affect_btn := JiangouSectionBtn{ text: "影响什么" }
+                                affect_on_btn := JiangouSectionBtnOn{ visible: false, text: "影响什么" }
+                                spacer5 := mod.widgets.View{ width: Fill, height: Fit }
+                                affected_btn := JiangouSectionBtn{ text: "被啥影响" }
+                                affected_on_btn := JiangouSectionBtnOn{ visible: false, text: "被啥影响" }
+                                spacer6 := mod.widgets.View{ width: Fill, height: Fit }
+                                use_btn := JiangouSectionBtn{ text: "概念作用" }
+                                use_on_btn := JiangouSectionBtnOn{ visible: false, text: "概念作用" }
+                            }
+                            ctx_row := mod.widgets.View{
                                 width: Fill
                                 height: Fit
                                 flow: Right
@@ -658,6 +726,9 @@ pub struct App {
     /// The ai_panel's input_row View, resolved the same way.
     #[rust]
     input_row_ref: Option<WidgetRef>,
+    /// The ai_panel's tools_row View (渐构 toggle), resolved the same way.
+    #[rust]
+    tools_row_ref: Option<WidgetRef>,
     /// RAG backend (two worker threads), created on first draw.
     #[rust]
     rag: Option<rag::RagService>,
@@ -768,6 +839,7 @@ impl App {
                 panel.hide(cx);
             } else {
                 panel.show(cx);
+                self.sync_jiangou_btns(cx);
                 self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
                 self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
             }
@@ -818,6 +890,28 @@ impl App {
             .clicked(actions)
         {
             self.stop_chat(cx);
+        }
+        let tools = self.tools_row(cx);
+        for (id, _) in ai::JIANGOU_SECTIONS {
+            let base = LiveId::from_str(&format!("{id}_btn"));
+            let on_id = LiveId::from_str(&format!("{id}_on_btn"));
+            if self.child_by_name(&tools, base).as_button().clicked(actions)
+                || self.child_by_name(&tools, on_id).as_button().clicked(actions)
+            {
+                let on = self
+                    .ai_config
+                    .jiangou_sections
+                    .iter()
+                    .any(|s| s == id);
+                if on {
+                    self.ai_config.jiangou_sections.retain(|s| s != id);
+                } else {
+                    self.ai_config.jiangou_sections.push(id.to_string());
+                }
+                ai::save_config(&self.ai_config);
+                self.sync_jiangou_btns(cx);
+                break;
+            }
         }
         let header = self.panel_header(cx);
         if self
@@ -1009,6 +1103,12 @@ impl App {
         cached_ai_child(cx, &self.ui, &mut self.input_row_ref, live_id!(input_row))
     }
 
+    /// The ai_panel's tools_row View (cached), via live children from the
+    /// panel content.
+    fn tools_row(&mut self, cx: &Cx) -> WidgetRef {
+        cached_ai_child(cx, &self.ui, &mut self.tools_row_ref, live_id!(tools_row))
+    }
+
     /// Child of `parent` by name, via live children (graph-independent).
     fn child_by_name(&self, parent: &WidgetRef, id: LiveId) -> WidgetRef {
         child_by_name(parent, id)
@@ -1085,6 +1185,7 @@ impl App {
         }
         self.update_ctx_label(cx);
         self.sync_send_btn(cx);
+        self.sync_jiangou_btns(cx);
     }
 
     /// Send the chat input text: append to history and stream a request.
@@ -1131,11 +1232,6 @@ impl App {
         self.chat_buf.clear();
         self.chat_think.clear();
         self.chat_parser = ai::SseParser::new();
-        let mut messages: Vec<(String, String)> = self
-            .chat_history
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect();
         // RAG context: sync BM25 always (fast path); when the models are
         // ready, defer the request until the background hybrid retrieval
         // answers (or times out), so citations reflect reranked results.
@@ -1146,17 +1242,39 @@ impl App {
                 self.rag_wait = Some(RagWait {
                     query: text.to_string(),
                     rx,
-                    fallback: ctx,
+                    fallback: ctx.clone(),
                     started: Instant::now(),
                 });
                 defer = true;
-            } else if !ctx.is_empty() {
-                messages.insert(0, ("system".to_string(), ctx));
             }
         }
         if !defer {
-            self.fire_chat(cx, messages);
+            self.fire_chat(cx, self.build_messages(&ctx));
         }
+    }
+
+    /// The messages for the next request: chat history plus (when enabled)
+    /// the 渐构 format instruction and the RAG context, both as system
+    /// messages (injected per request, never stored in chat_history).
+    fn build_messages(&self, ctx: &str) -> Vec<(String, String)> {
+        let mut messages: Vec<(String, String)> = self
+            .chat_history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        if !self.ai_config.jiangou_sections.is_empty() {
+            messages.insert(
+                0,
+                (
+                    "system".to_string(),
+                    ai::jiangou_format_prompt(&self.ai_config.jiangou_sections),
+                ),
+            );
+        }
+        if !ctx.is_empty() {
+            messages.insert(0, ("system".to_string(), ctx.to_string()));
+        }
+        messages
     }
 
     /// Fire the chat request with the given (system-prefixed) messages.
@@ -1248,15 +1366,7 @@ impl App {
         } else {
             rag::service::format_context(&hits)
         };
-        let mut messages: Vec<(String, String)> = self
-            .chat_history
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect();
-        if !ctx.is_empty() {
-            messages.insert(0, ("system".to_string(), ctx));
-        }
-        self.fire_chat(cx, messages);
+        self.fire_chat(cx, self.build_messages(&ctx));
     }
 
     /// Start a fresh conversation: drop all history and extras.
@@ -1299,6 +1409,22 @@ impl App {
             .set_visible(cx, !self.chat_pending);
         self.child_by_name(&row, live_id!(stop_btn))
             .set_visible(cx, self.chat_pending);
+    }
+
+    /// 渐构 section pills: swap each gray/blue pair by its enabled state.
+    fn sync_jiangou_btns(&mut self, cx: &mut Cx) {
+        let tools = self.tools_row(cx);
+        for (id, _) in ai::JIANGOU_SECTIONS {
+            let on = self
+                .ai_config
+                .jiangou_sections
+                .iter()
+                .any(|s| s == id);
+            let base = LiveId::from_str(&format!("{id}_btn"));
+            let on_id = LiveId::from_str(&format!("{id}_on_btn"));
+            self.child_by_name(&tools, base).set_visible(cx, !on);
+            self.child_by_name(&tools, on_id).set_visible(cx, on);
+        }
     }
 }
 
