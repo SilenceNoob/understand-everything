@@ -247,15 +247,11 @@ impl Widget for FloatPanel {
             if self.resizing == 0 && !self.dragging {
                 let dir = self.resize_hit(e.abs);
                 let cursor = match (dir & (RESIZE_LEFT | RESIZE_RIGHT) != 0, dir & (RESIZE_TOP | RESIZE_BOTTOM) != 0) {
-                    (true, true) => {
-                        let ne_sw = dir & RESIZE_TOP != 0 && dir & RESIZE_RIGHT != 0
-                            || dir & RESIZE_BOTTOM != 0 && dir & RESIZE_LEFT != 0;
-                        if ne_sw {
-                            MouseCursor::NeswResize
-                        } else {
-                            MouseCursor::NwseResize
-                        }
-                    }
+                    // Diagonal resize cursors crash makepad's macOS
+                    // load_undocumented_cursor (the respondsToSelector: BOOL
+                    // shadows the SEL passed to performSelector:, forwarding
+                    // strlen(NULL) => SIGSEGV); use the native axis cursor.
+                    (true, true) => MouseCursor::EwResize,
                     (true, false) => MouseCursor::EwResize,
                     (false, true) => MouseCursor::NsResize,
                     (false, false) => MouseCursor::Default,

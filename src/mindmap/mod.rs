@@ -833,7 +833,9 @@ impl MindMap {
     /// Primary-button press on the canvas: minimap drag, card resize/drag,
     /// double-click to open the detail, or background pan.
     fn handle_finger_down(&mut self, cx: &mut Cx, fe: &FingerDownEvent, child_grabbed: bool) {
-        if self.detail_open.is_none() {
+        // Panels (file/refs/float/dock) own their presses; the canvas must
+        // not start a pan/drag under them.
+        if self.detail_open.is_none() && !crate::util::over_any_panel(fe.abs) {
             if self.minimap_rect.contains(fe.abs) {
                 self.mm_dragging = true;
                 self.navigate_minimap(cx, fe.abs);
