@@ -224,7 +224,7 @@ impl MindMap {
         let Some(burst) = self.page_burst else {
             return;
         };
-        let Some(card) = self.cards.get(burst.card) else {
+        let Some(card) = self.cards.get(burst.card).and_then(|c| c.clone()) else {
             return;
         };
         // Cards live in world coords, so the body rect (from the last pass)

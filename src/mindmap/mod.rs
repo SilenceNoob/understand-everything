@@ -415,8 +415,11 @@ pub struct MindMap {
     /// saving to; switched via MindMapRef::switch_map.
     #[rust("maps/map.json")]
     map_file: String,
+    /// Lazily-created card widgets, keyed by node index (None = not yet
+    /// created). Never `push` — entries must stay aligned with `data.nodes`
+    /// or off-screen cards shift later indices.
     #[rust]
-    cards: Vec<WidgetRef>,
+    cards: Vec<Option<WidgetRef>>,
     #[rust]
     edges: Vec<DrawEdge>,
     #[rust]
@@ -525,13 +528,15 @@ impl WidgetNode for MindMap {
 
     fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
         for (i, card) in self.cards.iter().enumerate() {
-            visit(LiveId(i as u64 + 1), card.clone());
+            if let Some(card) = card {
+                visit(LiveId(i as u64 + 1), card.clone());
+            }
         }
     }
 
     fn find_widgets_from_point(&self, cx: &Cx, point: DVec2, found: &mut dyn FnMut(&WidgetRef)) {
         let local = self.screen_to_world(point);
-        for card in &self.cards {
+        for card in self.cards.iter().flatten() {
             card.find_widgets_from_point(cx, local, found);
         }
     }
@@ -703,7 +708,7 @@ impl Widget for MindMap {
         // back-mapping could coincidentally land inside a card's (untransformed)
         // hit area and, e.g., focus a TextInput mid-edit.
         if !on_mm {
-            for card in &self.cards {
+            for card in self.cards.iter().flatten() {
                 card.handle_event(cx, card_event, scope);
             }
         }
@@ -765,11 +770,12 @@ impl MindMap {
                 .cards
                 .iter()
                 .enumerate()
-                .filter(|(_, card)| {
-                    card.button(cx, ids!(edit_btn)).clicked(actions)
-                        || card.button(cx, ids!(done_btn)).clicked(actions)
+                .filter_map(|(i, card)| {
+                    let card = card.as_ref()?;
+                    (card.button(cx, ids!(edit_btn)).clicked(actions)
+                        || card.button(cx, ids!(done_btn)).clicked(actions))
+                    .then_some(i)
                 })
-                .map(|(i, _)| i)
                 .collect();
             for i in clicked {
                 if self.editing_card == Some(i) {
@@ -796,6 +802,9 @@ impl MindMap {
                     continue;
                 }
                 let card = &self.cards[i];
+                let Some(card) = card.as_ref() else {
+                    continue;
+                };
                 for id in [ids!(edit_btn), ids!(done_btn)] {
                     let btn = card.button(cx, id);
                     if !btn.visible() {
@@ -1122,7 +1131,7 @@ impl MindMap {
     /// the last drawn (highest index) wins — same z-order as `resize_hit`.
 
     fn card_ref(&mut self, cx: &mut Cx, i: usize) -> WidgetRef {
-        if let Some(c) = self.cards.get(i) {
+        if let Some(Some(c)) = self.cards.get(i) {
             return c.clone();
         }
         let Some(t) = &self.card_template else {
@@ -1138,7 +1147,10 @@ impl MindMap {
         if let Some(dir) = node.path.parent() {
             w.markdown_media(cx, ids!(markdown)).set_base_dir(dir.to_path_buf());
         }
-        self.cards.push(w.clone());
+        if self.cards.len() <= i {
+            self.cards.resize(i + 1, None);
+        }
+        self.cards[i] = Some(w.clone());
         w
     }
 
@@ -1149,7 +1161,7 @@ impl MindMap {
         if self.editing_card == Some(i) {
             return;
         }
-        let Some(card) = self.cards.get(i).cloned() else {
+        let Some(card) = self.cards.get(i).and_then(|c| c.clone()) else {
             return;
         };
         let node = self.data.as_ref().unwrap().nodes[i].clone();
@@ -1165,7 +1177,7 @@ impl MindMap {
         let Some(i) = self.editing_card.take() else {
             return;
         };
-        let Some(card) = self.cards.get(i).cloned() else {
+        let Some(card) = self.cards.get(i).and_then(|c| c.clone()) else {
             return;
         };
         // The title input now edits the card's body file name (the header
