@@ -1,7 +1,5 @@
 use makepad_widgets::*;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +11,7 @@ const TAB_H: f64 = 48.0;
 /// Exponential ease rate (1/s); settles in ~0.2s (mirrors FilePanel).
 const SLIDE_EASE: f64 = 14.0;
 /// Default panel width and drag limits (px), same as the file panel.
-const PANEL_W_DEFAULT: f64 = 260.0;
+const PANEL_W_DEFAULT: f64 = 520.0;
 const PANEL_W_MIN: f64 = 140.0;
 const PANEL_W_MAX: f64 = 520.0;
 /// Width-grab strip on the panel's left edge: 8px inside the panel,
@@ -23,7 +21,7 @@ const EDGE_INSET: f64 = 8.0;
 /// Fixed pane header height (px) — the DSL header is exactly this tall.
 const PANE_HEADER_H: f64 = 32.0;
 /// Bottom button bar height (px).
-const BAR_H: f64 = 44.0;
+const BAR_H: f64 = 60.0;
 /// Minimum row height (px) as a fallback when a row's laid-out height reads
 /// as zero; rows are otherwise sized by their real rendered content.
 const ROW_MIN: f64 = 40.0;
@@ -31,81 +29,48 @@ const ROW_MIN: f64 = 40.0;
 const MENU_W: f64 = 220.0;
 const MENU_ITEM_H: f64 = 32.0;
 const MENU_PAD: f64 = 6.0;
-/// Excerpt length cap (chars) for file snippets and link descriptions.
+/// Excerpt length cap (chars) for file snippets.
 const EXCERPT_MAX: usize = 200;
+/// Shown (in red) as the excerpt of a document that failed to convert.
+const FAILED_TEXT: &str = "文件解析失败";
 
 /// Panel body rect in window coords, written every draw pass; the mindmap
 /// reads it to keep wheel zoom and marquee selection off the panel.
 pub(crate) static PANEL_RECT_RIGHT: Mutex<Option<Rect>> = Mutex::new(None);
 
-/// True while the URL input row is active; the mindmap skips its keyboard
-/// shortcuts so typing doesn't move the map.
-static URL_EDITING: AtomicBool = AtomicBool::new(false);
-
-pub fn is_url_editing() -> bool {
-    URL_EDITING.load(Ordering::Relaxed)
-}
-
-/// What a reference item is: a local Markdown document (absolute path) or a
-/// web link (URL).
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum RefKind {
-    File,
-    Link,
-}
-
-/// One reference item. `value` is an absolute file path or a URL; `desc` is
-/// the file excerpt or the parsed page description. `pending` marks a link
-/// whose description is still being fetched (never persisted).
+/// One reference item: an absolute path to a local Markdown document, plus
+/// its excerpt. `failed` marks a document whose conversion to Markdown
+/// failed; its excerpt shows FAILED_TEXT in red.
 #[derive(Clone, PartialEq, Debug)]
 struct RefItem {
-    kind: RefKind,
     value: String,
     desc: String,
-    pending: bool,
+    failed: bool,
 }
 
 impl RefItem {
-    /// Display title: file name for documents, the URL itself for links.
+    /// Display title: the file name.
     fn name(&self) -> String {
-        match self.kind {
-            RefKind::File => std::path::Path::new(&self.value)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.value.clone()),
-            RefKind::Link => self.value.clone(),
-        }
-    }
-
-    fn new(kind: RefKind, value: String) -> Self {
-        Self {
-            kind,
-            value,
-            desc: String::new(),
-            pending: false,
-        }
+        std::path::Path::new(&self.value)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.value.clone())
     }
 }
 
 /// Per-map reference list, persisted as refs/<map rel>.json. File excerpts
-/// are re-derived from disk on load (the file is the source); link
-/// descriptions are fetched once and persisted here.
+/// are re-derived from disk on load (the file is the source).
 #[derive(Serialize, Deserialize)]
 struct RefsFile {
     files: Vec<FileRef>,
-    links: Vec<LinkRef>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct FileRef {
     path: String,
     desc: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LinkRef {
-    url: String,
-    desc: String,
+    #[serde(default)]
+    failed: bool,
 }
 
 /// The pre-card format ("files": ["path"]); kept readable so old refs files
@@ -113,7 +78,6 @@ struct LinkRef {
 #[derive(Deserialize)]
 struct LegacyRefsFile {
     files: Vec<String>,
-    links: Vec<String>,
 }
 
 /// Refs file for a map rel path ("maps/foo.json" -> "refs/foo.json", mirroring
@@ -128,56 +92,45 @@ fn load_items(map_rel: &str) -> Vec<RefItem> {
         return Vec::new();
     };
     if let Ok(data) = serde_json::from_str::<RefsFile>(&json) {
-        let mut items: Vec<RefItem> = data
+        return data
             .files
             .into_iter()
             .map(|f| RefItem {
-                // fresh excerpt from disk beats the stored one
-                desc: file_excerpt(&f.path).unwrap_or(f.desc),
-                ..RefItem::new(RefKind::File, f.path)
+                desc: if f.failed {
+                    FAILED_TEXT.to_string()
+                } else {
+                    // fresh excerpt from disk beats the stored one
+                    file_excerpt(&f.path).unwrap_or(f.desc)
+                },
+                value: f.path,
+                failed: f.failed,
             })
             .collect();
-        items.extend(data.links.into_iter().map(|l| RefItem {
-            desc: l.desc,
-            ..RefItem::new(RefKind::Link, l.url)
-        }));
-        return items;
     }
-    // pre-card format: plain string lists
+    // pre-card format: plain string list
     if let Ok(old) = serde_json::from_str::<LegacyRefsFile>(&json) {
-        let mut items: Vec<RefItem> = old
+        return old
             .files
             .into_iter()
             .map(|p| RefItem {
                 desc: file_excerpt(&p).unwrap_or_default(),
-                ..RefItem::new(RefKind::File, p)
+                value: p,
+                failed: false,
             })
             .collect();
-        items.extend(
-            old.links
-                .into_iter()
-                .map(|u| RefItem::new(RefKind::Link, u)),
-        );
-        return items;
     }
     Vec::new()
 }
 
 fn save_items(map_rel: &str, items: &[RefItem]) {
-    let mut files = Vec::new();
-    let mut links = Vec::new();
-    for it in items {
-        match it.kind {
-            RefKind::File => files.push(FileRef {
-                path: it.value.clone(),
-                desc: String::new(),
-            }),
-            RefKind::Link => links.push(LinkRef {
-                url: it.value.clone(),
-                desc: it.desc.clone(),
-            }),
-        }
-    }
+    let files = items
+        .iter()
+        .map(|it| FileRef {
+            path: it.value.clone(),
+            desc: String::new(),
+            failed: it.failed,
+        })
+        .collect();
     let path = refs_path(map_rel);
     let Some(parent) = path.parent() else {
         return;
@@ -185,7 +138,7 @@ fn save_items(map_rel: &str, items: &[RefItem]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(json) = serde_json::to_string_pretty(&RefsFile { files, links }) {
+    if let Ok(json) = serde_json::to_string_pretty(&RefsFile { files }) {
         let _ = std::fs::write(path, json);
     }
 }
@@ -195,6 +148,30 @@ fn save_items(map_rel: &str, items: &[RefItem]) {
 fn file_excerpt(path: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     Some(excerpt(&text, EXCERPT_MAX))
+}
+
+/// Target path for a converted document in the app's `docs/` dir: same stem
+/// as the source, `.md` extension, unique-ified with a numeric suffix when
+/// the name is taken (never overwrites). `docs/` is app-private: neither the
+/// card pane (scans `cards/`) nor the map list (scans `maps/`) ever reads it.
+fn converted_path(source: &std::path::Path) -> std::path::PathBuf {
+    let dir = app_base_dir().join("docs");
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "doc".to_string());
+    for n in 0.. {
+        let name = if n == 0 {
+            format!("{stem}.md")
+        } else {
+            format!("{stem}-{n}.md")
+        };
+        let p = dir.join(&name);
+        if !p.exists() {
+            return p;
+        }
+    }
+    unreachable!()
 }
 
 /// First meaningful snippet of `text`: drop markdown line markers, collapse
@@ -215,110 +192,6 @@ fn excerpt(text: &str, max: usize) -> String {
         Some(i) if i > max / 2 => format!("{}…", &cut[..i]),
         _ => format!("{cut}…"),
     }
-}
-
-/// Decode the few HTML entities that actually show up in descriptions.
-fn decode_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-}
-
-/// Remove `<...>` tags (attribute values containing '>' are rare enough to
-/// ignore here).
-fn strip_tags(s: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The value of a `name="value"` attribute (either quote style).
-fn attr_value(tag: &str, name: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let needle = format!("{name}={quote}");
-        if let Some(pos) = tag.find(&needle) {
-            let rest = &tag[pos + needle.len()..];
-            let end = rest.find(quote)?;
-            return Some(rest[..end].to_string());
-        }
-    }
-    None
-}
-
-/// The first <p> paragraph's text, if any.
-fn first_paragraph(html: &str) -> Option<String> {
-    let start = html.find("<p")?;
-    let rest = &html[start..];
-    let end = rest.find("</p>")?;
-    Some(strip_tags(&rest[..end]))
-}
-
-/// Parse a page description out of HTML: og:description or meta description,
-/// falling back to the first paragraph. None when nothing usable is found.
-fn extract_meta_description(html: &str) -> Option<String> {
-    for (i, _) in html.match_indices("<meta").take(200) {
-        let tail = &html[i..];
-        let end = tail.find('>').map(|e| i + e).unwrap_or(html.len().min(i + 512));
-        let tag = &html[i..end];
-        let lower = tag.to_lowercase();
-        let is_desc = lower.contains("og:description")
-            || lower.contains("name=\"description\"")
-            || lower.contains("name='description'");
-        if !is_desc {
-            continue;
-        }
-        if let Some(content) = attr_value(tag, "content") {
-            let text = excerpt(&decode_entities(&strip_tags(&content)), EXCERPT_MAX);
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    first_paragraph(html).map(|t| excerpt(&decode_entities(&t), EXCERPT_MAX))
-}
-
-/// Resolve a redirect `Location` header against the previous URL: absolute
-/// URLs pass through, "//host/path" keeps the scheme, everything else is
-/// resolved against the base's host. None for empty/unresolvable targets.
-fn resolve_url(base: &str, location: &str) -> Option<String> {
-    let loc = location.trim();
-    if loc.is_empty() {
-        return None;
-    }
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return Some(loc.to_string());
-    }
-    let (proto, rest) = base.split_once("://")?;
-    let host = rest.split('/').next().unwrap_or(rest);
-    if let Some(l) = loc.strip_prefix("//") {
-        return Some(format!("{proto}://{l}"));
-    }
-    let path = loc.trim_start_matches('/');
-    Some(format!("{proto}://{host}/{path}"))
-}
-
-/// Normalize a URL for storage: trim, and prepend https:// when no scheme is
-/// given. Returns None for empty input.
-fn normalize_url(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if !s.contains("://") {
-        return Some(format!("https://{s}"));
-    }
-    Some(s.to_string())
 }
 
 /// The row index under `abs` in a list rect, using the real per-row heights
@@ -354,7 +227,7 @@ fn scroll_rows(heights: &[f64], list: Rect, dy: f64, scroll: &mut f64) -> bool {
 }
 
 /// Lazily clone a row from the template, set its title/description and load
-/// its type icon (link for URLs, doc for files).
+/// its doc icon.
 fn row_ref(
     cx: &mut Cx,
     template: &ScriptObjectRef,
@@ -368,17 +241,12 @@ fn row_ref(
     let value = template.as_object().into();
     let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
     w.label(cx, ids!(row_name)).set_text(cx, &item.name());
-    let desc = if item.pending {
-        "获取中…".to_string()
-    } else {
-        item.desc.clone()
-    };
-    w.label(cx, ids!(row_desc)).set_text(cx, &desc);
-    let icon = match item.kind {
-        RefKind::File => "card.svg",
-        RefKind::Link => "link.svg",
-    };
-    let icon_path = app_base_dir().join("resources").join(icon);
+    let desc = w.label(cx, ids!(row_desc));
+    desc.set_text(cx, &item.desc);
+    if item.failed {
+        desc.set_text_color(cx, Vec4f::from_u32(0xfca5a5ff));
+    }
+    let icon_path = app_base_dir().join("resources").join("card.svg");
     if let Ok(bytes) = std::fs::read(&icon_path) {
         let _ = w
             .image(cx, ids!(row_icon))
@@ -433,18 +301,7 @@ script_mod! {
                 draw_text.color: #7a8192
             }
         }
-        row_edit_box := mod.widgets.View{
-            width: Fill
-            height: Fill
-            flow: Down
-            visible: false
-            row_edit := mod.widgets.TextInput{
-                width: Fill
-                height: Fit
-                empty_text: ""
-            }
         }
-    }
 
     mod.widgets.RefsPanelBase = #(RefsPanel::register_widget(vm))
 
@@ -488,23 +345,17 @@ script_mod! {
                 draw_text.color: #e6e9f0
             }
         }
-        // Bottom bar: add a document or a link.
+        // Bottom bar: add a document.
         bottom_bar := mod.widgets.View{
             width: Fill
-            height: (44.0)
+            height: (60.0)
             flow: Right
             spacing: 8
-            padding: Inset{left: 8, right: 8, top: 8, bottom: 8}
+            padding: Inset{left: 8, right: 8, top: 10, bottom: 10}
             add_doc_btn := mod.widgets.ButtonFlat{
                 width: Fill
                 height: Fill
                 text: "添加文档"
-                draw_text.text_style.font_size: 12.0
-            }
-            add_link_btn := mod.widgets.ButtonFlat{
-                width: Fill
-                height: Fill
-                text: "添加链接"
                 draw_text.text_style.font_size: 12.0
             }
         }
@@ -644,25 +495,9 @@ pub struct RefsPanel {
     menu_rect: Rect,
     #[rust]
     menu_hover: Option<usize>,
-    /// Window-wide area that captures all presses while the menu is open or
-    /// the URL input row is active.
+    /// Window-wide area that captures all presses while the menu is open.
     #[rust]
     modal_area: Area,
-
-    /// While Some, row 0 shows the URL input (a placeholder was inserted).
-    #[rust]
-    url_edit: bool,
-    /// The items before the URL placeholder was inserted (for cancel).
-    #[rust]
-    edit_snapshot: Vec<RefItem>,
-    #[rust]
-    edit_focus_pending: bool,
-    /// In-flight link fetches: request id → (item index, redirect hops so
-    /// far). Responses arrive via RefsPanelRef::apply_link_fetch, forwarded
-    /// by App; 3xx redirects are followed manually (makepad's HTTP client
-    /// does not).
-    #[rust]
-    pending_links: HashMap<LiveId, (usize, u8)>,
 }
 
 impl ScriptHook for RefsPanel {
@@ -735,7 +570,6 @@ impl Widget for RefsPanel {
         if self.current_map.is_none() {
             self.current_map = Some(crate::mindmap::MindMapData::DEFAULT_MAP.to_string());
             self.items = load_items(crate::mindmap::MindMapData::DEFAULT_MAP);
-            self.refetch_empty_links(cx.cx);
         }
 
         cx.begin_turtle(self.walk, self.layout);
@@ -823,19 +657,9 @@ impl Widget for RefsPanel {
                 cx.pop_clip_rect();
             }
         }
-        // Focus the URL input once its row has been drawn.
-        if self.edit_focus_pending {
-            if let Some(w) = self.row_refs.get(0) {
-                let input = w.text_input(cx, ids!(row_edit));
-                if input.area().is_valid(cx) {
-                    cx.set_key_focus(input.area());
-                    self.edit_focus_pending = false;
-                }
-            }
-        }
-        // While the menu is open or the URL input row is active, a
-        // window-wide modal area captures every press.
-        if self.menu_open || self.url_edit {
+        // While the menu is open, a window-wide modal area captures every
+        // press.
+        if self.menu_open {
             cx.add_aligned_rect_area(
                 &mut self.modal_area,
                 Rect {
@@ -858,50 +682,19 @@ impl Widget for RefsPanel {
         if let Some(tab) = self.tab_widget(cx) {
             tab.handle_event(cx, event, scope);
         }
-        // The URL input must see events itself to process keystrokes (IME);
-        // row widgets are not forwarded otherwise.
-        if self.url_edit {
-            if let Some(w) = self.row_refs.get(0).cloned() {
-                w.handle_event(cx, event, scope);
-            }
-        }
-        // Modal state (context menu / URL input) grabs every press first, so
-        // the list/tab/edge below can't fire behind it.
-        if self.menu_open || self.url_edit {
+        // Modal state (context menu) grabs every press first, so the
+        // list/tab/edge below can't fire behind it.
+        if self.menu_open {
             match event.hits_with_capture_overload(cx, self.modal_area, true) {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                    if self.menu_open {
-                        if self.menu_rect.contains(fe.abs) {
-                            self.on_menu_press(cx, fe.abs);
-                        } else {
-                            self.menu_open = false;
-                            self.redraw(cx);
-                        }
-                    } else if self.url_edit {
-                        let row_h = self.row_heights.first().copied().unwrap_or(ROW_MIN);
-                        let row_rect = Rect {
-                            pos: self.list_rect.pos - dvec2(0.0, self.scroll),
-                            size: dvec2(self.list_rect.size.x, row_h),
-                        };
-                        if row_rect.contains(fe.abs) {
-                            self.edit_focus_pending = true;
-                            self.redraw(cx);
-                        } else {
-                            self.cancel_url_edit(cx);
-                        }
+                    if self.menu_rect.contains(fe.abs) {
+                        self.on_menu_press(cx, fe.abs);
+                    } else {
+                        self.menu_open = false;
+                        self.redraw(cx);
                     }
                 }
                 _ => {}
-            }
-        }
-        // URL edit: Enter confirms, Esc cancels.
-        if self.url_edit {
-            if let Event::KeyDown(ke) = event {
-                match ke.key_code {
-                    KeyCode::ReturnKey => self.confirm_url_edit(cx),
-                    KeyCode::Escape => self.cancel_url_edit(cx),
-                    _ => {}
-                }
             }
         }
         // Button actions fire from the bottom bar's own event handling.
@@ -910,21 +703,18 @@ impl Widget for RefsPanel {
             if bar.button(cx, ids!(add_doc_btn)).clicked(actions) {
                 self.pick_doc(cx);
             }
-            if bar.button(cx, ids!(add_link_btn)).clicked(actions) {
-                self.start_url_edit(cx);
-            }
         }
         // capture_overload: widgets above us (float panels) may mark the
         // press handled first; plain hits would then skip our areas.
         match event.hits_with_capture_overload(cx, self.tab_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.url_edit => {
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 self.toggle(cx);
             }
             _ => {}
         }
         // Left-edge drag to resize the panel width.
         match event.hits_with_capture_overload(cx, self.edge_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.url_edit => {
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 self.panel_w_dragging = true;
                 cx.set_cursor(MouseCursor::ColResize);
                 self.apply_width(cx, fe.abs.x);
@@ -953,16 +743,14 @@ impl Widget for RefsPanel {
             }
         }
         match event.hits_with_capture_overload(cx, self.list_area, true) {
-            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.url_edit && !self.menu_open => {
+            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.menu_open => {
                 if let Some(i) = row_index_at(&self.row_heights, self.list_rect, fe.abs, self.scroll)
                 {
                     self.menu_row = Some(i);
                 }
             }
             Hit::FingerScroll(fe) => {
-                if !self.url_edit
-                    && scroll_rows(&self.row_heights, self.list_rect, fe.scroll.y, &mut self.scroll)
-                {
+                if scroll_rows(&self.row_heights, self.list_rect, fe.scroll.y, &mut self.scroll) {
                     self.redraw(cx);
                 }
             }
@@ -972,7 +760,7 @@ impl Widget for RefsPanel {
         match event.hits_with_capture_overload(cx, self.panel_area, true) {
             Hit::FingerDown(fe)
                 if matches!(fe.device, DigitDevice::Mouse { button } if button.is_secondary())
-                    && !self.url_edit && !self.menu_open =>
+                    && !self.menu_open =>
             {
                 self.open_menu(cx, fe.abs);
             }
@@ -980,6 +768,46 @@ impl Widget for RefsPanel {
         }
         // Claim the press over the panel body so it never reaches the canvas.
         let _ = event.hits_with_capture_overload(cx, self.panel_area, true);
+    }
+}
+
+/// Stage `src` into the app's `docs/` dir and return the path a ref item
+/// should record, plus whether parsing failed. Markdown files are copied
+/// as-is; other formats are converted with anydoc (failure keeps the source
+/// path so the row still shows which file was rejected). Sources already
+/// inside `docs/` are referenced in place.
+fn stage_document(src: &std::path::Path) -> (String, bool) {
+    if src.starts_with(app_base_dir().join("docs")) {
+        return (src.to_string_lossy().into_owned(), false);
+    }
+    let is_md = src.extension().is_some_and(|e| {
+        e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")
+    });
+    let out = converted_path(src);
+    if is_md {
+        return match std::fs::copy(src, &out) {
+            Ok(_) => (out.to_string_lossy().into_owned(), false),
+            Err(e) => {
+                eprintln!("failed to copy {} to {}: {}", src.display(), out.display(), e);
+                (src.to_string_lossy().into_owned(), false)
+            }
+        };
+    }
+    match anydoc::to_markdown(src) {
+        Ok(md) => {
+            let ok = std::fs::create_dir_all(out.parent().unwrap()).is_ok()
+                && std::fs::write(&out, md).is_ok();
+            if ok {
+                (out.to_string_lossy().into_owned(), false)
+            } else {
+                eprintln!("failed to write converted markdown {}", out.display());
+                (src.to_string_lossy().into_owned(), true)
+            }
+        }
+        Err(e) => {
+            eprintln!("anydoc conversion failed for {}: {}", src.display(), e);
+            (src.to_string_lossy().into_owned(), true)
+        }
     }
 }
 
@@ -1023,18 +851,7 @@ impl RefsPanel {
         self.row_heights.clear();
         let mut y = -self.scroll;
         for (i, item) in self.items.iter().enumerate() {
-            let fresh = self.row_refs.get(i).is_none();
             let w = row_ref(cx, template, i, item, &mut self.row_refs);
-            if self.url_edit && i == 0 {
-                w.view(cx, ids!(row_text_box)).set_visible(cx, false);
-                w.view(cx, ids!(row_edit_box)).set_visible(cx, true);
-                if fresh {
-                    w.text_input(cx, ids!(row_edit)).set_text(cx, "");
-                }
-            } else {
-                w.view(cx, ids!(row_text_box)).set_visible(cx, true);
-                w.view(cx, ids!(row_edit_box)).set_visible(cx, false);
-            }
             let _ = w.draw_walk(
                 cx,
                 scope,
@@ -1078,9 +895,6 @@ impl RefsPanel {
     fn toggle(&mut self, cx: &mut Cx) {
         self.opened = !self.opened;
         self.menu_open = false;
-        if self.url_edit {
-            self.cancel_url_edit(cx);
-        }
         if let Some(tab) = self.tab_widget(cx) {
             tab.set_text(cx, if self.opened { "▶" } else { "◀" });
         }
@@ -1102,141 +916,45 @@ impl RefsPanel {
     }
 
     /// Native file dialog for the 添加文档 button; appends the picked file
-    /// (absolute path) to the current map's list.
+    /// to the current map's list. Markdown files are copied into the app's
+    /// `docs/` dir, other formats are converted to Markdown via anydoc; a
+    /// document that failed to parse is still listed, with FAILED_TEXT in
+    /// red as its excerpt.
     fn pick_doc(&mut self, cx: &mut Cx) {
         let path = rfd::FileDialog::new()
             .set_directory(app_base_dir())
             .add_filter("Markdown", &["md", "markdown"])
+            .add_filter(
+                "文档",
+                &[
+                    "doc", "docx", "docm", "ppt", "pptx", "xls", "xlsx", "odt", "odp", "ods",
+                    "rtf", "epub", "pdf", "csv",
+                ],
+            )
             .add_filter("所有文件", &["*"])
             .pick_file();
         let Some(path) = path else {
             return;
         };
-        let path_str = path.to_string_lossy().into_owned();
-        let mut item = RefItem::new(RefKind::File, path_str);
-        item.desc = file_excerpt(&item.value).unwrap_or_default();
+        let (value, failed) = stage_document(&path);
+        let mut item = RefItem {
+            value,
+            desc: String::new(),
+            failed,
+        };
+        item.desc = if failed {
+            FAILED_TEXT.to_string()
+        } else {
+            file_excerpt(&item.value).unwrap_or_default()
+        };
         self.items.push(item);
         self.row_refs.clear();
         self.save();
         self.redraw(cx);
     }
 
-    /// Insert the URL input placeholder row at the top of the list.
-    fn start_url_edit(&mut self, cx: &mut Cx) {
-        if self.url_edit {
-            return;
-        }
-        self.edit_snapshot = self.items.clone();
-        self.items.insert(0, RefItem::new(RefKind::Link, String::new()));
-        self.url_edit = true;
-        self.edit_focus_pending = true;
-        self.row_refs.clear();
-        // The placeholder sits at the top; make sure it is on screen.
-        self.scroll = 0.0;
-        URL_EDITING.store(true, Ordering::Relaxed);
-        self.redraw(cx);
-    }
-
-    /// Cancel the URL edit, restoring the pre-edit list.
-    fn cancel_url_edit(&mut self, cx: &mut Cx) {
-        if !self.url_edit {
-            return;
-        }
-        self.url_edit = false;
-        URL_EDITING.store(false, Ordering::Relaxed);
-        self.drop_edit_focus(cx);
-        self.items = std::mem::take(&mut self.edit_snapshot);
-        self.row_refs.clear();
-        self.redraw(cx);
-    }
-
-    /// Read the URL input; on success append the link and stop editing.
-    fn confirm_url_edit(&mut self, cx: &mut Cx) {
-        if !self.url_edit {
-            return;
-        }
-        let Some(w) = self.row_refs.get(0).cloned() else {
-            return;
-        };
-        let raw = w.text_input(cx, ids!(row_edit)).text();
-        let Some(url) = normalize_url(&raw) else {
-            // keep editing on empty input (mirrors FilePanel::confirm_edit)
-            return;
-        };
-        self.items[0] = RefItem {
-            desc: String::new(),
-            pending: true,
-            ..RefItem::new(RefKind::Link, url)
-        };
-        self.url_edit = false;
-        URL_EDITING.store(false, Ordering::Relaxed);
-        self.drop_edit_focus(cx);
-        self.row_refs.clear();
-        self.save();
-        self.fetch_link_desc(cx, 0);
-        self.redraw(cx);
-    }
-
-    /// Start fetching the description of the link at index `i` (async; the
-    /// response arrives via App::handle_http_response → apply_link_fetch).
-    fn fetch_link_desc(&mut self, cx: &mut Cx, i: usize) {
-        let Some(item) = self.items.get(i) else {
-            return;
-        };
-        if item.kind != RefKind::Link || item.value.is_empty() {
-            return;
-        }
-        let request_id = LiveId::unique();
-        self.pending_links.insert(request_id, (i, 0));
-        let mut http = HttpRequest::new(item.value.clone(), HttpMethod::GET);
-        http.set_header(
-            "User-Agent".to_string(),
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)".to_string(),
-        );
-        http.set_header("Accept".to_string(), "text/html,application/xhtml+xml".to_string());
-        cx.http_request(request_id, http);
-    }
-
-    /// Kick off fetches for every link whose description is empty (fresh
-    /// loads, legacy-format items, earlier failed attempts). No-op while
-    /// other fetches are still in flight. This also heals refs files written
-    /// by older versions: the next save rewrites them in the current format.
-    fn refetch_empty_links(&mut self, cx: &mut Cx) {
-        if !self.pending_links.is_empty() {
-            return;
-        }
-        let idxs: Vec<usize> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.kind == RefKind::Link && it.desc.is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        if idxs.is_empty() {
-            return;
-        }
-        for i in &idxs {
-            self.items[*i].pending = true;
-            self.fetch_link_desc(cx, *i);
-        }
-        self.row_refs.clear();
-        self.redraw(cx);
-    }
-
-    fn drop_edit_focus(&self, cx: &mut Cx) {
-        if let Some(w) = self.row_refs.get(0) {
-            let input = w.text_input(cx, ids!(row_edit));
-            if input.area() == cx.key_focus() {
-                cx.set_key_focus(Area::Empty);
-            }
-        }
-    }
-
     /// Open the context menu at `abs`, clamped inside the panel.
     fn open_menu(&mut self, cx: &mut Cx, abs: DVec2) {
-        if self.url_edit {
-            return;
-        }
         self.menu_row = row_index_at(&self.row_heights, self.list_rect, abs, self.scroll);
         let panel = self.panel_rect;
         let h = MENU_PAD * 2.0 + MENU_ITEM_H;
@@ -1300,103 +1018,9 @@ impl RefsPanelRef {
             if w.current_map.as_deref() != map_file {
                 w.current_map = map_file.map(|s| s.to_string());
                 w.items = map_file.map(load_items).unwrap_or_default();
-                // stale requests from the previous map are dropped
-                w.pending_links.clear();
                 w.row_refs.clear();
-                w.refetch_empty_links(cx);
                 w.redraw(cx);
             }
-        }
-    }
-
-    /// Apply a fetched link page (forwarded by App::handle_http_response).
-    /// 3xx redirects are followed (up to 5 hops), 2xx bodies are parsed;
-    /// anything else leaves the description empty.
-    pub fn apply_link_fetch(&self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
-        let Some(mut w) = self.borrow_mut() else {
-            return;
-        };
-        let Some(&(i, hops)) = w.pending_links.get(&request_id) else {
-            return;
-        };
-        let abort = |w: &mut RefsPanel, cx: &mut Cx, rid: LiveId| {
-            w.pending_links.remove(&rid);
-            for item in &mut w.items {
-                item.pending = false;
-            }
-            w.row_refs.clear();
-            w.redraw(cx);
-        };
-        if (300..400).contains(&response.status_code) {
-            let location = response
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                .and_then(|(_, v)| v.first())
-                .map(|s| s.to_string());
-            let Some(location) = location else {
-                abort(&mut w, cx, request_id);
-                return;
-            };
-            if hops >= 5 {
-                abort(&mut w, cx, request_id);
-                return;
-            }
-            let Some(item) = w.items.get(i).cloned() else {
-                return;
-            };
-            let Some(url) = resolve_url(&item.value, &location) else {
-                abort(&mut w, cx, request_id);
-                return;
-            };
-            let new_id = LiveId::unique();
-            w.pending_links.remove(&request_id);
-            w.pending_links.insert(new_id, (i, hops + 1));
-            let mut http = HttpRequest::new(url, HttpMethod::GET);
-            http.set_header(
-                "User-Agent".to_string(),
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)"
-                    .to_string(),
-            );
-            http.set_header(
-                "Accept".to_string(),
-                "text/html,application/xhtml+xml".to_string(),
-            );
-            cx.http_request(new_id, http);
-            return;
-        }
-        w.pending_links.remove(&request_id);
-        if let Some(item) = w.items.get_mut(i) {
-            item.pending = false;
-            if (200..300).contains(&response.status_code) {
-                if let Some(body) = response.body() {
-                    // lossy: pages with stray non-UTF-8 bytes (or GBK) must
-                    // not drop the whole description
-                    let html = String::from_utf8_lossy(body);
-                    if let Some(desc) = extract_meta_description(&html) {
-                        item.desc = desc;
-                    }
-                }
-            }
-        }
-        w.row_refs.clear();
-        w.save();
-        w.redraw(cx);
-    }
-
-    /// The link fetch failed (forwarded by App::handle_http_request_error);
-    /// the row just drops the "获取中…" placeholder.
-    pub fn link_fetch_error(&self, cx: &mut Cx, request_id: LiveId) {
-        if let Some(mut w) = self.borrow_mut() {
-            if !w.pending_links.contains_key(&request_id) {
-                return;
-            }
-            w.pending_links.remove(&request_id);
-            for item in &mut w.items {
-                item.pending = false;
-            }
-            w.row_refs.clear();
-            w.redraw(cx);
         }
     }
 }
@@ -1418,38 +1042,30 @@ mod tests {
     }
 
     #[test]
-    fn normalize_url_adds_scheme() {
-        assert_eq!(normalize_url("example.com"), Some("https://example.com".into()));
-        assert_eq!(
-            normalize_url("http://example.com/a"),
-            Some("http://example.com/a".into())
-        );
-        assert_eq!(normalize_url("  "), None);
-    }
-
-    #[test]
-    fn resolve_redirect_location() {
-        // absolute
-        assert_eq!(
-            resolve_url("https://a.com/x", "http://b.com/y"),
-            Some("http://b.com/y".into())
-        );
-        // scheme-relative
-        assert_eq!(
-            resolve_url("https://a.com/x", "//b.com/y"),
-            Some("https://b.com/y".into())
-        );
-        // path-relative
-        assert_eq!(
-            resolve_url("https://a.com/dir/page", "/wiki"),
-            Some("https://a.com/wiki".into())
-        );
-        assert_eq!(
-            resolve_url("https://a.com/x", "wiki"),
-            Some("https://a.com/wiki".into())
-        );
-        // unusable
-        assert_eq!(resolve_url("https://a.com/x", ""), None);
+    fn converted_path_unique_ifies_collisions() {
+        let dir = app_base_dir().join("docs");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..3 {
+            let name = if n == 0 {
+                "report.md".to_string()
+            } else {
+                format!("report-{n}.md")
+            };
+            std::fs::remove_file(dir.join(name)).ok();
+        }
+        let source = std::path::Path::new("/somewhere/report.docx");
+        let first = converted_path(source);
+        assert_eq!(first, dir.join("report.md"));
+        std::fs::write(&first, "x").unwrap();
+        let second = converted_path(source);
+        assert_eq!(second, dir.join("report-1.md"));
+        std::fs::write(&second, "x").unwrap();
+        let third = converted_path(source);
+        assert_eq!(third, dir.join("report-2.md"));
+        std::fs::write(&third, "x").unwrap();
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        std::fs::remove_file(&third).ok();
     }
 
     #[test]
@@ -1467,65 +1083,88 @@ mod tests {
     }
 
     #[test]
-    fn extracts_og_description() {
-        let html = r#"<html><head><meta property="og:description" content="  An og &amp; nice description  "><meta name="description" content="fallback"></head></html>"#;
-        assert_eq!(
-            extract_meta_description(html).as_deref(),
-            Some("An og & nice description")
-        );
-    }
-
-    #[test]
-    fn meta_attr_order_does_not_matter() {
-        let html = r#"<meta content="c-desc" name="description">"#;
-        assert_eq!(extract_meta_description(html).as_deref(), Some("c-desc"));
-    }
-
-    #[test]
-    fn falls_back_to_first_paragraph() {
-        let html = r#"<html><body><p>Hello <b>world</b>, this is the first paragraph.</p><p>second</p></body></html>"#;
-        assert_eq!(
-            extract_meta_description(html).as_deref(),
-            Some("Hello world, this is the first paragraph.")
-        );
-    }
-
-    #[test]
     fn legacy_refs_json_still_parses() {
-        let old = r#"{"files":["/a/b.md"],"links":["https://x.com"]}"#;
+        let old = r#"{"files":["/a/b.md"]}"#;
         let data: LegacyRefsFile = serde_json::from_str(old).unwrap();
         assert_eq!(data.files, vec!["/a/b.md"]);
-        assert_eq!(data.links, vec!["https://x.com"]);
     }
 
     #[test]
-    fn refs_json_roundtrip_keeps_link_desc() {
-        let items = vec![
-            RefItem {
-                desc: "excerpt".into(),
-                ..RefItem::new(RefKind::File, "/a/b.md".to_string())
-            },
-            RefItem {
-                desc: "page desc".into(),
-                ..RefItem::new(RefKind::Link, "https://x.com".to_string())
-            },
-        ];
+    fn refs_json_roundtrip() {
+        let items = vec![RefItem {
+            desc: "excerpt".into(),
+            value: "/a/b.md".to_string(),
+            failed: true,
+        }];
         let json = serde_json::to_string(&RefsFile {
             files: items
                 .iter()
-                .filter(|i| i.kind == RefKind::File)
-                .map(|i| FileRef { path: i.value.clone(), desc: String::new() })
-                .collect(),
-            links: items
-                .iter()
-                .filter(|i| i.kind == RefKind::Link)
-                .map(|i| LinkRef { url: i.value.clone(), desc: i.desc.clone() })
+                .map(|i| FileRef {
+                    path: i.value.clone(),
+                    desc: String::new(),
+                    failed: i.failed,
+                })
                 .collect(),
         })
         .unwrap();
         let data: RefsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(data.files[0].path, "/a/b.md");
-        assert_eq!(data.links[0].url, "https://x.com");
-        assert_eq!(data.links[0].desc, "page desc");
+        assert!(data.files[0].failed);
+    }
+
+    #[test]
+    fn files_without_failed_key_default_to_false() {
+        let old = r#"{"files":[{"path":"/a/b.md","desc":""}]}"#;
+        let data: RefsFile = serde_json::from_str(old).unwrap();
+        assert!(!data.files[0].failed);
+    }
+
+    #[test]
+    fn stage_document_copies_markdown_into_docs() {
+        let stem = format!("ue-md-{}", std::process::id());
+        let src = std::env::temp_dir().join(format!("{stem}.md"));
+        std::fs::write(&src, "# 标题\n内容").unwrap();
+        let out = app_base_dir().join("docs").join(format!("{stem}.md"));
+        std::fs::remove_file(&out).ok();
+        let (value, failed) = stage_document(&src);
+        assert_eq!(value, out.to_string_lossy());
+        assert!(!failed);
+        assert!(out.exists());
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn stage_document_converts_csv_into_docs() {
+        let stem = format!("ue-csv-{}", std::process::id());
+        let src = std::env::temp_dir().join(format!("{stem}.csv"));
+        std::fs::write(&src, "name,age\nAlice,30\n").unwrap();
+        let out = app_base_dir().join("docs").join(format!("{stem}.md"));
+        std::fs::remove_file(&out).ok();
+        let (value, failed) = stage_document(&src);
+        assert_eq!(value, out.to_string_lossy());
+        assert!(!failed);
+        let md = std::fs::read_to_string(&out).unwrap();
+        assert!(md.contains("Alice"));
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn stage_document_flags_unparseable_source() {
+        let stem = format!("ue-bad-{}", std::process::id());
+        let src = std::env::temp_dir().join(format!("{stem}.docx"));
+        std::fs::write(&src, "definitely not a docx").unwrap();
+        let (value, failed) = stage_document(&src);
+        assert_eq!(value, src.to_string_lossy());
+        assert!(failed);
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn files_with_links_key_still_parse() {
+        let old = r#"{"files":[{"path":"/a/b.md","desc":""}],"links":[{"url":"https://x.com","desc":"d"}]}"#;
+        let data: RefsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(data.files.len(), 1);
     }
 }

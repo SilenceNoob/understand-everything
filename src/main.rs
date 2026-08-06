@@ -902,9 +902,6 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_http_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
-        self.ui
-            .refs_panel(cx, ids!(refs_panel))
-            .apply_link_fetch(cx, request_id, response);
         if request_id != self.test_id || !self.testing {
             return;
         }
@@ -927,9 +924,6 @@ impl MatchEvent for App {
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
-        self.ui
-            .refs_panel(cx, ids!(refs_panel))
-            .link_fetch_error(cx, request_id);
         if request_id == self.test_id && self.testing {
             self.testing = false;
             self.ui

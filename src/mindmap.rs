@@ -940,7 +940,6 @@ impl Widget for MindMap {
             && self.detail_open.is_none()
             && !crate::file_panel::is_name_editing()
             && !crate::float_panel::is_chat_input_active()
-            && !crate::refs_panel::is_url_editing()
         {
             match event {
                 Event::KeyDown(ke) => {
