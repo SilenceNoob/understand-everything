@@ -313,7 +313,7 @@ script_mod! {
                     }
                     float_panel := mod.widgets.FloatPanel{}
                     ai_panel := mod.widgets.FloatPanel{
-                        panel_size: vec2(720.0, 700.0)
+                        panel_size: vec2(512.0, 800.0)
                         pin_bottom_right: false
                         // Multi-turn streaming chat; bubbles are the
                         // msg_00..msg_31 slots below the greeting.

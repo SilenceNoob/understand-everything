@@ -310,6 +310,24 @@ script_mod! {
                 draw_text.color: #cbd5e1
             }
         }
+
+        mark := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            padding: Inset{left: 4, right: 4}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #eab3082e
+                border_radius: 3.0
+                border_size: 0.0
+            }
+            label := mod.widgets.Label{
+                padding: 0
+                draw_text.color: #fde68a
+            }
+        }
     }
 }
 
@@ -346,6 +364,9 @@ pub struct MarkdownMedia {
     /// Pending `#d/#t/#e/#n` pill: kind plus accumulated text.
     #[rust]
     pill: Option<(PillKind, String)>,
+    /// Pending `==...==` mark: accumulated text while an open `==` is active.
+    #[rust]
+    mark: Option<String>,
     /// Incremented whenever `body` changes, so the parse cache below can be
     /// reused across frames without comparing strings.
     #[rust]
@@ -415,9 +436,12 @@ impl MarkdownMedia {
         // children each pass — but the pulldown parse is skipped).
         let events: Vec<MdEvent<'static>> = match self.cached_events.take() {
             Some((version, events)) if version == self.body_version => events,
-            _ => Parser::new_ext(
+            _ =>             Parser::new_ext(
                 self.body.as_ref(),
-                Options::ENABLE_TABLES | Options::ENABLE_MATH,
+                Options::ENABLE_TABLES
+                    | Options::ENABLE_MATH
+                    | Options::ENABLE_STRIKETHROUGH
+                    | Options::ENABLE_SMART_PUNCTUATION,
             )
             .into_iter()
             .map(|e| e.into_static())
@@ -444,7 +468,7 @@ impl MarkdownMedia {
                     tf.bold.push();
                 }
                 MdEvent::End(TagEnd::Heading(_level)) => {
-                    flush_pill(tf, cx, &mut self.pill);
+                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                     tf.bold.pop();
                     tf.font_sizes.pop();
                     tf.new_line_collapsed(cx);
@@ -456,7 +480,7 @@ impl MarkdownMedia {
                     is_first_block = false;
                 }
                 MdEvent::End(TagEnd::Paragraph) => {
-                    flush_pill(tf, cx, &mut self.pill);
+                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                 }
                 MdEvent::Start(Tag::BlockQuote(_)) => {
                     if !is_first_block {
@@ -513,10 +537,10 @@ impl MarkdownMedia {
                     tf.bold.pop();
                 }
                 MdEvent::Start(Tag::Strikethrough) => {
-                    tf.underline.push();
+                    tf.strikethrough.push();
                 }
                 MdEvent::End(TagEnd::Strikethrough) => {
-                    tf.underline.pop();
+                    tf.strikethrough.pop();
                 }
                 MdEvent::Start(Tag::Link { .. }) => {
                     let entry_id = tf.new_counted_id();
@@ -680,20 +704,36 @@ impl MarkdownMedia {
                         self.code_block_string.push_str(text);
                     } else {
                         let text = text.trim_end_matches("\n");
-                        for (kind, seg) in scan_pills(text) {
-                            match kind {
-                                Some(kind) => {
-                                    flush_pill(tf, cx, &mut self.pill);
-                                    self.pill = Some((kind, seg.to_string()));
+                        let mut in_mark = self.mark.is_some();
+                        for (is_mark, seg) in scan_marks(text, in_mark) {
+                            if is_mark {
+                                if let Some(m) = &mut self.mark {
+                                    m.push_str(seg);
+                                } else {
+                                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
+                                    self.mark = Some(seg.to_string());
                                 }
-                                None => {
-                                    if let Some((_, pill_text)) = &mut self.pill {
-                                        pill_text.push_str(seg);
-                                    } else {
-                                        tf.draw_text(cx, seg);
+                            } else {
+                                if self.mark.is_some() {
+                                    flush_mark(tf, cx, &mut self.mark);
+                                }
+                                for (kind, seg) in scan_pills(seg) {
+                                    match kind {
+                                        Some(kind) => {
+                                            flush_pending(tf, cx, &mut self.pill, &mut self.mark);
+                                            self.pill = Some((kind, seg.to_string()));
+                                        }
+                                        None => {
+                                            if let Some((_, pill_text)) = &mut self.pill {
+                                                pill_text.push_str(seg);
+                                            } else {
+                                                tf.draw_text(cx, seg);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            in_mark = is_mark;
                         }
                     }
                 }
@@ -703,7 +743,7 @@ impl MarkdownMedia {
                     } else if self.in_code_block {
                         self.code_block_string.push('\n');
                     } else {
-                        flush_pill(tf, cx, &mut self.pill);
+                        flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                         tf.new_line_collapsed(cx);
                     }
                 }
@@ -762,7 +802,7 @@ impl MarkdownMedia {
                     if tf.in_table_header {
                         tf.bold.pop();
                     }
-                    flush_pill(tf, cx, &mut self.pill);
+                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                     tf.end_table_cell(cx);
                     table_cell_index += 1;
                 }
@@ -861,6 +901,18 @@ fn scan_pills(text: &str) -> Vec<(Option<PillKind>, &str)> {
     out
 }
 
+/// Splits a text run into alternating non-mark/mark segments on `==`,
+/// honoring a pending mark state from a previous run (`in_mark`).
+fn scan_marks<'a>(text: &'a str, in_mark: bool) -> Vec<(bool, &'a str)> {
+    let mut out = Vec::new();
+    let mut flag = in_mark;
+    for seg in text.split("==") {
+        out.push((flag, seg));
+        flag = !flag;
+    }
+    out
+}
+
 /// Draws a pill widget for `text` into the text flow.
 fn draw_pill(tf: &mut TextFlow, cx: &mut Cx2d, kind: PillKind, text: &str) {
     if text.is_empty() {
@@ -884,6 +936,59 @@ fn flush_pill(tf: &mut TextFlow, cx: &mut Cx2d, pill: &mut Option<(PillKind, Str
     if let Some((kind, text)) = pill.take() {
         draw_pill(tf, cx, kind, &text);
     }
+}
+
+/// Draws a `==...==` highlight widget for `text` into the text flow.
+fn draw_mark(tf: &mut TextFlow, cx: &mut Cx2d, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let entry_id = tf.new_counted_id();
+    tf.item_with(cx, entry_id, live_id!(mark), |cx, item, tf| {
+        // Mirror TextFlow's own run-style selection so the mark label uses
+        // the exact font, size, line spacing and metrics of the surrounding
+        // text, whatever the context (chat, thinking, card, heading scale).
+        let mut style = if tf.fixed.value() > 0 {
+            tf.text_style_fixed.clone()
+        } else if tf.bold.value() > 0 {
+            if tf.italic.value() > 0 {
+                tf.text_style_bold_italic.clone()
+            } else {
+                tf.text_style_bold.clone()
+            }
+        } else if tf.italic.value() > 0 {
+            tf.text_style_italic.clone()
+        } else {
+            tf.text_style_normal.clone()
+        };
+        style.font_size = *tf.font_sizes.last().unwrap_or(&tf.font_size);
+        let label = item.widget(cx, ids!(label));
+        if let Some(mut inner) = label.borrow_mut::<Label>() {
+            inner.draw_text.text_style = style;
+        } else if let Some(mut inner) = label.cast_inner_mut::<Label>() {
+            inner.draw_text.text_style = style;
+        }
+        label.set_text(cx, text.trim());
+        item.draw_all_unscoped(cx);
+    });
+}
+
+/// Flushes a pending mark (if any) into the text flow.
+fn flush_mark(tf: &mut TextFlow, cx: &mut Cx2d, mark: &mut Option<String>) {
+    if let Some(text) = mark.take() {
+        draw_mark(tf, cx, &text);
+    }
+}
+
+/// Flushes any pending pill and mark into the text flow.
+fn flush_pending(
+    tf: &mut TextFlow,
+    cx: &mut Cx2d,
+    pill: &mut Option<(PillKind, String)>,
+    mark: &mut Option<String>,
+) {
+    flush_pill(tf, cx, pill);
+    flush_mark(tf, cx, mark);
 }
 
 impl MarkdownMediaRef {
@@ -972,10 +1077,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_marks_alternates() {
+        assert_eq!(
+            scan_marks("前 ==中== 后", false),
+            vec![(false, "前 "), (true, "中"), (false, " 后")]
+        );
+    }
+
+    #[test]
+    fn scan_marks_continues_pending_state() {
+        // A run arriving while a mark is open keeps alternating from there.
+        assert_eq!(
+            scan_marks("中== 后", true),
+            vec![(true, "中"), (false, " 后")]
+        );
+        assert_eq!(
+            scan_marks("后", false),
+            vec![(false, "后")]
+        );
+    }
+
+    #[test]
+    fn scan_marks_no_tokens() {
+        assert_eq!(scan_marks("普通文本", false), vec![(false, "普通文本")]);
+        assert_eq!(scan_marks("", false), vec![(false, "")]);
+    }
+
+    #[test]
     fn parse_cache_roundtrip_preserves_events() {
         // The cached owned event stream must match a fresh parse exactly.
         let src = "#d 描述 **加粗** `x` [链接](https://x)\n\n- 列表\n- 二\n\n| a | b |\n|---|---|\n| 1 | 2 |";
-        let options = Options::ENABLE_TABLES | Options::ENABLE_MATH;
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_MATH
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_SMART_PUNCTUATION;
         let owned: Vec<MdEvent<'static>> =
             Parser::new_ext(src, options).into_iter().map(|e| e.into_static()).collect();
         let reparsed: Vec<MdEvent<'static>> =
