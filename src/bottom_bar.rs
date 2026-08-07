@@ -136,9 +136,16 @@ pub struct BottomBar {
     #[rust]
     col_rects: [Rect; 4],
     /// Column index + press position of an in-progress click (tap = press
-    /// and release within 6px on the same slot).
+    /// and release within 6px on the same slot). Kept across MouseUps:
+    /// macOS may deliver a burst of events per click (and the dock may
+    /// still be sliding), so the first release that matches wins instead of
+    /// the first release consuming the press and losing the tap.
     #[rust]
     pressed_col: Option<(usize, DVec2)>,
+    /// True once the current press has delivered its tap, so the event
+    /// burst can't re-fire it.
+    #[rust]
+    tap_sent: bool,
     /// A completed tap, consumed by the app via take_clicked().
     #[rust]
     pending_click: Option<usize>,
@@ -192,12 +199,17 @@ impl Widget for BottomBar {
             if fd.button.is_primary() && self.slide.opened {
                 if let Some(i) = self.hit_col(fd.abs) {
                     self.pressed_col = Some((i, fd.abs));
+                    self.tap_sent = false;
                 }
             }
         }
         if let Event::MouseUp(fu) = event {
-            if let Some((i, down)) = self.pressed_col.take() {
-                if (fu.abs - down).length() < 6.0 && self.hit_col(fu.abs) == Some(i) {
+            if let Some((i, down)) = self.pressed_col {
+                if !self.tap_sent
+                    && (fu.abs - down).length() < 6.0
+                    && self.hit_col(fu.abs) == Some(i)
+                {
+                    self.tap_sent = true;
                     self.pending_click = Some(i);
                 }
             }

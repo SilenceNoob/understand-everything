@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::ai::{AIConfig, SseParser};
 use crate::bottom_bar::BottomBarWidgetRefExt;
+use crate::popup_panel::PopupPanelWidgetRefExt;
 use crate::util::cached_widget;
 
 app_main!(App);
@@ -18,6 +19,7 @@ mod file_panel;
 mod float_panel;
 mod markdown_media;
 mod mindmap;
+mod popup_panel;
 mod rag;
 mod refs_panel;
 mod slide_panel;
@@ -98,12 +100,15 @@ script_mod! {
         }
     }
 
-    let PopupTemplate = mod.widgets.View{
+    // Popup content shared by the Setting/About PopupPanel instances; the
+    // panel widget draws it window-sized only while opened (the old
+    // visible:false View never drew, so its area stayed empty and
+    // set_visible couldn't repaint it).
+    let PopupPanelContent = mod.widgets.View{
         width: Fill
         height: Fill
         flow: Overlay
         align: Align{x: 0.5, y: 0.5}
-        visible: false
         draw_bg +: {
             pixel: fn(){
                 #000000cc
@@ -300,8 +305,12 @@ script_mod! {
                 body +: {
                     flow: Flow.Overlay
                     mindmap := mod.widgets.MindMap{}
-                    setting_popup := PopupTemplate{}
-                    about_popup := PopupTemplate{}
+                    setting_popup := mod.widgets.PopupPanel{
+                        content := PopupPanelContent{}
+                    }
+                    about_popup := mod.widgets.PopupPanel{
+                        content := PopupPanelContent{}
+                    }
                     float_panel := mod.widgets.FloatPanel{}
                     ai_panel := mod.widgets.FloatPanel{
                         panel_size: vec2(720.0, 700.0)
@@ -762,23 +771,38 @@ fn fmt_tokens(n: usize) -> String {
 }
 
 impl App {
+    /// The popup widget (setting/about), walked through live children from
+    /// the root — the widget-tree graph does not index widgets inside
+    /// custom-widget content (BottomBar, FloatPanel, PopupPanel…), while
+    /// live navigation always reflects the real tree.
+    fn popup_widget(&self, id: LiveId) -> WidgetRef {
+        let main_window = child_by_name(&self.ui, live_id!(main_window));
+        let body = child_by_name(&main_window, live_id!(body));
+        child_by_name(&body, id)
+    }
+
+    /// Descendant of a popup by live-child path (content → panel → …).
+    fn popup_child(&self, popup_id: LiveId, path: &[LiveId]) -> WidgetRef {
+        let mut cur = self.popup_widget(popup_id);
+        for &seg in path {
+            cur = child_by_name(&cur, seg);
+            if cur.is_empty() {
+                break;
+            }
+        }
+        cur
+    }
+
     /// Setting/About popup close buttons.
     fn handle_popup_closes(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self
-            .ui
-            .view(cx, ids!(setting_popup))
-            .button(cx, ids!(close))
-            .clicked(actions)
-        {
-            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-        }
-        if self
-            .ui
-            .view(cx, ids!(about_popup))
-            .button(cx, ids!(close))
-            .clicked(actions)
-        {
-            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+        for id in [live_id!(setting_popup), live_id!(about_popup)] {
+            if self
+                .popup_child(id, &[live_id!(content), live_id!(panel), live_id!(close)])
+                .as_button()
+                .clicked(actions)
+            {
+                self.popup_widget(id).as_popup_panel().hide(cx);
+            }
         }
     }
 
@@ -789,8 +813,8 @@ impl App {
             return;
         };
         match col {
-            0 => self.toggle_popup(cx, ids!(setting_popup)),
-            1 => self.toggle_popup(cx, ids!(about_popup)),
+            0 => self.toggle_popup(cx, live_id!(setting_popup)),
+            1 => self.toggle_popup(cx, live_id!(about_popup)),
             2 => self.toggle_debug_panel(cx),
             3 => self.toggle_ai_panel(cx),
             _ => {}
@@ -798,35 +822,91 @@ impl App {
     }
 
     /// Toggle a Setting/About popup, filling its body when shown.
-    fn toggle_popup(&mut self, cx: &mut Cx, id: &[LiveId]) {
-        let p = self.ui.view(cx, id);
-        let show = !p.visible();
-        p.set_visible(cx, show);
+    fn toggle_popup(&mut self, cx: &mut Cx, id: LiveId) {
+        let p = self.popup_widget(id).as_popup_panel();
+        let show = !p.opened();
         if show {
-            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
-            if id[0] == live_id!(setting_popup) {
-                p.label(cx, ids!(title)).set_text(cx, "Setting");
-                p.view(cx, ids!(body_box)).set_visible(cx, false);
-                p.view(cx, ids!(settings_form)).set_visible(cx, true);
-                p.text_input(cx, ids!(key_input))
-                    .set_text(cx, &self.ai_config.api_key);
-                p.text_input(cx, ids!(url_input))
-                    .set_text(cx, &self.ai_config.base_url);
-                p.text_input(cx, ids!(model_input))
-                    .set_text(cx, &self.ai_config.model);
+            self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
+            p.show(cx);
+            if id == live_id!(setting_popup) {
+                let child = |path: &[LiveId]| self.popup_child(live_id!(setting_popup), path);
+                child(&[live_id!(content), live_id!(panel), live_id!(title)])
+                    .set_text(cx, "Setting");
+                child(&[live_id!(content), live_id!(panel), live_id!(body_box)])
+                    .set_visible(cx, false);
+                child(&[live_id!(content), live_id!(panel), live_id!(settings_form)])
+                    .set_visible(cx, true);
+                child(&[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(key_row),
+                    live_id!(key_input),
+                ])
+                .set_text(cx, &self.ai_config.api_key);
+                child(&[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(url_row),
+                    live_id!(url_input),
+                ])
+                .set_text(cx, &self.ai_config.base_url);
+                child(&[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(model_row),
+                    live_id!(model_input),
+                ])
+                .set_text(cx, &self.ai_config.model);
                 let thinking_idx = ai::THINKING_LEVELS
                     .iter()
                     .position(|l| *l == self.ai_config.thinking)
                     .unwrap_or(3);
-                p.drop_down(cx, ids!(thinking_input))
-                    .set_selected_item(cx, thinking_idx);
-                p.label(cx, ids!(status)).set_text(cx, "");
+                child(&[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(thinking_row),
+                    live_id!(thinking_input),
+                ])
+                .as_drop_down()
+                .set_selected_item(cx, thinking_idx);
+                child(&[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(status),
+                ])
+                .set_text(cx, "");
             } else {
-                p.label(cx, ids!(title)).set_text(cx, "About");
-                p.view(cx, ids!(settings_form)).set_visible(cx, false);
-                p.view(cx, ids!(body_box)).set_visible(cx, true);
-                p.label(cx, ids!(body_box.body)).set_text(
+                self.popup_child(
+                    live_id!(about_popup),
+                    &[live_id!(content), live_id!(panel), live_id!(title)],
+                )
+                .set_text(cx, "About");
+                self.popup_child(
+                    live_id!(about_popup),
+                    &[live_id!(content), live_id!(panel), live_id!(settings_form)],
+                )
+                .set_visible(cx, false);
+                self.popup_child(
+                    live_id!(about_popup),
+                    &[live_id!(content), live_id!(panel), live_id!(body_box)],
+                )
+                .set_visible(cx, true);
+                self.popup_child(
+                    live_id!(about_popup),
+                    &[
+                        live_id!(content),
+                        live_id!(panel),
+                        live_id!(body_box),
+                        live_id!(body),
+                    ],
+                )
+                .set_text(
                     cx,
                     &format!(
                         "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
@@ -834,6 +914,8 @@ impl App {
                     ),
                 );
             }
+        } else {
+            p.hide(cx);
         }
     }
 
@@ -844,8 +926,8 @@ impl App {
             panel.hide(cx);
         } else {
             panel.show(cx);
-            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+            self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
         }
     }
 
@@ -856,30 +938,61 @@ impl App {
         } else {
             panel.show(cx);
             self.sync_jiangou_btns(cx);
-            self.ui.view(cx, ids!(setting_popup)).set_visible(cx, false);
-            self.ui.view(cx, ids!(about_popup)).set_visible(cx, false);
+            self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
         }
     }
 
     /// Settings form: save and connection test.
     fn handle_settings_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.ui.button(cx, ids!(save_btn)).clicked(actions) {
+        let status = self.popup_child(
+            live_id!(setting_popup),
+            &[
+                live_id!(content),
+                live_id!(panel),
+                live_id!(settings_form),
+                live_id!(status),
+            ],
+        );
+        if self
+            .popup_child(
+                live_id!(setting_popup),
+                &[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(btn_row),
+                    live_id!(save_btn),
+                ],
+            )
+            .as_button()
+            .clicked(actions)
+        {
             self.ai_config = self.form_config(cx);
             ai::save_config(&self.ai_config);
             self.update_ctx_label(cx);
-            self.ui
-                .label(cx, ids!(setting_popup.status))
-                .set_text(cx, "已保存");
+            status.set_text(cx, "已保存");
         }
-        if self.ui.button(cx, ids!(test_btn)).clicked(actions) {
+        if self
+            .popup_child(
+                live_id!(setting_popup),
+                &[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(btn_row),
+                    live_id!(test_btn),
+                ],
+            )
+            .as_button()
+            .clicked(actions)
+        {
             if !self.testing {
                 self.testing = true;
                 self.test_id = LiveId::unique();
                 let cfg = self.form_config(cx);
                 ai::test_request(cx, self.test_id, &cfg);
-                self.ui
-                    .label(cx, ids!(setting_popup.status))
-                    .set_text(cx, "测试中…");
+                status.set_text(cx, "测试中…");
             }
         }
     }
@@ -1027,19 +1140,51 @@ impl App {
 
     /// Current config as typed in the settings form (empty base_url/model
     /// fall back to the DeepSeek defaults).
-    fn form_config(&self, cx: &Cx) -> AIConfig {
-        let p = self.ui.view(cx, ids!(setting_popup));
+    fn form_config(&self, _cx: &Cx) -> AIConfig {
+        let child = |path: &[LiveId]| self.popup_child(live_id!(setting_popup), path);
         let mut cfg = self.ai_config.clone();
-        cfg.api_key = p.text_input(cx, ids!(key_input)).text();
-        let base_url = p.text_input(cx, ids!(url_input)).text();
-        let model = p.text_input(cx, ids!(model_input)).text();
+        cfg.api_key = child(&[
+            live_id!(content),
+            live_id!(panel),
+            live_id!(settings_form),
+            live_id!(key_row),
+            live_id!(key_input),
+        ])
+        .as_text_input()
+        .text();
+        let base_url = child(&[
+            live_id!(content),
+            live_id!(panel),
+            live_id!(settings_form),
+            live_id!(url_row),
+            live_id!(url_input),
+        ])
+        .as_text_input()
+        .text();
+        let model = child(&[
+            live_id!(content),
+            live_id!(panel),
+            live_id!(settings_form),
+            live_id!(model_row),
+            live_id!(model_input),
+        ])
+        .as_text_input()
+        .text();
         if !base_url.trim().is_empty() {
             cfg.base_url = base_url.trim().to_string();
         }
         if !model.trim().is_empty() {
             cfg.model = model.trim().to_string();
         }
-        cfg.thinking = p.drop_down(cx, ids!(thinking_input)).selected_label();
+        cfg.thinking = child(&[
+            live_id!(content),
+            live_id!(panel),
+            live_id!(settings_form),
+            live_id!(thinking_row),
+            live_id!(thinking_input),
+        ])
+        .as_drop_down()
+        .selected_label();
         cfg
     }
 
@@ -1461,17 +1606,31 @@ impl MatchEvent for App {
                 format!("连接失败 ({})：{}", status, detail)
             }
         };
-        self.ui
-            .label(cx, ids!(setting_popup.status))
-            .set_text(cx, &msg);
+        self.popup_child(
+            live_id!(setting_popup),
+            &[
+                live_id!(content),
+                live_id!(panel),
+                live_id!(settings_form),
+                live_id!(status),
+            ],
+        )
+        .set_text(cx, &msg);
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
         if request_id == self.test_id && self.testing {
             self.testing = false;
-            self.ui
-                .label(cx, ids!(setting_popup.status))
-                .set_text(cx, &format!("连接失败：{}", err.message));
+            self.popup_child(
+                live_id!(setting_popup),
+                &[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(status),
+                ],
+            )
+            .set_text(cx, &format!("连接失败：{}", err.message));
             return;
         }
         if request_id == self.chat_id && self.chat_pending {
@@ -1529,6 +1688,7 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         crate::markdown_media::script_mod(vm);
         crate::mindmap::script_mod(vm);
+        crate::popup_panel::script_mod(vm);
         crate::bottom_bar::script_mod(vm);
         crate::float_panel::script_mod(vm);
         crate::file_panel::script_mod(vm);
@@ -1576,5 +1736,18 @@ impl AppMain for App {
         // event propagates, so poll it afterwards — a click would otherwise
         // wait for the next event (never comes with a still mouse).
         self.handle_dock_clicks(cx);
+        // The dock area covers the whole window on top of the popups, so
+        // root dispatch can't reach the popup's buttons/inputs; hand mouse
+        // events to the open popup directly (it forwards to its content,
+        // which hit-tests geometrically).
+        if let Event::MouseDown(_) | Event::MouseUp(_) = event {
+            for id in [live_id!(setting_popup), live_id!(about_popup)] {
+                let p = self.popup_widget(id).as_popup_panel();
+                if p.opened() {
+                    p.handle_event(cx, event, &mut Scope::empty());
+                    break;
+                }
+            }
+        }
     }
 }
