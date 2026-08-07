@@ -367,7 +367,7 @@ script_mod! {
                                     UserLine := mod.widgets.View{
                                         width: Fill
                                         height: Fit
-                                        flow: Right
+                                        flow: Down
                                         bubble := mod.widgets.RoundedView{
                                             width: Fill
                                             height: Fit
@@ -408,10 +408,48 @@ script_mod! {
                                                 }
                                             }
                                         }
+                                        copy_btn := mod.widgets.ButtonFlat{
+                                            width: Fit
+                                            text: ""
+                                            icon_walk: Walk{width: 13, height: 13}
+                                            padding: Inset{left: 6, right: 6, top: 2, bottom: 2}
+                                            margin: Inset{left: 20, top: 4, bottom: 6}
+                                            draw_bg +: {
+                                                color: #0000
+                                                color_hover: #ffffff0a
+                                                color_down: #ffffff0a
+                                                color_focus: #0000
+                                                border_size: uniform(0.0)
+                                            }
+                                            draw_icon +: {
+                                                svg: crate_resource("self:resources/copy.svg")
+                                                color: #8a91a0
+                                            }
+                                        }
+                                        copy_on_btn := mod.widgets.ButtonFlat{
+                                            width: Fit
+                                            visible: false
+                                            text: ""
+                                            icon_walk: Walk{width: 13, height: 13}
+                                            padding: Inset{left: 6, right: 6, top: 2, bottom: 2}
+                                            margin: Inset{left: 20, top: 4, bottom: 6}
+                                            draw_bg +: {
+                                                color: #0000
+                                                color_hover: #ffffff0a
+                                                color_down: #ffffff0a
+                                                color_focus: #0000
+                                                border_size: uniform(0.0)
+                                            }
+                                            draw_icon +: {
+                                                svg: crate_resource("self:resources/check.svg")
+                                                color: #4ade80
+                                            }
+                                        }
                                     }
                                     AssistantLine := mod.widgets.View{
                                         width: Fill
                                         height: Fit
+                                        flow: Down
                                         bubble := mod.widgets.RoundedView{
                                             width: Fill
                                             height: Fit
@@ -507,6 +545,43 @@ script_mod! {
                                                 text_style_fixed: theme.font_code{
                                                     font_size: 13.0
                                                 }
+                                            }
+                                        }
+                                        copy_btn := mod.widgets.ButtonFlat{
+                                            width: Fit
+                                            text: ""
+                                            icon_walk: Walk{width: 13, height: 13}
+                                            padding: Inset{left: 6, right: 6, top: 2, bottom: 2}
+                                            margin: Inset{left: 8, top: 4, bottom: 6}
+                                            draw_bg +: {
+                                                color: #0000
+                                                color_hover: #ffffff0a
+                                                color_down: #ffffff0a
+                                                color_focus: #0000
+                                                border_size: uniform(0.0)
+                                            }
+                                            draw_icon +: {
+                                                svg: crate_resource("self:resources/copy.svg")
+                                                color: #8a91a0
+                                            }
+                                        }
+                                        copy_on_btn := mod.widgets.ButtonFlat{
+                                            width: Fit
+                                            visible: false
+                                            text: ""
+                                            icon_walk: Walk{width: 13, height: 13}
+                                            padding: Inset{left: 6, right: 6, top: 2, bottom: 2}
+                                            margin: Inset{left: 8, top: 4, bottom: 6}
+                                            draw_bg +: {
+                                                color: #0000
+                                                color_hover: #ffffff0a
+                                                color_down: #ffffff0a
+                                                color_focus: #0000
+                                                border_size: uniform(0.0)
+                                            }
+                                            draw_icon +: {
+                                                svg: crate_resource("self:resources/check.svg")
+                                                color: #4ade80
                                             }
                                         }
                                     }
@@ -1662,7 +1737,12 @@ impl MatchEvent for App {
             return;
         }
         self.chat_pending = false;
-        let content = if data.status_code == 200 {
+        // macOS 的 makepad 流式后端在连接正常结束时把 status_code 硬编码为
+        // 0（从不记录真实 HTTP 状态），所以成功流要按 "status 0 + [DONE]"
+        // 判定；Linux/Windows 传真实 200，不受影响。
+        let ok = data.status_code == 200
+            || (data.status_code == 0 && self.chat_parser.raw().contains("[DONE]"));
+        let content = if ok {
             self.chat_buf.clone()
         } else {
             // Non-200 stream: the body was raw JSON (not SSE), recovered from
@@ -1672,7 +1752,7 @@ impl MatchEvent for App {
                 .unwrap_or_else(|| raw.chars().take(200).collect());
             format!("请求失败 ({}): {}", data.status_code, detail)
         };
-        if data.status_code == 200 {
+        if ok {
             let buf = std::mem::take(&mut self.chat_buf);
             let think = std::mem::take(&mut self.chat_think);
             self.push_chat_msg_thinking(cx, &buf, &think);

@@ -28,13 +28,13 @@ fn default_thinking() -> String {
 /// ai_panel shows one pill button per section; enabled ids are persisted in
 /// settings.json and the prompt is built from them.
 pub const JIANGOU_SECTIONS: [(&str, &str); 7] = [
-    ("desc", "标准描述"),
-    ("plain", "通俗描述"),
-    ("pos", "正面例子"),
-    ("neg", "反面例子"),
-    ("affect", "影响什么"),
-    ("affected", "被啥影响"),
-    ("use", "概念作用"),
+    ("desc", "#d 标准描述"),
+    ("plain", "#t 通俗描述"),
+    ("pos", "#e 正面例子"),
+    ("neg", "#e 反面例子"),
+    ("affect", "#n 影响什么"),
+    ("affected", "#n 被啥影响"),
+    ("use", "#n 概念作用"),
 ];
 
 /// Instruction for one enabled section: (id, section body).

@@ -1,6 +1,13 @@
 use makepad_widgets::*;
 
+use std::time::Instant;
+
 use crate::markdown_media::MarkdownMediaWidgetRefExt;
+
+/// Action data for the per-bubble copy button; distinct from the thinking
+/// fold button's plain `usize` so the two clicks never collide.
+#[derive(Debug, Clone, PartialEq)]
+struct CopyMsg(usize);
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -35,6 +42,9 @@ pub struct ChatList {
     /// Scroll to the newest message on the next draw pass.
     #[rust]
     scroll_end: bool,
+    /// Row index and time of the last copy click, for the "已复制" flash.
+    #[rust]
+    copied_flash: Option<(usize, Instant)>,
 }
 
 impl ScriptHook for ChatList {}
@@ -60,6 +70,13 @@ impl Widget for ChatList {
                     if item.is_empty() {
                         continue;
                     }
+                    // Copy button (both line templates): swap the gray copy
+                    // icon for a green check for two seconds after the click.
+                    let flashing = matches!(self.copied_flash, Some((i, t)) if i == idx && t.elapsed().as_secs_f32() < 2.0);
+                    item.button(cx, ids!(copy_btn)).set_visible(cx, !flashing);
+                    item.button(cx, ids!(copy_on_btn)).set_visible(cx, flashing);
+                    item.button(cx, ids!(copy_btn)).set_action_data(CopyMsg(idx));
+                    item.button(cx, ids!(copy_on_btn)).set_action_data(CopyMsg(idx));
                     if msg.role == "user" {
                         item.markdown_media(cx, ids!(line_md)).set_text(cx, &msg.content);
                     } else {
@@ -118,7 +135,13 @@ impl Widget for ChatList {
                     continue;
                 }
                 if let Some(data) = wa.data.as_ref() {
-                    if let Some(idx) = data.downcast_ref::<usize>().copied() {
+                    if let Some(CopyMsg(idx)) = data.downcast_ref::<CopyMsg>() {
+                        if let Some(msg) = self.msgs.get(*idx) {
+                            cx.copy_to_clipboard(&msg.content);
+                            self.copied_flash = Some((*idx, Instant::now()));
+                            self.redraw(cx);
+                        }
+                    } else if let Some(idx) = data.downcast_ref::<usize>().copied() {
                         if let Some(msg) = self.msgs.get_mut(idx) {
                             msg.thinking_open = !msg.thinking_open;
                             self.redraw(cx);
