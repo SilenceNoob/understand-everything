@@ -191,8 +191,9 @@ impl MindMap {
         self.pan_target = self.pan;
     }
 
-    /// Select the card under the view center; with `add` (Shift+Space) the
-    /// card is added to the selection instead of replacing it.
+    /// Select the card under the view center, or the group whose frame
+    /// contains it (card first); with `add` (Shift+Space) the hit is added
+    /// to the selection instead of replacing it.
     pub(super) fn select_view_center(&mut self, cx: &mut Cx, add: bool) {
         // view_rect is the world-space viewport rect, so its center is the
         // hit point directly (no screen->world conversion).
@@ -209,7 +210,25 @@ impl MindMap {
                 }
             }
             None => {
-                if !add {
+                if let Some(gi) = self.hit_group_frame(world) {
+                    let cards = {
+                        let g = &self.data.as_ref().unwrap().groups[gi];
+                        g.cards.clone()
+                    };
+                    if add {
+                        for c in cards {
+                            if !self.selected.contains(&c) {
+                                self.selected.push(c);
+                            }
+                        }
+                        if !self.selected_groups.contains(&gi) {
+                            self.selected_groups.push(gi);
+                        }
+                    } else {
+                        self.selected = cards;
+                        self.selected_groups = vec![gi];
+                    }
+                } else if !add {
                     self.selected.clear();
                     self.selected_groups.clear();
                 }

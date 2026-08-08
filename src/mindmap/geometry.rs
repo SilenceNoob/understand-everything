@@ -53,27 +53,45 @@ impl MindMap {
         }
     }
 
-    /// Topmost group whose color button contains `world`.
-    pub(super) fn hit_color_button(&self, world: DVec2) -> Option<usize> {
+    /// Among all groups whose `rect_of` contains `world`, the innermost one
+    /// (deepest in the containment forest). Index order is NOT a depth order
+    /// — Ctrl+G appends new wrapper groups AFTER their children — so
+    /// containment is compared directly via group_reaches. n is small;
+    /// the O(n²) worst case is fine.
+    fn innermost_hit(&self, world: DVec2, rect_of: impl Fn(&Self, usize) -> Rect) -> Option<usize> {
         let data = self.data.as_ref()?;
-        for gi in (0..data.groups.len()).rev() {
-            if self.color_button_rect(gi).contains(world) {
-                return Some(gi);
+        let mut best: Option<usize> = None;
+        for gi in 0..data.groups.len() {
+            if !rect_of(self, gi).contains(world) {
+                continue;
+            }
+            if let Some(b) = best {
+                // whichever nests deeper wins; sibling frames (both contain
+                // the point, neither reaches the other) keep the first hit
+                if data.group_reaches(b, gi) {
+                    best = Some(gi);
+                }
+            } else {
+                best = Some(gi);
             }
         }
-        None
+        best
     }
 
-    /// Topmost group whose title bar contains `world` (children draw on top
-    /// of their parents, so iterate from the end).
+    /// Topmost group whose color button contains `world`.
+    pub(super) fn hit_color_button(&self, world: DVec2) -> Option<usize> {
+        self.innermost_hit(world, |s, gi| s.color_button_rect(gi))
+    }
+
+    /// Innermost group whose title bar contains `world`.
     pub(super) fn hit_group_title(&self, world: DVec2) -> Option<usize> {
-        let data = self.data.as_ref()?;
-        for gi in (0..data.groups.len()).rev() {
-            if self.group_title_rect(gi).contains(world) {
-                return Some(gi);
-            }
-        }
-        None
+        self.innermost_hit(world, |s, gi| s.group_title_rect(gi))
+    }
+
+    /// Innermost group whose frame contains `world`. Any gap inside the
+    /// frame counts, not just the title bar.
+    pub(super) fn hit_group_frame(&self, world: DVec2) -> Option<usize> {
+        self.innermost_hit(world, |s, gi| s.group_rect(gi))
     }
 
     /// Screen coords → world coords (inverse of the pan/zoom transform).

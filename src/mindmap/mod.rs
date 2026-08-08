@@ -845,7 +845,8 @@ impl MindMap {
     }
 
     /// Primary-button press on the canvas: minimap drag, card resize/drag,
-    /// group title drag, or background marquee (box select).
+    /// group title drag (or frame-gap select+drag), or background marquee
+    /// (box select).
     fn handle_finger_down(&mut self, cx: &mut Cx, fe: &FingerDownEvent, child_grabbed: bool) {
         // Any canvas press commits an open group rename (a click inside the
         // rename TextInput is captured and skipped).
@@ -920,6 +921,23 @@ impl MindMap {
                         if fe.tap_count >= 2 {
                             self.enter_group_edit(cx, gi);
                         } else if !child_grabbed {
+                            self.drag_group = Some(gi);
+                            self.drag_last = world;
+                        }
+                    }
+                    self.redraw(cx);
+                } else if let Some(gi) = self.hit_group_frame(world) {
+                    // Any gap inside the group frame selects the group and
+                    // drags it (same as the title bar, minus rename).
+                    if self.editing_card.is_none() {
+                        let cards = {
+                            let g = &self.data.as_ref().unwrap().groups[gi];
+                            g.cards.clone()
+                        };
+                        self.selected = cards;
+                        self.selected_groups = vec![gi];
+                        self.reanchor_cards(cx);
+                        if !child_grabbed {
                             self.drag_group = Some(gi);
                             self.drag_last = world;
                         }
@@ -1475,8 +1493,9 @@ impl MindMap {
         if doomed.is_empty() {
             return;
         }
-        // Higher indices first: parents are created before children, so a
-        // dissolved child's members splice up into a still-present parent.
+        // Children first (lower indices): dissolving a parent before its
+        // children would splice members into a doomed group; children splice
+        // up into the still-present parent.
         doomed.sort_unstable_by(|a, b| b.cmp(a));
         for &gi in &doomed {
             let (cards, grps) = { let g = &data.groups[gi]; (g.cards.clone(), g.groups.clone()) };

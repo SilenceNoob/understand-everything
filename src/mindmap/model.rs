@@ -303,8 +303,9 @@ impl MindMapData {
             .filter_map(|(i, n)| n.parent.map(|p| (p, i)))
     }
 
-    /// Index of the group that directly contains `gi`, if any. Creation order
-    /// guarantees a parent always has a lower index than its children.
+    /// Index of the group that directly contains `gi`, if any. NOTE: index
+    /// order is not a depth order — Ctrl+G appends new wrapper groups after
+    /// their children, so parents usually have HIGHER indices.
     pub fn group_parent(&self, gi: usize) -> Option<usize> {
         self.groups.iter().position(|g| g.groups.contains(&gi))
     }
