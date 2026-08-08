@@ -123,7 +123,7 @@ script_mod! {
         }
     }
 
-    // Right-button marquee: faint fill + soft edge glow, same feathered-alpha
+    // Marquee: faint fill + soft edge glow, same feathered-alpha
     // technique as the card glow. NOTE: box radius 0 degenerates the SDF to
     // dist=0 across the whole interior, which would paint glow/stroke over
     // everything; radius 2 keeps the interior distance negative (2px corners
@@ -323,55 +323,6 @@ script_mod! {
         }
     }
 
-    let DetailTemplate = mod.widgets.View{
-        width: Fill
-        height: Fill
-        flow: Overlay
-        draw_bg +: {
-            pixel: fn(){
-                #000000cc
-            }
-        }
-        panel := mod.widgets.RoundedView{
-            width: Fill
-            height: Fill
-            margin: 80
-            flow: Down
-            padding: 20
-            spacing: 12
-            show_bg: true
-            draw_bg +: {
-                color: #1f2430
-                border_radius: 8.0
-                border_size: 1.0
-                border_color: #ffffff14
-            }
-            header := mod.widgets.View{
-                height: Fit
-                flow: Right
-                align: Align{y: 0.5}
-                title := mod.widgets.Label{
-                    width: Fill
-                    text: ""
-                    draw_text.text_style.font_size: 20.0
-                    draw_text.color: #e6e9f0
-                }
-                close := mod.widgets.ButtonFlat{
-                    text: "关闭"
-                }
-            }
-            body := mod.widgets.ScrollYView{
-                width: Fill
-                height: Fill
-                markdown := mod.widgets.MarkdownMedia{
-                    width: Fill
-                    height: Fit
-                    font_size: 14.0
-                }
-            }
-        }
-    }
-
     mod.widgets.MindMapBase = #(MindMap::register_widget(vm))
 
     mod.widgets.MindMap = set_type_default() do mod.widgets.MindMapBase{
@@ -401,7 +352,6 @@ script_mod! {
         }
         card := CardTemplate{}
         group := GroupTemplate{}
-        detail := DetailTemplate{}
     }
 }
 
@@ -478,8 +428,6 @@ pub struct MindMap {
     highlight: Option<DrawHighlight>,
     #[rust]
     marquee_draw: Option<DrawMarquee>,
-    #[rust]
-    detail_ref: Option<WidgetRef>,
 
     #[rust]
     canvas: Option<DrawList2d>,
@@ -524,8 +472,6 @@ pub struct MindMap {
     selected: Vec<usize>,
     #[rust]
     marquee: Option<Marquee>,
-    #[rust]
-    detail_open: Option<usize>,
     #[rust]
     drag_card: Option<usize>,
     #[rust]
@@ -589,8 +535,6 @@ pub struct MindMap {
     card_template: Option<ScriptObjectRef>,
     #[rust]
     group_template: Option<ScriptObjectRef>,
-    #[rust]
-    detail_template: Option<ScriptObjectRef>,
 
 }
 
@@ -659,8 +603,6 @@ impl ScriptHook for MindMap {
                                 self.card_template = Some(template_ref);
                             } else if id == live_id!(group) {
                                 self.group_template = Some(template_ref);
-                            } else if id == live_id!(detail) {
-                                self.detail_template = Some(template_ref);
                             }
                         }
                     }
@@ -680,22 +622,6 @@ impl Widget for MindMap {
 
         cx.begin_turtle(walk, self.layout);
         let view = cx.turtle().rect();
-
-        let (detail_title, detail_body, detail_dir) = match self.detail_open {
-            Some(di) => self
-                .data
-                .as_ref()
-                .map(|d| {
-                    let node = &d.nodes[di];
-                    (
-                        card_title(node),
-                        node.body.clone(),
-                        node.path.parent().map(|p| p.to_path_buf()),
-                    )
-                })
-                .unwrap_or_default(),
-            None => (String::new(), String::new(), None),
-        };
 
         // Canvas content: always laid out at zoom = 1.0; pan/zoom are a pure
         // GPU view transform, so text layout caches never invalidate and
@@ -742,7 +668,7 @@ impl Widget for MindMap {
 
                 self.draw_cards(cx2d, scope, local_view);
 
-                // right-button marquee, drawn on top of the cards
+                // marquee, drawn on top of the cards
                 if let Some(m) = self.marquee {
                     let rect = Rect {
                         pos: dvec2(m.start.x.min(m.end.x), m.start.y.min(m.end.y)),
@@ -782,19 +708,6 @@ impl Widget for MindMap {
                 .draw_abs(cx, Rect { pos: c + dvec2(-1.25, -12.0), size: dvec2(2.5, 24.0) });
         }
 
-        // detail overlay (untransformed, on top)
-        if self.detail_open.is_some() {
-            if let Some(detail) = &self.detail_ref {
-                let _ = detail.draw_walk(cx, scope, Walk::fill());
-                detail.label(cx, ids!(title)).set_text(cx, &detail_title);
-                let mut md = detail.markdown_media(cx, ids!(markdown));
-                md.set_text(cx, &detail_body);
-                if let Some(dir) = detail_dir {
-                    md.set_base_dir(dir);
-                }
-            }
-        }
-
         cx.end_turtle_with_area(&mut self.area);
 
         DrawStep::done()
@@ -804,7 +717,6 @@ impl Widget for MindMap {
         self.handle_zoom_anim(cx, event);
         self.handle_page_burst(cx, event, scope);
         self.handle_keys(cx, event, scope);
-        self.handle_detail_events(cx, event, scope);
         self.handle_edit_buttons(cx, event);
         let on_mm = self.on_minimap(event);
         let local_event = self.remap_event(event);
@@ -850,26 +762,8 @@ impl Widget for MindMap {
 
 impl MindMap {
     /// WASD pan / QE zoom keys. Skipped while a card is being edited
-    /// (TextInput owns the keys), the detail panel is open (same rule as
-    /// wheel zoom), or the file panel is naming a new map/dir inline.
-
-    /// Detail overlay events: forward to the overlay and close it on its
-    /// close button.
-    fn handle_detail_events(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        let mut close_clicked = false;
-        if let Some(detail) = &self.detail_ref {
-            detail.handle_event(cx, event, scope);
-            if let Event::Actions(actions) = event {
-                if detail.button(cx, ids!(close)).clicked(actions) {
-                    close_clicked = true;
-                }
-            }
-        }
-        if close_clicked {
-            self.detail_open = None;
-            self.redraw(cx);
-        }
-    }
+    /// (TextInput owns the keys), or the file panel is naming a new
+    /// map/dir inline.
 
     /// Toggle card edit mode on its edit/done buttons.
     fn handle_edit_buttons(&mut self, cx: &mut Cx, event: &Event) {
@@ -951,7 +845,7 @@ impl MindMap {
     }
 
     /// Primary-button press on the canvas: minimap drag, card resize/drag,
-    /// group title drag, double-click to open the detail, or background pan.
+    /// group title drag, or background marquee (box select).
     fn handle_finger_down(&mut self, cx: &mut Cx, fe: &FingerDownEvent, child_grabbed: bool) {
         // Any canvas press commits an open group rename (a click inside the
         // rename TextInput is captured and skipped).
@@ -974,8 +868,8 @@ impl MindMap {
             return;
         }
         // Panels (file/refs/float/dock) own their presses; the canvas must
-        // not start a pan/drag under them.
-        if self.detail_open.is_none() && !crate::util::over_any_panel(fe.abs) {
+        // not start a marquee/drag under them.
+        if !crate::util::over_any_panel(fe.abs) {
             if self.minimap_rect.contains(fe.abs) {
                 self.mm_dragging = true;
                 self.navigate_minimap(cx, fe.abs);
@@ -995,13 +889,7 @@ impl MindMap {
                         self.selected_groups.clear();
                         self.reanchor_cards(cx);
                     }
-                    if fe.tap_count >= 2 {
-                        if self.editing_card.is_some() {
-                            self.commit_edit(cx);
-                        }
-                        self.detail_open = Some(i);
-                        self.ensure_detail(cx);
-                    } else if !child_grabbed && self.editing_card.is_none() {
+                    if !child_grabbed && self.editing_card.is_none() {
                         // no card-internal widget (scrollbar, link) grabbed the press
                         self.drag_card = Some(i);
                         self.drag_last = world;
@@ -1039,14 +927,17 @@ impl MindMap {
                     self.redraw(cx);
                 } else {
                     self.cancel_zoom_anim(cx);
-                    self.panning = true;
-                    self.pan_last = fe.abs;
+                    self.marquee = Some(Marquee {
+                        start: world,
+                        end: world,
+                    });
+                    self.redraw(cx);
                 }
             }
         }
     }
 
-    /// Right-button press: start a marquee selection, skipped over any panel
+    /// Right-button press: start a pan, skipped over any panel
     /// (file/refs/float), which use right-clicks for themselves.
     fn handle_finger_down_secondary(&mut self, cx: &mut Cx, fe: &FingerDownEvent) {
         if self.editing_group.is_some() {
@@ -1057,17 +948,13 @@ impl MindMap {
             self.redraw(cx);
             return;
         }
-        if self.detail_open.is_none()
-            && self.editing_card.is_none()
+        if self.editing_card.is_none()
             && !self.minimap_rect.contains(fe.abs)
             && !crate::util::over_any_panel(fe.abs)
         {
-            let world = self.screen_to_world(fe.abs);
-            self.marquee = Some(Marquee {
-                start: world,
-                end: world,
-            });
-            self.redraw(cx);
+            self.cancel_zoom_anim(cx);
+            self.panning = true;
+            self.pan_last = fe.abs;
         }
     }
 
@@ -1149,12 +1036,11 @@ impl MindMap {
         }
     }
 
-    /// Wheel zoom, swallowed over the minimap, the detail overlay and any
-    /// panel (file/refs/float — their content scrolls instead). Compact
-    /// cards have no scrollable body, so wheel over them zooms like canvas.
+    /// Wheel zoom, swallowed over the minimap and any panel (file/refs/float
+    /// — their content scrolls instead). Compact cards have no scrollable
+    /// body, so wheel over them zooms like canvas.
     fn handle_finger_scroll(&mut self, cx: &mut Cx, fe: &FingerScrollEvent) {
         if !self.minimap_rect.contains(fe.abs)
-            && self.detail_open.is_none()
             && fe.scroll.y != 0.0
             && !crate::util::over_any_panel(fe.abs)
         {
@@ -1201,7 +1087,6 @@ impl MindMap {
             self.marquee = None;
             self.editing_card = None;
             self.editing_group = None;
-            self.detail_open = None;
             self.mm_dragging = false;
             self.cancel_zoom_anim(cx);
             self.cancel_page_burst(cx);
@@ -1228,7 +1113,6 @@ impl MindMap {
         self.marquee = None;
         self.editing_card = None;
         self.editing_group = None;
-        self.detail_open = None;
         self.drag_card = None;
         self.drag_group = None;
         self.resize_card = None;
@@ -1247,22 +1131,11 @@ impl MindMap {
         self.pan_target = self.pan;
         self.zoom_target = self.zoom;
         log!(
-            "mindmap ready: {} nodes, {} edges, card_template={}, detail_template={}",
+            "mindmap ready: {} nodes, {} edges, card_template={}",
             n,
             self.edges.len(),
-            self.card_template.is_some(),
-            self.detail_template.is_some()
+            self.card_template.is_some()
         );
-    }
-
-    fn ensure_detail(&mut self, cx: &mut Cx) {
-        if self.detail_ref.is_none() {
-            if let Some(t) = &self.detail_template {
-                let value = t.as_object().into();
-                let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
-                self.detail_ref = Some(w);
-            }
-        }
     }
 
     /// Draw all card connection edges, culled to the viewport.

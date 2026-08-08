@@ -46,7 +46,6 @@ impl MindMap {
         }
         if self.editing_card.is_none()
             && self.editing_group.is_none()
-            && self.detail_open.is_none()
             && !crate::file_panel::is_name_editing()
             && !crate::float_panel::is_chat_input_active()
         {

@@ -9,6 +9,9 @@ const HOT_ZONE: f64 = 60.0;
 /// margin + a few px so progress 0 is fully off-screen; bump if the dock
 /// DSL grows taller.
 const HIDDEN_Y: f64 = 72.0;
+/// Dock tray width (px). Must stay in sync with the `bar` width in the
+/// main.rs BottomBar DSL; the hint line is 4/5 of this.
+const DOCK_W: f64 = 184.0;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -253,14 +256,15 @@ impl Widget for BottomBar {
                     z: 1.0,
                     w: a as f32 * 0.4,
                 };
+                let w = DOCK_W * 0.8;
                 self.draw_hint.draw_abs(
                     cx,
                     Rect {
                         pos: dvec2(
-                            self.window_size.x / 2.0 - 96.0,
+                            self.window_size.x / 2.0 - w / 2.0,
                             self.window_size.y - 16.0 - self.slide.progress * HIDDEN_Y,
                         ),
-                        size: dvec2(192.0, 4.0),
+                        size: dvec2(w, 4.0),
                     },
                 );
             }
