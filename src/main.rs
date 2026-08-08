@@ -247,6 +247,90 @@ script_mod! {
         }
     }
 
+    // Startup welcome page: asks what concept to learn, then hands off to
+    // the AI panel. Shown once per launch (the PopupPanel starts closed;
+    // App::handle_event opens it on the first draw).
+    let StartupPageContent = mod.widgets.View{
+        width: Fill
+        height: Fill
+        flow: Overlay
+        align: Align{x: 0.5, y: 0.5}
+        draw_bg +: {
+            pixel: fn(){
+                #000000cc
+            }
+        }
+        panel := mod.widgets.RoundedView{
+            width: 480
+            height: Fit
+            flow: Down
+            padding: 28
+            spacing: 14
+            show_bg: true
+            draw_bg +: {
+                color: #1f2430
+                border_radius: 8.0
+                border_size: 1.0
+                border_color: #ffffff14
+            }
+            title := mod.widgets.Label{
+                width: Fill
+                text: "想学习什么？"
+                draw_text.text_style.font_size: 22.0
+                draw_text.color: #e6e9f0
+            }
+            hint := mod.widgets.Label{
+                width: Fill
+                text: "输入你想学习的概念，AI 会为你讲解"
+                draw_text.text_style.font_size: 13.0
+                draw_text.color: #aab0bc
+            }
+            hint2 := mod.widgets.Label{
+                width: Fill
+                text: "提示：可先在右侧「参考资料」中添加文档，提升回答准确率"
+                draw_text.text_style.font_size: 12.0
+                draw_text.color: #7a8192
+            }
+            input_row := mod.widgets.View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 8
+                start_input := mod.widgets.TextInput{
+                    width: Fill
+                    height: (44.0)
+                    submit_on_enter: true
+                    empty_text: "提出要解释的概念…"
+                }
+                start_send_btn := SendBtn{
+                    draw_icon +: {
+                        svg: crate_resource("self:resources/send.svg")
+                        color: #aab0bc
+                    }
+                    icon_walk: Walk{width: 16, height: 16}
+                }
+            }
+            skip_btn := mod.widgets.ButtonFlat{
+                width: Fit
+                text: "先看看导图 →"
+                padding: Inset{left: 0, right: 0, top: 2, bottom: 2}
+                draw_bg +: {
+                    color: #0000
+                    color_hover: #ffffff0a
+                    color_down: #ffffff0a
+                    color_focus: #0000
+                    border_size: uniform(0.0)
+                }
+                draw_text +: {
+                    text_style: theme.font_regular{
+                        font_size: 12.0
+                    }
+                    color: #7a8192
+                }
+            }
+        }
+    }
+
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
@@ -310,6 +394,9 @@ script_mod! {
                     }
                     about_popup := mod.widgets.PopupPanel{
                         content := PopupPanelContent{}
+                    }
+                    startup_popup := mod.widgets.PopupPanel{
+                        content := StartupPageContent{}
                     }
                     float_panel := mod.widgets.FloatPanel{}
                     ai_panel := mod.widgets.FloatPanel{
@@ -903,6 +990,7 @@ impl App {
         if show {
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
             p.show(cx);
             if id == live_id!(setting_popup) {
                 let child = |path: &[LiveId]| self.popup_child(live_id!(setting_popup), path);
@@ -1003,6 +1091,7 @@ impl App {
             panel.show(cx);
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
         }
     }
 
@@ -1015,6 +1104,7 @@ impl App {
             self.sync_jiangou_btns(cx);
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
         }
     }
 
@@ -1145,6 +1235,90 @@ impl App {
         }
     }
 
+    /// Startup page: submit the concept (dismisses the page, opens the AI
+    /// panel and sends it as the first message) or skip to the main UI.
+    fn handle_startup_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let popup = self.popup_widget(live_id!(startup_popup));
+        if !popup.as_popup_panel().opened() {
+            return;
+        }
+        let input = self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(input_row), live_id!(start_input)],
+            )
+            .as_text_input();
+        for action in actions.filter_widget_actions_cast::<TextInputAction>(input.widget_uid()) {
+            match action {
+                TextInputAction::KeyFocus => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(true, Ordering::Relaxed)
+                }
+                TextInputAction::KeyFocusLost => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed)
+                }
+                TextInputAction::Returned(text, _) => self.submit_concept(cx, &text),
+                _ => {}
+            }
+        }
+        if self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(input_row), live_id!(start_send_btn)],
+            )
+            .as_button()
+            .clicked(actions)
+        {
+            self.submit_concept(cx, &input.text());
+        }
+        if self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(skip_btn)],
+            )
+            .as_button()
+            .clicked(actions)
+        {
+            self.close_startup(cx);
+        }
+    }
+
+    /// Dismiss the startup page and (when a concept is given) start a chat
+    /// about it in the AI panel.
+    fn submit_concept(&mut self, cx: &mut Cx, text: &str) {
+        let text = text.trim().to_string();
+        self.close_startup(cx);
+        if text.is_empty() {
+            return;
+        }
+        let panel = self.ui.float_panel(cx, ids!(ai_panel));
+        if !panel.opened() {
+            self.toggle_ai_panel(cx);
+        }
+        self.send_chat(cx, &text);
+    }
+
+    fn close_startup(&mut self, cx: &mut Cx) {
+        // The input can't emit KeyFocusLost once the popup is gone.
+        crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed);
+        self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
+    }
+
+    /// Open the startup welcome page, clearing any leftover input text.
+    fn show_startup(&mut self, cx: &mut Cx) {
+        self.popup_child(
+            live_id!(startup_popup),
+            &[
+                live_id!(content),
+                live_id!(panel),
+                live_id!(input_row),
+                live_id!(start_input),
+            ],
+        )
+        .as_text_input()
+        .set_text(cx, "");
+        self.popup_widget(live_id!(startup_popup)).as_popup_panel().show(cx);
+    }
+
     /// File panel tree: map click, context-menu create/delete/rename.
     fn handle_file_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         // File panel tree: clicking a map switches the mindmap to it.
@@ -1156,6 +1330,8 @@ impl App {
         if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
             std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
             self.open_map(cx, &map_file);
+            // A fresh map starts from the welcome page: ask what to learn.
+            self.show_startup(cx);
         }
         if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
             std::fs::create_dir(base.join(&dir)).ok();
@@ -1798,6 +1974,16 @@ impl AppMain for App {
                     }
                 }
             }
+            // First launch with no maps: create the default map for the user
+            // and open the welcome page.
+            let base = crate::util::app_base_dir();
+            if crate::file_panel::all_map_files(&base).is_empty() {
+                let map = mindmap::MindMapData::DEFAULT_MAP.to_string();
+                let _ = std::fs::create_dir_all(base.join("maps"));
+                std::fs::write(base.join(&map), mindmap::new_map_json()).ok();
+                self.open_map(cx, &map);
+                self.show_startup(cx);
+            }
         }
         if let Some(timer) = self.rag_timer {
             if timer.is_event(event).is_some() {
@@ -1810,6 +1996,7 @@ impl AppMain for App {
             self.handle_settings_actions(cx, actions);
             self.handle_chat_actions(cx, actions);
             self.handle_file_panel_actions(cx, actions);
+            self.handle_startup_actions(cx, actions);
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
         // After ui.handle_event: the dock writes pending_click while the
@@ -1821,7 +2008,11 @@ impl AppMain for App {
         // events to the open popup directly (it forwards to its content,
         // which hit-tests geometrically).
         if let Event::MouseDown(_) | Event::MouseUp(_) = event {
-            for id in [live_id!(setting_popup), live_id!(about_popup)] {
+            for id in [
+                live_id!(setting_popup),
+                live_id!(about_popup),
+                live_id!(startup_popup),
+            ] {
                 let p = self.popup_widget(id).as_popup_panel();
                 if p.opened() {
                     p.handle_event(cx, event, &mut Scope::empty());
