@@ -22,11 +22,14 @@ const ZOOM_EASE_SPEED: f64 = 10.0;
 // WASD pan speed in screen px/sec (same coordinate space as drag-panning,
 // so it feels identical at any zoom). Q/E zoom as an exponential rate/sec.
 const MOVE_SPEED: f64 = 1200.0;
+// Arrow-key card movement, deliberately slower than WASD pan (≈65% of
+// MOVE_SPEED) so cards can be dialed in precisely.
+const ARROW_MOVE_SPEED: f64 = 780.0;
 const ZOOM_KEY_SPEED: f64 = 1.5;
 // Shift+arrow resize speed in screen px/sec (world = /zoom); slower than
 // MOVE_SPEED so the size can be dialed in precisely.
 const RESIZE_SPEED: f64 = 600.0;
-// Ctrl+arrow paging: one page = PAGE_TICKS small instant scrolls (is_mouse:
+// Alt/Option+arrow paging: one page = PAGE_TICKS small instant scrolls (is_mouse:
 // false takes ScrollBar's non-smoothing branch), paced at 60Hz by
 // `page_timer`. Constant speed, no pause between steps, refresh-rate
 // independent — unlike the wheel path, which keeps its own smooth glide
@@ -50,6 +53,13 @@ const POPUP_SWATCH: f64 = 26.0;
 const POPUP_GAP: f64 = 8.0;
 const POPUP_PAD: f64 = 10.0;
 
+// Primary-modifier drag grid snap (⌘ on macOS, Ctrl elsewhere): card/group
+// positions and resize edges round to GRID_SIZE world px while the key is
+// held. The grid lines fade in/out at GRID_EASE_SPEED (≈0.2s) via a 60Hz
+// timer, mirroring the zoom anim.
+const GRID_SIZE: f64 = 24.0;
+const GRID_EASE_SPEED: f64 = 14.0;
+
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 pub struct DrawEdge {
@@ -67,6 +77,13 @@ pub struct DrawHighlight {
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 pub struct DrawMarquee {
+    #[deref]
+    draw_super: DrawQuad,
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawGrid {
     #[deref]
     draw_super: DrawQuad,
 }
@@ -143,6 +160,28 @@ script_mod! {
             // e: 1 on the border line, fading over `width` px on both sides
             let e = clamp(1.0 - abs(sdf.shape) / self.width, 0.0, 1.0)
             let a = self.fill_alpha * g + self.color.a * e
+            return vec4(self.color.rgb * a, a)
+        }
+    }
+
+    // Grid-snap guide: 1px hairlines at GRID_SIZE spacing, drawn in world
+    // coords over the viewport so lines pan/zoom with the canvas. The whole
+    // grid is one draw call — the shader derives the lines from each
+    // fragment's world position (modulo spacing). Alpha driven by the
+    // grid_alpha fade (primary modifier held).
+    mod.widgets.DrawGrid = set_type_default() do #(DrawGrid::script_shader(vm)){
+        ..mod.draw.DrawQuad
+
+        color: uniform(vec4(0.62, 0.68, 0.85, 0.14))
+        spacing: uniform(24.0)
+
+        pixel: fn() {
+            let p = self.rect_pos + self.pos * self.rect_size
+            let g = self.spacing
+            let dx = p.x - floor(p.x / g) * g
+            let dy = p.y - floor(p.y / g) * g
+            let d = min(min(dx, g - dx), min(dy, g - dy))
+            let a = self.color.a * (1.0 - min(d, 1.0))
             return vec4(self.color.rgb * a, a)
         }
     }
@@ -245,7 +284,7 @@ script_mod! {
             // off the bottom so code blocks/images never poke past the
             // 6px rounded corners (markdown adds 4px more).
             margin: Inset{bottom: 10}
-            // Smooth glide for Ctrl+arrow paging (and wheel): ScrollBar's
+            // Smooth glide for Alt/Option+arrow paging (and wheel): ScrollBar's
             // smoothing routes wheel-style deltas through set_scroll_target,
             // which then animates itself frame-by-frame. ~0.05 → a page in
             // ~0.3s. The explicit mod.widgets.ScrollBars proto is required:
@@ -355,7 +394,7 @@ script_mod! {
     }
 }
 
-/// Active Ctrl+arrow page burst: the card being paged, its scroll direction
+/// Active Alt/Option+arrow page burst: the card being paged, its scroll direction
 /// (±1) and the 60Hz segments left.
 #[derive(Clone, Copy)]
 struct PageBurst {
@@ -428,6 +467,8 @@ pub struct MindMap {
     highlight: Option<DrawHighlight>,
     #[rust]
     marquee_draw: Option<DrawMarquee>,
+    #[rust]
+    grid_draw: Option<DrawGrid>,
 
     #[rust]
     canvas: Option<DrawList2d>,
@@ -444,7 +485,7 @@ pub struct MindMap {
     zoom_timer: Option<Timer>,
     #[rust]
     last_timer_time: f64,
-    /// Ctrl+arrow paging: timer pacing the page burst and the burst state.
+    /// Alt/Option+arrow paging: timer pacing the page burst and the burst state.
     #[rust]
     page_timer: Option<Timer>,
     #[rust]
@@ -456,9 +497,10 @@ pub struct MindMap {
     /// selected cards toward `rect_targets` (see set_arrow).
     #[rust]
     arrow_move: u8,
-    /// Held Shift+arrow keys, same bit layout as `arrow_move`; resizes the
-    /// selected cards toward `rect_targets` (top-left pinned, bottom-right
-    /// handle: Right/Down grow, Left/Up shrink).
+    /// Held Alt/Option+arrow keys, same bit layout as `arrow_move`; resizes
+    /// the selected cards toward `rect_targets` (top-left pinned, bottom-right
+    /// handle: Right/Down grow, Left/Up shrink). Sizes snap to the grid while
+    /// the primary modifier is also held (⌘/Ctrl+Alt+arrow).
     #[rust]
     resize_arrows: u8,
     /// Interpolation targets for the selected cards' positions and sizes.
@@ -468,6 +510,27 @@ pub struct MindMap {
     panning: bool,
     #[rust]
     pan_last: DVec2,
+    /// Primary modifier held (⌘ on macOS, Ctrl elsewhere): grid-snap drags
+    /// and the grid lines fade in. Tracked from key events (KeyUp may be
+    /// lost on focus change; the map-switch resets below clear the stale
+    /// state).
+    #[rust]
+    ctrl_down: bool,
+    /// Grid line alpha, eased toward `grid_alpha_target` by a 60Hz timer.
+    #[rust]
+    grid_alpha: f64,
+    #[rust]
+    grid_alpha_target: f64,
+    #[rust]
+    grid_timer: Option<Timer>,
+    #[rust]
+    last_grid_time: f64,
+    /// Fractional cell motion accumulated for grid-snap arrow movement/resize
+    /// (a whole cell is applied only once GRID_SIZE is crossed — round-to-
+    /// nearest per tick collapses when the per-tick delta is under half a
+    /// cell).
+    #[rust]
+    grid_accum: DVec2,
     #[rust]
     selected: Vec<usize>,
     #[rust]
@@ -484,7 +547,7 @@ pub struct MindMap {
     /// and every nested group's cards.
     #[rust]
     drag_group: Option<usize>,
-    /// Groups selected via their title bar (for Ctrl+G nesting and the
+    /// Groups selected via their title bar (for ⌘/Ctrl+G nesting and the
     /// selection highlight); `selected` holds their member cards.
     #[rust]
     selected_groups: Vec<usize>,
@@ -662,6 +725,18 @@ impl Widget for MindMap {
                 self.view_rect = local_view;
                 cx2d.push_clip_rect(local_view);
 
+                // Grid-snap guide, behind everything else; one draw call for
+                // the whole viewport (lines derived in the shader).
+                if self.grid_alpha > 0.003 {
+                    if let Some(gd) = &mut self.grid_draw {
+                        let a = (self.grid_alpha * 0.14) as f32;
+                        gd.draw_vars.set_uniform(cx2d, id!(color), &[0.62, 0.68, 0.85, a]);
+                        gd.draw_vars
+                            .set_uniform(cx2d, id!(spacing), &[GRID_SIZE as f32]);
+                        gd.draw_abs(cx2d, local_view);
+                    }
+                }
+
                 self.draw_edges(cx2d, local_view);
 
                 self.draw_groups(cx2d, scope, local_view);
@@ -715,8 +790,10 @@ impl Widget for MindMap {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_zoom_anim(cx, event);
+        self.handle_grid_anim(cx, event);
         self.handle_page_burst(cx, event, scope);
         self.handle_keys(cx, event, scope);
+        self.handle_grid_key(cx, event);
         self.handle_edit_buttons(cx, event);
         let on_mm = self.on_minimap(event);
         let local_event = self.remap_event(event);
@@ -989,13 +1066,15 @@ impl MindMap {
             return;
         }
         let world = self.screen_to_world(fe.abs);
+        // ⌘/Ctrl: the dragged edge/corner snaps to the grid (anchor edge stays).
+        let w = if self.ctrl_down { Self::snap_grid(world) } else { world };
         if let Some(r) = self.resize_card {
             if let Some(data) = &mut self.data {
                 let node = &mut data.nodes[r.card];
                 apply_resize(
                     &mut node.pos,
                     &mut node.size,
-                    world,
+                    w,
                     r.dir,
                     dvec2(CARD_MIN_SIZE, CARD_MIN_SIZE),
                     dvec2(CARD_MAX_SIZE, CARD_MAX_SIZE),
@@ -1004,17 +1083,28 @@ impl MindMap {
             self.redraw(cx);
         } else if self.drag_card.is_some() {
             if let Some(data) = &mut self.data {
-                let delta = world - self.drag_last;
+                let delta = w - self.drag_last;
                 for &j in &self.selected {
                     data.nodes[j].pos += delta;
+                    if self.ctrl_down {
+                        data.nodes[j].pos = Self::snap_grid(data.nodes[j].pos);
+                    }
                 }
-                self.drag_last = world;
+                self.drag_last = w;
             }
             self.redraw(cx);
         } else if let Some(gi) = self.drag_group {
-            let delta = world - self.drag_last;
+            let delta = w - self.drag_last;
             self.move_group(gi, delta);
-            self.drag_last = world;
+            if self.ctrl_down {
+                let cards = self.group_subtree_cards(gi);
+                if let Some(data) = &mut self.data {
+                    for c in cards {
+                        data.nodes[c].pos = Self::snap_grid(data.nodes[c].pos);
+                    }
+                }
+            }
+            self.drag_last = w;
             self.redraw(cx);
         } else if self.panning {
             self.pan += fe.abs - self.pan_last;
@@ -1108,6 +1198,7 @@ impl MindMap {
             self.mm_dragging = false;
             self.cancel_zoom_anim(cx);
             self.cancel_page_burst(cx);
+            self.reset_grid_state(cx);
             self.redraw(cx);
             return;
         };
@@ -1121,6 +1212,7 @@ impl MindMap {
         self.edges = edges;
         self.highlight = Some(cx.with_vm(|vm| DrawHighlight::script_new_with_default(vm)));
         self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
+        self.grid_draw = Some(cx.with_vm(|vm| DrawGrid::script_new_with_default(vm)));
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
         self.rebuild_group_widgets(cx);
@@ -1140,6 +1232,7 @@ impl MindMap {
         self.key_move = 0;
         self.cancel_page_burst(cx);
         self.cancel_zoom_anim(cx);
+        self.reset_grid_state(cx);
         self.pan = dvec2(120.0, 60.0);
         self.zoom = 1.0;
         if let Some((p, z)) = saved_view {
@@ -1428,7 +1521,7 @@ impl MindMap {
         self.hover_color_btn = None;
     }
 
-    /// Ctrl+G: wrap the selected cards and selected groups in a new group.
+    /// ⌘/Ctrl+G: wrap the selected cards and selected groups in a new group.
     /// Cards that already belong to a group stay there — their group is
     /// nested into the new one instead (fold_selection), so grouping over
     /// existing groups' cards wraps those groups rather than flattening them.
@@ -1477,7 +1570,7 @@ impl MindMap {
         self.redraw(cx);
     }
 
-    /// Ctrl+Shift+G: dissolve every selected group and every group containing
+    /// ⌘/Ctrl+Shift+G: dissolve every selected group and every group containing
     /// a selected card; their members (cards + nested groups) splice into the
     /// dissolved group's parent.
     fn ungroup_selected(&mut self, cx: &mut Cx) {

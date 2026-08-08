@@ -304,7 +304,7 @@ impl MindMapData {
     }
 
     /// Index of the group that directly contains `gi`, if any. NOTE: index
-    /// order is not a depth order — Ctrl+G appends new wrapper groups after
+    /// order is not a depth order — ⌘/Ctrl+G appends new wrapper groups after
     /// their children, so parents usually have HIGHER indices.
     pub fn group_parent(&self, gi: usize) -> Option<usize> {
         self.groups.iter().position(|g| g.groups.contains(&gi))
@@ -333,7 +333,7 @@ impl MindMapData {
     }
 
     /// Turn a raw selection into group members: cards that already belong to
-    /// a group stay there and the group itself is nested instead (so Ctrl+G
+    /// a group stay there and the group itself is nested instead (so ⌘/Ctrl+G
     /// over cards of existing groups wraps the groups, never pulls the cards
     /// out); groups already transitively contained in another selected group
     /// are dropped (keeps the containment graph a forest).

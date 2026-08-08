@@ -19,6 +19,19 @@ fn axis(bits: u8, pos: u8, neg: u8) -> f64 {
     ((bits & pos) != 0) as i8 as f64 - ((bits & neg) != 0) as i8 as f64
 }
 
+/// The primary modifier key: Command (⌘) on macOS, Control elsewhere
+/// (mirrors KeyModifiers::is_primary's cfg split).
+fn mod_key() -> KeyCode {
+    #[cfg(target_vendor = "apple")]
+    {
+        KeyCode::Logo
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        KeyCode::Control
+    }
+}
+
 impl MindMap {
     pub(super) fn handle_keys(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         // Group rename: Enter commits, Esc cancels; the TextInput owns the
@@ -51,7 +64,7 @@ impl MindMap {
         {
             match event {
                 Event::KeyDown(ke) => {
-                    if ke.modifiers.control && ke.key_code == KeyCode::KeyG && !ke.is_repeat {
+                    if ke.modifiers.is_primary() && ke.key_code == KeyCode::KeyG && !ke.is_repeat {
                         if ke.modifiers.shift {
                             self.ungroup_selected(cx);
                         } else {
@@ -59,18 +72,21 @@ impl MindMap {
                         }
                     } else if ke.key_code == KeyCode::Space && !ke.is_repeat {
                         self.select_view_center(cx, ke.modifiers.shift);
-                    } else if ke.modifiers.control && arrow_mask(ke.key_code).is_some() {
-                        // Ctrl+arrow pages the selected card's markdown body;
+                    } else if ke.modifiers.shift && arrow_mask(ke.key_code).is_some() {
+                        // Shift+arrow pages the selected card's markdown body;
                         // repeats keep paging. Left/Right are deliberately
                         // absorbed so they never fall through to card movement.
                         self.page_card(ke.key_code, cx, scope);
+                    } else if ke.modifiers.alt && arrow_mask(ke.key_code).is_some() {
+                        // Alt/Option+arrow resizes the selected cards
+                        // (bottom-right handle); holding the primary
+                        // modifier (⌘/Ctrl+Alt+arrow) snaps to the grid.
+                        self.set_arrow(ke.key_code, true, true, cx);
                     } else {
                         self.set_key_move(ke.key_code, true, cx);
-                        // Shift+arrow resizes the selected cards instead of
-                        // moving them; also switches a still-held key's mode.
-                        let resize = ke.modifiers.shift;
-                        self.set_arrow(ke.key_code, false, !resize, cx);
-                        self.set_arrow(ke.key_code, true, resize, cx);
+                        // Plain arrows move without snapping; holding the
+                        // primary modifier (⌘/Ctrl) snaps to the grid.
+                        self.set_arrow(ke.key_code, true, false, cx);
                     }
                 }
                 Event::KeyUp(ke) => {
@@ -119,20 +135,93 @@ impl MindMap {
                 axis(self.arrow_move, ARROW_RIGHT, ARROW_LEFT),
                 axis(self.arrow_move, ARROW_DOWN, ARROW_UP),
             );
-            let delta = dir * (MOVE_SPEED / self.zoom) * dt;
-            for (_, t) in &mut self.rect_targets {
-                t.pos += delta;
+            let delta = dir * (ARROW_MOVE_SPEED / self.zoom) * dt;
+            if self.ctrl_down {
+                // Grid mode: accumulate the per-tick delta and apply whole
+                // cells only (round-to-nearest per tick collapses when the
+                // delta is under half a cell, and can jitter backward near a
+                // boundary). Stepping always follows the motion direction;
+                // the pin keeps targets on the grid and aligns an off-grid
+                // start. Average speed matches the unsnapped branch.
+                self.grid_accum += delta;
+                let mut step = dvec2(0.0, 0.0);
+                while self.grid_accum.x >= GRID_SIZE {
+                    self.grid_accum.x -= GRID_SIZE;
+                    step.x += GRID_SIZE;
+                }
+                while self.grid_accum.x <= -GRID_SIZE {
+                    self.grid_accum.x += GRID_SIZE;
+                    step.x -= GRID_SIZE;
+                }
+                while self.grid_accum.y >= GRID_SIZE {
+                    self.grid_accum.y -= GRID_SIZE;
+                    step.y += GRID_SIZE;
+                }
+                while self.grid_accum.y <= -GRID_SIZE {
+                    self.grid_accum.y += GRID_SIZE;
+                    step.y -= GRID_SIZE;
+                }
+                if step != dvec2(0.0, 0.0) {
+                    for (_, t) in &mut self.rect_targets {
+                        t.pos += step;
+                    }
+                }
+                for (_, t) in &mut self.rect_targets {
+                    t.pos = Self::snap_grid(t.pos);
+                }
+            } else {
+                self.grid_accum = dvec2(0.0, 0.0);
+                for (_, t) in &mut self.rect_targets {
+                    t.pos += delta;
+                }
             }
         }
-        // Shift+arrow: bottom-right handle mode — the top-left corner is
-        // pinned, Right/Down grow and Left/Up shrink (100px floor).
+        // Alt/Option+arrow: bottom-right handle mode — the top-left corner is
+        // pinned, Right/Down grow and Left/Up shrink. With the primary
+        // modifier (⌘/Ctrl+Alt+arrow) sizes step whole grid cells via the
+        // same accumulator (snap-then-clamp so CARD_MIN_SIZE holds).
         if self.resize_arrows != 0 {
             let rx = axis(self.resize_arrows, ARROW_RIGHT, ARROW_LEFT);
             let ry = axis(self.resize_arrows, ARROW_DOWN, ARROW_UP);
             let s = (RESIZE_SPEED / self.zoom) * dt;
+            if self.ctrl_down {
+                self.grid_accum += dvec2(rx * s, ry * s);
+                let mut step = dvec2(0.0, 0.0);
+                while self.grid_accum.x >= GRID_SIZE {
+                    self.grid_accum.x -= GRID_SIZE;
+                    step.x += GRID_SIZE;
+                }
+                while self.grid_accum.x <= -GRID_SIZE {
+                    self.grid_accum.x += GRID_SIZE;
+                    step.x -= GRID_SIZE;
+                }
+                while self.grid_accum.y >= GRID_SIZE {
+                    self.grid_accum.y -= GRID_SIZE;
+                    step.y += GRID_SIZE;
+                }
+                while self.grid_accum.y <= -GRID_SIZE {
+                    self.grid_accum.y += GRID_SIZE;
+                    step.y -= GRID_SIZE;
+                }
+                if step != dvec2(0.0, 0.0) {
+                    for (_, t) in &mut self.rect_targets {
+                        t.size += step;
+                    }
+                }
+                for (_, t) in &mut self.rect_targets {
+                    t.size.x = (t.size.x / GRID_SIZE).round() * GRID_SIZE;
+                    t.size.y = (t.size.y / GRID_SIZE).round() * GRID_SIZE;
+                }
+            } else {
+                self.grid_accum = dvec2(0.0, 0.0);
+                for (_, t) in &mut self.rect_targets {
+                    t.size.x += rx * s;
+                    t.size.y += ry * s;
+                }
+            }
             for (_, t) in &mut self.rect_targets {
-                t.size.x = (t.size.x + rx * s).clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
-                t.size.y = (t.size.y + ry * s).clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
+                t.size.x = t.size.x.clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
+                t.size.y = t.size.y.clamp(CARD_MIN_SIZE, CARD_MAX_SIZE);
             }
         }
         let k = 1.0 - (-dt * ZOOM_EASE_SPEED).exp();
@@ -191,6 +280,75 @@ impl MindMap {
         self.pan_target = self.pan;
     }
 
+    /// Primary modifier held (⌘ on macOS, Ctrl elsewhere): start/stop the
+    /// grid fade (and record the key state for drag snapping). KeyUp can be
+    /// lost on focus loss, so the state is also cleared on map switches
+    /// (reset_grid_state).
+    pub(super) fn handle_grid_key(&mut self, cx: &mut Cx, event: &Event) {
+        match event {
+            Event::KeyDown(ke) if ke.key_code == mod_key() && !ke.is_repeat => {
+                self.set_grid_fade(cx, 1.0);
+                self.ctrl_down = true;
+            }
+            Event::KeyUp(ke) if ke.key_code == mod_key() => {
+                self.set_grid_fade(cx, 0.0);
+                self.ctrl_down = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Ease `grid_alpha` toward its target on the 60Hz fade timer, stopping
+    /// once settled. Mirrors handle_zoom_anim.
+    pub(super) fn handle_grid_anim(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(timer) = self.grid_timer else { return };
+        let Some(te) = timer.is_event(event) else { return };
+        let now = te.time.unwrap_or(0.0);
+        // first tick has no baseline; fall back to one 60Hz frame
+        let dt = if self.last_grid_time == 0.0 {
+            1.0 / 60.0
+        } else {
+            (now - self.last_grid_time).max(0.0)
+        };
+        self.last_grid_time = now;
+        let k = 1.0 - (-dt * GRID_EASE_SPEED).exp();
+        self.grid_alpha += (self.grid_alpha_target - self.grid_alpha) * k;
+        if (self.grid_alpha_target - self.grid_alpha).abs() < 0.005 {
+            self.grid_alpha = self.grid_alpha_target;
+            cx.stop_timer(timer);
+            self.grid_timer = None;
+        }
+        self.redraw(cx);
+    }
+
+    /// Stop the fade timer and reset grid state (map switch).
+    pub(super) fn reset_grid_state(&mut self, cx: &mut Cx) {
+        if let Some(t) = self.grid_timer.take() {
+            cx.stop_timer(t);
+        }
+        self.ctrl_down = false;
+        self.grid_alpha = 0.0;
+        self.grid_alpha_target = 0.0;
+        self.grid_accum = dvec2(0.0, 0.0);
+    }
+
+    /// Round a world-space point to the grid (primary-modifier drag snapping).
+    pub(super) fn snap_grid(p: DVec2) -> DVec2 {
+        dvec2(
+            (p.x / GRID_SIZE).round() * GRID_SIZE,
+            (p.y / GRID_SIZE).round() * GRID_SIZE,
+        )
+    }
+
+    /// Target the grid fade (1.0 shown, 0.0 hidden), starting the 60Hz timer.
+    fn set_grid_fade(&mut self, cx: &mut Cx, target: f64) {
+        if self.grid_timer.is_none() {
+            self.grid_timer = Some(cx.start_interval(1.0 / 60.0));
+            self.last_grid_time = 0.0;
+        }
+        self.grid_alpha_target = target;
+    }
+
     /// Select the card under the view center, or the group whose frame
     /// contains it (card first); with `add` (Shift+Space) the hit is added
     /// to the selection instead of replacing it.
@@ -238,7 +396,7 @@ impl MindMap {
         self.redraw(cx);
     }
 
-    /// Ctrl+arrow: page the first selected card's markdown body by one
+    /// Alt/Option+arrow: page the first selected card's markdown body by one
     /// viewport. One page = PAGE_TICKS small instant scrolls (is_mouse: false
     /// skips the bar's smoothing glide) paced at 60Hz by `page_timer`, so the
     /// motion is constant-speed and refresh-rate independent. Synthesizes
@@ -357,8 +515,9 @@ impl MindMap {
     }
 
     /// Track held arrow keys in the `arrow_move` (move) or `resize_arrows`
-    /// (Shift+arrow resize) bitmask; the first press re-anchors the selected
-    /// cards' targets and starts the animation timer that eases toward them.
+    /// (Alt/Option+arrow resize) bitmask; the first press re-anchors the
+    /// selected cards' targets and starts the animation timer that eases
+    /// toward them.
     pub(super) fn set_arrow(&mut self, code: KeyCode, down: bool, resize: bool, cx: &mut Cx) {
         let Some(mask) = arrow_mask(code) else {
             return;

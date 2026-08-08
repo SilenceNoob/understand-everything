@@ -55,7 +55,7 @@ impl MindMap {
 
     /// Among all groups whose `rect_of` contains `world`, the innermost one
     /// (deepest in the containment forest). Index order is NOT a depth order
-    /// — Ctrl+G appends new wrapper groups AFTER their children — so
+    /// — ⌘/Ctrl+G appends new wrapper groups AFTER their children — so
     /// containment is compared directly via group_reaches. n is small;
     /// the O(n²) worst case is fine.
     fn innermost_hit(&self, world: DVec2, rect_of: impl Fn(&Self, usize) -> Rect) -> Option<usize> {
