@@ -44,6 +44,21 @@ impl MindMap {
             }
         }
 
+        // Group frames under the card rects (faint, viewport-indicator color;
+        // ponytail: reuses draw_mm_view, add a dedicated color if groups get
+        // hard to spot).
+        if scale > 0.0 {
+            let to_mm = |p: DVec2| p * scale + offset;
+            let n = self.data.as_ref().map(|d| d.groups.len()).unwrap_or(0);
+            for gi in 0..n {
+                let r = self.group_rect(gi);
+                self.draw_mm_view.draw_abs(cx, Rect {
+                    pos: to_mm(r.pos),
+                    size: r.size * scale,
+                });
+            }
+        }
+
         let card_rects: Vec<Rect> = self
             .data
             .as_ref()

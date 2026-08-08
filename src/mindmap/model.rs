@@ -10,6 +10,10 @@ pub(crate) const CARD_MAX_SIZE: f64 = 1000.0;
 const GAP_X: f64 = 120.0;
 const GAP_Y: f64 = 40.0;
 const CANVAS_MARGIN: f64 = 60.0;
+/// Space between a group's frame border and its members' rects (cards, or
+/// nested groups' frames). Nested frames are padded recursively, so each
+/// level's border sits GROUP_PAD outside its children's.
+pub(crate) const GROUP_PAD: f64 = 36.0;
 /// Zoom range for the map view (mouse wheel, QE keys, saved view clamp).
 pub(crate) const ZOOM_MIN: f64 = 0.3;
 pub(crate) const ZOOM_MAX: f64 = 2.5;
@@ -21,6 +25,20 @@ struct MapFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     zoom: Option<f64>,
     nodes: Vec<MapNodeFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<GroupFile>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct GroupFile {
+    id: String,
+    title: String,
+    #[serde(default)]
+    cards: Vec<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -52,8 +70,22 @@ pub struct Node {
     pub subtree_h: f64,
 }
 
+/// A card group: a titled frame wrapping member cards and/or nested groups.
+/// `cards`/`groups` hold resolved node/group indices; the containment graph
+/// is a forest (a card or group belongs to at most one parent group).
+#[derive(Clone)]
+pub struct Group {
+    pub id: String,
+    pub title: String,
+    pub cards: Vec<usize>,
+    pub groups: Vec<usize>,
+    /// Frame color as "#rrggbb"; None = default (script shader default).
+    pub color: Option<String>,
+}
+
 pub struct MindMapData {
     pub nodes: Vec<Node>,
+    pub groups: Vec<Group>,
     pub root: Option<usize>,
     pub max_w: f64,
     pub max_h: f64,
@@ -108,8 +140,88 @@ impl MindMapData {
                 }
             }
         }
+        // Resolve groups: member ids -> indices. Empty groups and groups
+        // unreachable from any root group (cycles, dangling references) are
+        // dropped; the survivors form a forest.
+        let mut groups: Vec<Group> = Vec::new();
+        let mut raw_grp_ids: Vec<Vec<String>> = Vec::new();
+        for gf in &map.groups {
+            let mut cards: Vec<usize> = gf.cards.iter().filter_map(|c| id_of(&nodes, c)).collect();
+            cards.sort_unstable();
+            cards.dedup();
+            raw_grp_ids.push(gf.groups.clone());
+            groups.push(Group {
+                id: gf.id.clone(),
+                title: gf.title.clone(),
+                cards,
+                groups: Vec::new(),
+                color: gf.color.clone(),
+            });
+        }
+        for (i, ids) in raw_grp_ids.iter().enumerate() {
+            let mut grps: Vec<usize> = ids
+                .iter()
+                .filter_map(|c| groups.iter().position(|g| g.id == *c))
+                .collect();
+            grps.sort_unstable();
+            grps.dedup();
+            grps.retain(|&x| x != i);
+            groups[i].groups = grps;
+        }
+        let mut remove = vec![false; groups.len()];
+        for (i, g) in groups.iter().enumerate() {
+            if g.cards.is_empty() && g.groups.is_empty() {
+                remove[i] = true;
+            }
+        }
+        // Reachability from groups no other group references (computed on the
+        // RAW references, so a self-reference alone still marks a group as
+        // non-root): anything unreachable is part of a cycle and gets dropped.
+        let mut is_child = vec![false; groups.len()];
+        for ids in &raw_grp_ids {
+            for c in ids {
+                if let Some(ci) = groups.iter().position(|g| g.id == *c) {
+                    is_child[ci] = true;
+                }
+            }
+        }
+        let mut reachable = vec![false; groups.len()];
+        let mut stack: Vec<usize> = (0..groups.len()).filter(|&i| !is_child[i]).collect();
+        while let Some(gi) = stack.pop() {
+            if reachable[gi] {
+                continue;
+            }
+            reachable[gi] = true;
+            for &c in &groups[gi].groups {
+                if c < groups.len() {
+                    stack.push(c);
+                }
+            }
+        }
+        for (i, r) in reachable.iter().enumerate() {
+            if !r {
+                remove[i] = true;
+            }
+        }
+        let mut old_to_new = vec![usize::MAX; groups.len()];
+        let mut kept = Vec::new();
+        for (i, g) in groups.drain(..).enumerate() {
+            if remove[i] {
+                continue;
+            }
+            old_to_new[i] = kept.len();
+            kept.push(g);
+        }
+        for g in &mut kept {
+            g.groups = g
+                .groups
+                .iter()
+                .filter_map(|&c| (old_to_new[c] != usize::MAX).then_some(old_to_new[c]))
+                .collect();
+        }
         let mut data = MindMapData {
             nodes,
+            groups: kept,
             root,
             max_w: 0.0,
             max_h: 0.0,
@@ -129,6 +241,12 @@ impl MindMapData {
         for n in &data.nodes {
             max_w = max_w.max(n.pos.x + n.size.x);
             max_h = max_h.max(n.pos.y + n.size.y);
+        }
+        for gi in 0..data.groups.len() {
+            if let Some((p, s)) = group_bounds(&data.groups, &data.nodes, gi, GROUP_PAD) {
+                max_w = max_w.max(p.x + s.x);
+                max_h = max_h.max(p.y + s.y);
+            }
         }
         data.max_w = max_w + CANVAS_MARGIN;
         data.max_h = max_h + CANVAS_MARGIN;
@@ -183,6 +301,173 @@ impl MindMapData {
             .iter()
             .enumerate()
             .filter_map(|(i, n)| n.parent.map(|p| (p, i)))
+    }
+
+    /// Index of the group that directly contains `gi`, if any. Creation order
+    /// guarantees a parent always has a lower index than its children.
+    pub fn group_parent(&self, gi: usize) -> Option<usize> {
+        self.groups.iter().position(|g| g.groups.contains(&gi))
+    }
+
+    /// Index of the group directly containing card `ci`, if any.
+    pub fn group_of_card(&self, ci: usize) -> Option<usize> {
+        self.groups.iter().position(|g| g.cards.contains(&ci))
+    }
+
+    /// Whether `from` transitively contains `to` (same group excluded).
+    pub fn group_reaches(&self, from: usize, to: usize) -> bool {
+        let mut visited = vec![false; self.groups.len()];
+        let mut stack = vec![from];
+        while let Some(g) = stack.pop() {
+            if g >= visited.len() || visited[g] {
+                continue;
+            }
+            visited[g] = true;
+            if g == to {
+                return true;
+            }
+            stack.extend(self.groups[g].groups.iter().copied());
+        }
+        false
+    }
+
+    /// Turn a raw selection into group members: cards that already belong to
+    /// a group stay there and the group itself is nested instead (so Ctrl+G
+    /// over cards of existing groups wraps the groups, never pulls the cards
+    /// out); groups already transitively contained in another selected group
+    /// are dropped (keeps the containment graph a forest).
+    pub fn fold_selection(&self, cards: &[usize], grps: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let mut out_cards: Vec<usize> = Vec::new();
+        let mut out_grps: Vec<usize> = Vec::new();
+        for &c in cards {
+            match self.group_of_card(c) {
+                None => out_cards.push(c),
+                Some(gi) => {
+                    if !out_grps.contains(&gi) {
+                        out_grps.push(gi);
+                    }
+                }
+            }
+        }
+        for &gi in grps {
+            if !out_grps.contains(&gi) {
+                out_grps.push(gi);
+            }
+        }
+        out_cards.sort_unstable();
+        out_cards.dedup();
+        out_grps.sort_unstable();
+        out_grps.dedup();
+        let kept: Vec<usize> = out_grps
+            .iter()
+            .copied()
+            .filter(|&gi| !out_grps.iter().any(|&o| o != gi && self.group_reaches(o, gi)))
+            .collect();
+        out_grps = kept;
+        (out_cards, out_grps)
+    }
+
+    /// Remove groups left with no members (cascading: a group whose only
+    /// members were removed groups dies too). Group indices are renumbered;
+    /// node indices are untouched.
+    pub fn prune_empty_groups(&mut self) {
+        let mut removed = vec![false; self.groups.len()];
+        loop {
+            let dead: Vec<usize> = (0..self.groups.len())
+                .filter(|&i| {
+                    !removed[i] && self.groups[i].cards.is_empty() && self.groups[i].groups.is_empty()
+                })
+                .collect();
+            if dead.is_empty() {
+                break;
+            }
+            for &i in &dead {
+                removed[i] = true;
+            }
+            for g in &mut self.groups {
+                g.groups.retain(|&c| !removed[c]);
+            }
+        }
+        let mut old_to_new = vec![usize::MAX; self.groups.len()];
+        let mut kept = Vec::new();
+        for (i, g) in self.groups.drain(..).enumerate() {
+            if removed[i] {
+                continue;
+            }
+            old_to_new[i] = kept.len();
+            kept.push(g);
+        }
+        for g in &mut kept {
+            g.groups = g
+                .groups
+                .iter()
+                .filter_map(|&c| (old_to_new[c] != usize::MAX).then_some(old_to_new[c]))
+                .collect();
+        }
+        self.groups = kept;
+    }
+}
+
+/// Bounding box of a group's members (member cards plus nested groups'
+/// frames — each nested frame expanded by `pad` — recursively), excluding
+/// the outer frame padding. None when empty.
+pub(crate) fn group_bounds(
+    groups: &[Group],
+    nodes: &[Node],
+    gi: usize,
+    pad: f64,
+) -> Option<(DVec2, DVec2)> {
+    let mut bbox: Option<(DVec2, DVec2)> = None;
+    collect_group_bounds(
+        groups,
+        nodes,
+        gi,
+        pad,
+        &mut vec![false; groups.len()],
+        &mut bbox,
+    );
+    bbox
+}
+
+fn collect_group_bounds(
+    groups: &[Group],
+    nodes: &[Node],
+    gi: usize,
+    pad: f64,
+    visited: &mut [bool],
+    bbox: &mut Option<(DVec2, DVec2)>,
+) {
+    if gi >= visited.len() || visited[gi] {
+        return;
+    }
+    visited[gi] = true;
+    let g = &groups[gi];
+    for &c in &g.cards {
+        if let Some(n) = nodes.get(c) {
+            expand_bbox(bbox, n.pos.x, n.pos.y, n.pos.x + n.size.x, n.pos.y + n.size.y);
+        }
+    }
+    for &gi2 in &g.groups {
+        let mut child: Option<(DVec2, DVec2)> = None;
+        collect_group_bounds(groups, nodes, gi2, pad, visited, &mut child);
+        // A nested group contributes its frame (member bbox + pad), so the
+        // outer border sits a full pad clear of the inner one.
+        if let Some((p, s)) = child {
+            expand_bbox(bbox, p.x - pad, p.y - pad, p.x + s.x + pad, p.y + s.y + pad);
+        }
+    }
+}
+
+fn expand_bbox(bbox: &mut Option<(DVec2, DVec2)>, x0: f64, y0: f64, x1: f64, y1: f64) {
+    if let Some((p, s)) = bbox {
+        let (maxx, maxy) = (p.x + s.x, p.y + s.y);
+        let (minx, miny) = (p.x.min(x0), p.y.min(y0));
+        p.x = minx;
+        p.y = miny;
+        s.x = maxx.max(x1) - minx;
+        s.y = maxy.max(y1) - miny;
+    } else {
+        *bbox = Some((dvec2(x0, y0), dvec2(x1 - x0, y1 - y0)));
     }
 }
 
@@ -269,6 +554,32 @@ pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
             }
         }
         map.nodes.retain(|n| !is_removed(&n.id));
+        // Groups: prune dead card members, then cascade-drop groups left
+        // empty (removing a group never dangles anything: membership is
+        // stored on the container, so orphaned groups just become top-level).
+        for g in &mut map.groups {
+            g.cards.retain(|c| !is_removed(c));
+        }
+        let mut removed_groups: Vec<String> = Vec::new();
+        loop {
+            let dead: Vec<String> = map
+                .groups
+                .iter()
+                .filter(|g| {
+                    g.cards.is_empty() && g.groups.is_empty() && !removed_groups.contains(&g.id)
+                })
+                .map(|g| g.id.clone())
+                .collect();
+            if dead.is_empty() {
+                break;
+            }
+            removed_groups.extend(dead);
+            let is_dead = |id: &str| removed_groups.iter().any(|r| r == id);
+            for g in &mut map.groups {
+                g.groups.retain(|c| !is_dead(c));
+            }
+        }
+        map.groups.retain(|g| !removed_groups.contains(&g.id));
         if let Ok(out) = serde_json::to_string_pretty(&map) {
             std::fs::write(&p, out).ok();
         }
@@ -288,6 +599,23 @@ pub(crate) fn card_title(node: &Node) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| node.title.clone())
+}
+
+/// "#rrggbb" -> RGBA with the frame/glow shader alpha (0.45), so every color
+/// path uses the same stroke weight. Invalid input -> None (caller falls back
+/// to the shader's default color).
+pub(crate) fn parse_hex_color(s: &str) -> Option<[f32; 4]> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let c = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    Some([
+        c(0)? as f32 / 255.0,
+        c(2)? as f32 / 255.0,
+        c(4)? as f32 / 255.0,
+        0.45,
+    ])
 }
 
 /// Rename a card's body file to `new_name` (extension defaults to .md when
@@ -368,10 +696,22 @@ pub(crate) fn write_map(base: &Path, data: &MindMapData, pan: DVec2, zoom: f64, 
             h: Some(n.size.y),
         })
         .collect();
+    let groups = data
+        .groups
+        .iter()
+        .map(|g| GroupFile {
+            id: g.id.clone(),
+            title: g.title.clone(),
+            cards: g.cards.iter().map(|&c| data.nodes[c].id.clone()).collect(),
+            groups: g.groups.iter().map(|&gi| data.groups[gi].id.clone()).collect(),
+            color: g.color.clone(),
+        })
+        .collect();
     let map = MapFile {
         pan: Some([pan.x, pan.y]),
         zoom: Some(zoom),
         nodes,
+        groups,
     };
     if let Ok(json) = serde_json::to_string_pretty(&map) {
         if let Err(e) = std::fs::write(base.join(map_file), json) {
@@ -583,6 +923,242 @@ mod tests {
         // untouched map unchanged
         let json = std::fs::read_to_string(dir.join("maps/other.json")).unwrap();
         assert!(json.contains("cards/x.md"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn groups_persist_with_nesting_across_write_reload() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test8-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let json = r#"{"nodes":[
+            {"id":"root","title":"R","path":"root.md","children":null},
+            {"id":"a","title":"","path":"a.md","children":null},
+            {"id":"b","title":"","path":"b.md","children":null},
+            {"id":"c","title":"","path":"c.md","children":null}
+        ],"groups":[
+            {"id":"g1","title":"组 1","cards":["a","b"],"groups":[]},
+            {"id":"g2","title":"组 2","cards":["c"],"groups":["g1"]}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(data.groups.len(), 2);
+        assert_eq!(data.groups[0].cards, vec![1, 2]);
+        assert!(data.groups[0].groups.is_empty());
+        assert_eq!(data.groups[1].cards, vec![3]);
+        assert_eq!(data.groups[1].groups, vec![0]);
+        assert_eq!(data.group_parent(0), Some(1));
+        assert_eq!(data.group_of_card(2), Some(0));
+        // a leaves g1 -> g1 keeps b; round-trip through write_map
+        data.groups[0].cards.retain(|&c| c != 1);
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/map.json");
+        let again = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(again.groups[0].cards, vec![2]);
+        assert_eq!(again.groups[1].groups, vec![0]);
+        assert_eq!(again.groups[1].cards, vec![3]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_drops_empty_dangling_and_cyclic_groups() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test9-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["root.md", "a.md", "b.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let json = r#"{"nodes":[
+            {"id":"root","title":"","path":"root.md","children":null},
+            {"id":"a","title":"","path":"a.md","children":null},
+            {"id":"b","title":"","path":"b.md","children":null}
+        ],"groups":[
+            {"id":"g1","title":"ok","cards":["a","b"],"groups":[]},
+            {"id":"g2","title":"dangling","cards":["ghost"],"groups":[]},
+            {"id":"g3","title":"empty","cards":[],"groups":[]},
+            {"id":"g4","title":"cycle-a","cards":["root"],"groups":["g5"]},
+            {"id":"g5","title":"cycle-b","cards":["root"],"groups":["g4"]},
+            {"id":"g6","title":"selfref","cards":["root"],"groups":["g6"]}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(data.groups.len(), 1);
+        assert_eq!(data.groups[0].id, "g1");
+        assert_eq!(data.groups[0].cards, vec![1, 2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_dir_nodes_prunes_groups_cascading() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test10-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        let json = r#"{"nodes":[
+            {"id":"root","title":"R","path":"cards/root.md","children":null},
+            {"id":"A","title":"A","path":"cards/docs/a.md","children":null},
+            {"id":"B","title":"B","path":"cards/b.md","children":null}
+        ],"groups":[
+            {"id":"g1","title":"keeps B","cards":["A","B"],"groups":[]},
+            {"id":"g2","title":"chain top","cards":[],"groups":["g3"]},
+            {"id":"g3","title":"chain mid","cards":["A"],"groups":["g4"]},
+            {"id":"g4","title":"chain leaf","cards":["B"],"groups":[]}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        remove_dir_nodes(&dir, "cards/docs/");
+        // A removed: g3 loses its only card but keeps g4 -> survives; g2's
+        // card list was empty all along. Nothing cascades; load should work.
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(data.groups.len(), 4);
+        assert_eq!(data.groups[0].cards, vec![1], "g1 keeps B");
+        let by_id = |id: &str| data.groups.iter().position(|g| g.id == id).unwrap();
+        let (g2, g3, g4) = (by_id("g2"), by_id("g3"), by_id("g4"));
+        assert_eq!(data.groups[g2].groups, vec![g3]);
+        assert_eq!(data.groups[g3].cards, Vec::<usize>::new());
+        assert_eq!(data.groups[g3].groups, vec![g4]);
+        assert_eq!(data.groups[g4].cards, vec![1]);
+        // cascade: drop B too -> g1 empty, g4 empty -> g3 loses g4 AND its
+        // cards -> g3 empty -> g2 loses g3 -> g2 empty. All groups gone.
+        std::fs::remove_file(dir.join("cards/b.md")).ok();
+        let json = std::fs::read_to_string(dir.join("maps/map.json")).unwrap();
+        let mut map: MapFile = serde_json::from_str(&json).unwrap();
+        for n in &mut map.nodes {
+            if n.id == "B" {
+                n.path = "cards/docs/b.md".into();
+            }
+        }
+        std::fs::write(dir.join("maps/map.json"), serde_json::to_string_pretty(&map).unwrap()).unwrap();
+        remove_dir_nodes(&dir, "cards/docs/");
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert!(data.groups.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fold_selection_nests_cards_into_their_groups() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test11-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["root.md", "a.md", "b.md", "c.md", "d.md", "e.md", "f.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        // nodes: root(0) a(1) b(2) c(3) d(4) e(5) f(6, ungrouped)
+        // g1={a,b} g2={c,d} g3={e, groups:[g2]}
+        let json = r#"{"nodes":[
+            {"id":"root","title":"","path":"root.md","children":null},
+            {"id":"a","title":"","path":"a.md","children":null},
+            {"id":"b","title":"","path":"b.md","children":null},
+            {"id":"c","title":"","path":"c.md","children":null},
+            {"id":"d","title":"","path":"d.md","children":null},
+            {"id":"e","title":"","path":"e.md","children":null},
+            {"id":"f","title":"","path":"f.md","children":null}
+        ],"groups":[
+            {"id":"g1","title":"g1","cards":["a","b"],"groups":[]},
+            {"id":"g2","title":"g2","cards":["c","d"],"groups":[]},
+            {"id":"g3","title":"g3","cards":["e"],"groups":["g2"]}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let (g1, g2, g3) = (0, 1, 2);
+        // all cards of two groups -> the groups are nested, cards stay put
+        let (cards, grps) = data.fold_selection(&[1, 2, 3, 4], &[]);
+        assert!(cards.is_empty());
+        assert_eq!(grps, vec![g1, g2]);
+        // one ungrouped card + one card of g1
+        let (cards, grps) = data.fold_selection(&[6, 1], &[]);
+        assert_eq!(cards, vec![6]);
+        assert_eq!(grps, vec![g1]);
+        // all cards of a single group -> pure wrap
+        let (cards, grps) = data.fold_selection(&[1, 2], &[]);
+        assert!(cards.is_empty());
+        assert_eq!(grps, vec![g1]);
+        // g2's cards + selected g3: g2 is dropped (g3 already contains it)
+        let (cards, grps) = data.fold_selection(&[3, 4], &[g3]);
+        assert!(cards.is_empty());
+        assert_eq!(grps, vec![g3]);
+        // plain ungrouped selection is untouched
+        let (cards, grps) = data.fold_selection(&[6], &[]);
+        assert_eq!(cards, vec![6]);
+        assert!(grps.is_empty());
+        // folded groups keep their members (no side effects)
+        assert_eq!(data.groups[g1].cards, vec![1, 2]);
+        assert_eq!(data.groups[g2].cards, vec![3, 4]);
+        assert_eq!(data.groups[g3].groups, vec![g2]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn group_bounds_pads_nested_group_frames() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test12-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["root.md", "c.md", "d.md", "e.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        // g2={c,d} g3={e, groups:[g2]}
+        let json = r#"{"nodes":[
+            {"id":"root","title":"","path":"root.md","children":null},
+            {"id":"c","title":"","path":"c.md","children":null},
+            {"id":"d","title":"","path":"d.md","children":null},
+            {"id":"e","title":"","path":"e.md","children":null}
+        ],"groups":[
+            {"id":"g2","title":"inner","cards":["c","d"],"groups":[]},
+            {"id":"g3","title":"outer","cards":["e"],"groups":["g2"]}
+        ]}"#;
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        let data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let pad = GROUP_PAD;
+        // inner group's bounds: raw member-card bbox only
+        let mut b2: Option<(DVec2, DVec2)> = None;
+        for &ci in &data.groups[0].cards {
+            let n = &data.nodes[ci];
+            expand_bbox(&mut b2, n.pos.x, n.pos.y, n.pos.x + n.size.x, n.pos.y + n.size.y);
+        }
+        assert_eq!(group_bounds(&data.groups, &data.nodes, 0, pad), b2);
+        // outer group's bounds: inner frame (bbox + pad) ∪ its own cards
+        let mut b3: Option<(DVec2, DVec2)> = None;
+        for &ci in &data.groups[1].cards {
+            let n = &data.nodes[ci];
+            expand_bbox(&mut b3, n.pos.x, n.pos.y, n.pos.x + n.size.x, n.pos.y + n.size.y);
+        }
+        if let Some((p, s)) = b2 {
+            expand_bbox(&mut b3, p.x - pad, p.y - pad, p.x + s.x + pad, p.y + s.y + pad);
+        }
+        assert_eq!(group_bounds(&data.groups, &data.nodes, 1, pad), b3);
+        // the outer frame clears the inner one by a full pad on every side
+        let (op, os) = group_bounds(&data.groups, &data.nodes, 1, pad).unwrap();
+        let (ip, is) = b2.unwrap();
+        assert!(op.x <= ip.x - pad && op.x + os.x >= ip.x + is.x + pad);
+        assert!(op.y <= ip.y - pad && op.y + os.y >= ip.y + is.y + pad);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn group_color_persists_and_parses() {
+        // parse_hex_color: valid + invalid
+        let c = parse_hex_color("#7d8bd4").unwrap();
+        assert!((c[0] - 0.4902).abs() < 1e-3 && (c[1] - 0.5451).abs() < 1e-3);
+        assert!((c[2] - 0.8314).abs() < 1e-3 && (c[3] - 0.45).abs() < 1e-6);
+        assert!(parse_hex_color("#xyz123").is_none());
+        assert!(parse_hex_color("7d8bd4").is_none());
+        assert!(parse_hex_color("#7d8bd").is_none());
+        // round-trip through write/load
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-test13-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["root.md", "a.md", "b.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"root","title":"","path":"root.md","children":null},
+                {"id":"a","title":"","path":"a.md","children":null},
+                {"id":"b","title":"","path":"b.md","children":null}
+            ],"groups":[{"id":"g1","title":"g1","cards":["a","b"],"groups":[]}]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(data.groups[0].color, None);
+        data.groups[0].color = Some("#ff0000".into());
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/map.json");
+        let again = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        assert_eq!(again.groups[0].color.as_deref(), Some("#ff0000"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

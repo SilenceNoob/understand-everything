@@ -39,6 +39,17 @@ const MM_H: f64 = 150.0;
 const MM_MARGIN: f64 = 12.0;
 const MM_PAD: f64 = 8.0;
 
+// Group color picker: preset swatches (5x2 grid) in a popup anchored below
+// the group's title bar. Colors tuned for the dark theme.
+const GROUP_PRESET_COLORS: [&str; 10] = [
+    "#7d8bd4", "#61afef", "#56b6c2", "#98c379", "#e5c07b",
+    "#d19a66", "#e06c75", "#c678dd", "#abb2bf", "#e6e9f0",
+];
+const POPUP_COLS: f64 = 5.0;
+const POPUP_SWATCH: f64 = 26.0;
+const POPUP_GAP: f64 = 8.0;
+const POPUP_PAD: f64 = 10.0;
+
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 pub struct DrawEdge {
@@ -279,6 +290,39 @@ script_mod! {
         }
     }
 
+    // Title-bar widget for group frames. Transparent: the colored bar
+    // behind it is drawn manually (per-group color), so no instance-level
+    // widget uniform state is involved. The color button is a plain tinted
+    // icon drawn manually too (hit-tested via color_button_rect).
+    let GroupTemplate = mod.widgets.RoundedView{
+        height: 24
+        flow: Right
+        align: Align{y: 0.5}
+        spacing: 6
+        padding: Inset{left: 10 right: 8}
+        title_box := mod.widgets.View{
+            width: Fill
+            height: Fit
+            title := mod.widgets.Label{
+                width: Fill
+                height: Fit
+                text: ""
+                draw_text.text_style.font_size: 12.0
+                draw_text.color: #e6e9f0
+            }
+        }
+        title_edit_box := mod.widgets.View{
+            width: Fill
+            height: Fit
+            visible: false
+            title_edit := mod.widgets.TextInput{
+                width: Fill
+                height: Fit
+                empty_text: ""
+            }
+        }
+    }
+
     let DetailTemplate = mod.widgets.View{
         width: Fill
         height: Fill
@@ -352,7 +396,11 @@ script_mod! {
         draw_crosshair +: {
             color: #ffffff40
         }
+        draw_grp_icon +: {
+            svg: crate_resource("self:resources/palette.svg")
+        }
         card := CardTemplate{}
+        group := GroupTemplate{}
         detail := DetailTemplate{}
     }
 }
@@ -404,6 +452,10 @@ pub struct MindMap {
     draw_mm_view: DrawColor,
     #[live]
     draw_crosshair: DrawColor,
+    /// Palette icon for the per-group color button; the SVG's own white
+    /// strokes render as-is (the color uniform keeps its -1 default).
+    #[live]
+    draw_grp_icon: DrawSvg,
     #[rust]
     area: Area,
 
@@ -482,6 +534,39 @@ pub struct MindMap {
     resize_card: Option<ResizeDrag>,
     #[rust]
     editing_card: Option<usize>,
+    /// In-progress group drag: translating the group moves its member cards
+    /// and every nested group's cards.
+    #[rust]
+    drag_group: Option<usize>,
+    /// Groups selected via their title bar (for Ctrl+G nesting and the
+    /// selection highlight); `selected` holds their member cards.
+    #[rust]
+    selected_groups: Vec<usize>,
+    /// Group whose title is being renamed (TextInput shown on the title bar).
+    #[rust]
+    editing_group: Option<usize>,
+    /// Lazily-created group title widgets, keyed by group index; entries must
+    /// stay aligned with `data.groups` (rebuilt on any structural change).
+    #[rust]
+    group_refs: Vec<Option<WidgetRef>>,
+    /// Per-group frame draws (the DrawMarquee border shader), one per group.
+    #[rust]
+    group_draws: Vec<DrawMarquee>,
+    /// Group whose color picker popup is open; None = closed. The popup is
+    /// drawn in screen space (main turtle) next to the group's title bar.
+    #[rust]
+    color_popup: Option<usize>,
+    /// Group whose color button the pointer hovers (manual hover tracking
+    /// for the drawn icon button, redrawn on change).
+    #[rust]
+    hover_color_btn: Option<usize>,
+    /// Popup panel rect (window coords), cached on the last draw pass for
+    /// swatch hit-testing.
+    #[rust]
+    popup_rect: Rect,
+    /// Shared draw for the popup panel and its swatches.
+    #[rust]
+    popup_draw: Option<DrawMarquee>,
 
     // Minimap: panel rect in window coords plus the world->minimap map,
     // cached on the last draw pass for event hit-testing and back-conversion.
@@ -502,6 +587,8 @@ pub struct MindMap {
 
     #[rust]
     card_template: Option<ScriptObjectRef>,
+    #[rust]
+    group_template: Option<ScriptObjectRef>,
     #[rust]
     detail_template: Option<ScriptObjectRef>,
 
@@ -532,12 +619,21 @@ impl WidgetNode for MindMap {
                 visit(LiveId(i as u64 + 1), card.clone());
             }
         }
+        let base = self.cards.len() as u64 + 1;
+        for (i, g) in self.group_refs.iter().enumerate() {
+            if let Some(g) = g {
+                visit(LiveId(base + i as u64 + 1), g.clone());
+            }
+        }
     }
 
     fn find_widgets_from_point(&self, cx: &Cx, point: DVec2, found: &mut dyn FnMut(&WidgetRef)) {
         let local = self.screen_to_world(point);
         for card in self.cards.iter().flatten() {
             card.find_widgets_from_point(cx, local, found);
+        }
+        for g in self.group_refs.iter().flatten() {
+            g.find_widgets_from_point(cx, local, found);
         }
     }
 }
@@ -561,6 +657,8 @@ impl ScriptHook for MindMap {
                             let template_ref = vm.bx.heap.new_object_ref(template_obj);
                             if id == live_id!(card) {
                                 self.card_template = Some(template_ref);
+                            } else if id == live_id!(group) {
+                                self.group_template = Some(template_ref);
                             } else if id == live_id!(detail) {
                                 self.detail_template = Some(template_ref);
                             }
@@ -640,6 +738,8 @@ impl Widget for MindMap {
 
                 self.draw_edges(cx2d, local_view);
 
+                self.draw_groups(cx2d, scope, local_view);
+
                 self.draw_cards(cx2d, scope, local_view);
 
                 // right-button marquee, drawn on top of the cards
@@ -666,6 +766,11 @@ impl Widget for MindMap {
         // canvas pans/zooms. The pushed clip keeps the viewport indicator and
         // card rects inside the panel.
         self.draw_minimap(cx, view);
+
+        // Group color picker popup, anchored next to the title bar.
+        if self.color_popup.is_some() {
+            self.draw_color_popup(cx, view);
+        }
 
         // Center crosshair while WASD/QE navigation keys are held, showing
         // where a Space press would select (same center as select_view_center).
@@ -710,6 +815,9 @@ impl Widget for MindMap {
         if !on_mm {
             for card in self.cards.iter().flatten() {
                 card.handle_event(cx, card_event, scope);
+            }
+            for g in self.group_refs.iter().flatten() {
+                g.handle_event(cx, card_event, scope);
             }
         }
 
@@ -819,20 +927,52 @@ impl MindMap {
                 }
             }
         };
+        // Track the drawn color-button hover (world coords, remapped event);
+        // MouseLeave clears it.
         match local {
             Event::MouseMove(e) => {
                 reset_visible_buttons(cx, Some(e.abs));
+                self.set_color_btn_hover(cx, self.hit_color_button(e.abs));
             }
             Event::MouseLeave(_) => {
                 reset_visible_buttons(cx, None);
+                self.set_color_btn_hover(cx, None);
             }
             _ => {}
         }
     }
 
+    /// Track the hovered color button; redraws only on state change.
+    fn set_color_btn_hover(&mut self, cx: &mut Cx, gi: Option<usize>) {
+        if self.hover_color_btn != gi {
+            self.hover_color_btn = gi;
+            self.redraw(cx);
+        }
+    }
+
     /// Primary-button press on the canvas: minimap drag, card resize/drag,
-    /// double-click to open the detail, or background pan.
+    /// group title drag, double-click to open the detail, or background pan.
     fn handle_finger_down(&mut self, cx: &mut Cx, fe: &FingerDownEvent, child_grabbed: bool) {
+        // Any canvas press commits an open group rename (a click inside the
+        // rename TextInput is captured and skipped).
+        if self.editing_group.is_some() && !child_grabbed {
+            self.commit_group_edit(cx);
+        }
+        // Color picker popup: a press on a swatch applies the color; any
+        // other press closes it. Either way the press is consumed.
+        if let Some(gi) = self.color_popup {
+            if let Some(i) = (0..GROUP_PRESET_COLORS.len())
+                .find(|&i| self.popup_swatch_rect(i).contains(fe.abs))
+            {
+                if let Some(data) = &mut self.data {
+                    data.groups[gi].color = Some(GROUP_PRESET_COLORS[i].to_string());
+                    self.save_map();
+                }
+            }
+            self.color_popup = None;
+            self.redraw(cx);
+            return;
+        }
         // Panels (file/refs/float/dock) own their presses; the canvas must
         // not start a pan/drag under them.
         if self.detail_open.is_none() && !crate::util::over_any_panel(fe.abs) {
@@ -852,6 +992,7 @@ impl MindMap {
                     // selected card, so dragging moves them all
                     if !self.selected.contains(&i) {
                         self.selected = vec![i];
+                        self.selected_groups.clear();
                         self.reanchor_cards(cx);
                     }
                     if fe.tap_count >= 2 {
@@ -866,6 +1007,36 @@ impl MindMap {
                         self.drag_last = world;
                     }
                     self.redraw(cx);
+                } else if let Some(gi) = self.hit_color_button(world) {
+                    if self.editing_card.is_none() {
+                        let cards = {
+                            let g = &self.data.as_ref().unwrap().groups[gi];
+                            g.cards.clone()
+                        };
+                        self.selected = cards;
+                        self.selected_groups = vec![gi];
+                        self.reanchor_cards(cx);
+                        self.hover_color_btn = None;
+                        self.color_popup = Some(gi);
+                    }
+                    self.redraw(cx);
+                } else if let Some(gi) = self.hit_group_title(world) {
+                    if self.editing_card.is_none() {
+                        let cards = {
+                            let g = &self.data.as_ref().unwrap().groups[gi];
+                            g.cards.clone()
+                        };
+                        self.selected = cards;
+                        self.selected_groups = vec![gi];
+                        self.reanchor_cards(cx);
+                        if fe.tap_count >= 2 {
+                            self.enter_group_edit(cx, gi);
+                        } else if !child_grabbed {
+                            self.drag_group = Some(gi);
+                            self.drag_last = world;
+                        }
+                    }
+                    self.redraw(cx);
                 } else {
                     self.cancel_zoom_anim(cx);
                     self.panning = true;
@@ -878,6 +1049,14 @@ impl MindMap {
     /// Right-button press: start a marquee selection, skipped over any panel
     /// (file/refs/float), which use right-clicks for themselves.
     fn handle_finger_down_secondary(&mut self, cx: &mut Cx, fe: &FingerDownEvent) {
+        if self.editing_group.is_some() {
+            self.commit_group_edit(cx);
+        }
+        if self.color_popup.is_some() {
+            self.color_popup = None;
+            self.redraw(cx);
+            return;
+        }
         if self.detail_open.is_none()
             && self.editing_card.is_none()
             && !self.minimap_rect.contains(fe.abs)
@@ -927,6 +1106,11 @@ impl MindMap {
                 self.drag_last = world;
             }
             self.redraw(cx);
+        } else if let Some(gi) = self.drag_group {
+            let delta = world - self.drag_last;
+            self.move_group(gi, delta);
+            self.drag_last = world;
+            self.redraw(cx);
         } else if self.panning {
             self.pan += fe.abs - self.pan_last;
             self.pan_target = self.pan;
@@ -941,6 +1125,7 @@ impl MindMap {
     fn handle_finger_up(&mut self, cx: &mut Cx) {
         self.panning = false;
         self.drag_card = None;
+        self.drag_group = None;
         self.resize_card = None;
         self.mm_dragging = false;
         self.rebuild_targets();
@@ -952,10 +1137,12 @@ impl MindMap {
             };
             if rect.size.x < 4.0 && rect.size.y < 4.0 {
                 self.selected.clear();
+                self.selected_groups.clear();
             } else if let Some(data) = &self.data {
                 self.selected = (0..data.nodes.len())
                     .filter(|&i| rect.intersects(self.card_rect(i)))
                     .collect();
+                self.selected_groups.clear();
             }
             self.reanchor_cards(cx);
             self.redraw(cx);
@@ -1005,9 +1192,15 @@ impl MindMap {
             self.data = None;
             self.cards.clear();
             self.edges.clear();
+            self.group_refs.clear();
+            self.group_draws.clear();
+            self.color_popup = None;
+            self.hover_color_btn = None;
             self.selected.clear();
+            self.selected_groups.clear();
             self.marquee = None;
             self.editing_card = None;
+            self.editing_group = None;
             self.detail_open = None;
             self.mm_dragging = false;
             self.cancel_zoom_anim(cx);
@@ -1027,12 +1220,17 @@ impl MindMap {
         self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
+        self.rebuild_group_widgets(cx);
+        self.popup_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         // Per-map transient state must not leak across switches.
         self.selected.clear();
+        self.selected_groups.clear();
         self.marquee = None;
         self.editing_card = None;
+        self.editing_group = None;
         self.detail_open = None;
         self.drag_card = None;
+        self.drag_group = None;
         self.resize_card = None;
         self.mm_dragging = false;
         self.arrow_move = 0;
@@ -1089,6 +1287,11 @@ impl MindMap {
     fn draw_cards(&mut self, cx2d: &mut Cx2d, scope: &mut Scope, local_view: Rect) {
         let compact = self.zoom < COMPACT_ZOOM;
         let n = self.data.as_ref().map(|d| d.nodes.len()).unwrap_or(0);
+        // draw_groups may have left a group color in the shared highlight
+        // draw; cards use the default indigo.
+        if let Some(hl) = &mut self.highlight {
+            hl.draw_vars.set_uniform(cx2d, id!(color), &[0.49, 0.55, 0.83, 0.45]);
+        }
         for i in 0..n {
             let r = self.card_rect(i);
             if !local_view.intersects(r) {
@@ -1128,6 +1331,342 @@ impl MindMap {
                 },
             );
         }
+    }
+
+    /// Group frames: colored translucent border (DrawMarquee shader) + title
+    /// bar, drawn under the cards. The title strip lives in the padding above
+    /// the member bbox, so it never covers a member card.
+    fn draw_groups(&mut self, cx2d: &mut Cx2d, scope: &mut Scope, local_view: Rect) {
+        let n = self.data.as_ref().map(|d| d.groups.len()).unwrap_or(0);
+        for gi in 0..n {
+            let r = self.group_rect(gi);
+            if !local_view.intersects(r) {
+                continue;
+            }
+            let color = self.group_color(gi);
+            if self.selected_groups.contains(&gi) {
+                // same glow treatment as selected cards, tinted to the group
+                if let Some(hl) = &mut self.highlight {
+                    hl.draw_vars.set_uniform(cx2d, id!(color), &color);
+                    hl.draw_abs(
+                        cx2d,
+                        Rect {
+                            pos: r.pos - dvec2(4.0, 4.0),
+                            size: r.size + dvec2(8.0, 8.0),
+                        },
+                    );
+                }
+            }
+            // the frame itself: translucent fill + colored border
+            if let Some(d) = self.group_draws.get_mut(gi) {
+                d.draw_vars.set_uniform(cx2d, id!(color), &color);
+                d.draw_vars.set_uniform(cx2d, id!(fill_alpha), &[0.08]);
+                d.draw_vars.set_uniform(cx2d, id!(width), &[4.0]);
+                d.draw_abs(cx2d, r);
+            }
+            let t = self.group_title_rect(gi);
+            // colored title bar behind the transparent title widget
+            if let Some(d) = self.group_draws.get_mut(gi) {
+                d.draw_vars.set_uniform(cx2d, id!(color), &color);
+                d.draw_vars.set_uniform(cx2d, id!(fill_alpha), &[1.0]);
+                d.draw_vars.set_uniform(cx2d, id!(width), &[1.5]);
+                d.draw_abs(cx2d, t);
+            }
+            let w = self.group_ref(cx2d, gi);
+            let editing = self.editing_group == Some(gi);
+            w.view(cx2d, ids!(title_box)).set_visible(cx2d, !editing);
+            w.view(cx2d, ids!(title_edit_box)).set_visible(cx2d, editing);
+            let _ = w.draw_walk(
+                cx2d,
+                scope,
+                Walk {
+                    abs_pos: Some(t.pos),
+                    width: Size::Fixed(t.size.x),
+                    height: Size::Fixed(t.size.y),
+                    ..Walk::default()
+                },
+            );
+            // color button: soft hover highlight behind a tinted palette icon
+            let btn = self.color_button_rect(gi);
+            if self.hover_color_btn == Some(gi) {
+                if let Some(d) = self.group_draws.get_mut(gi) {
+                    let hr = Rect { pos: btn.pos - dvec2(2.5, 2.5), size: btn.size + dvec2(5.0, 5.0) };
+                    d.draw_vars.set_uniform(cx2d, id!(color), &color);
+                    d.draw_vars.set_uniform(cx2d, id!(fill_alpha), &[0.28]);
+                    d.draw_vars.set_uniform(cx2d, id!(width), &[2.0]);
+                    d.draw_abs(cx2d, hr);
+                }
+            }
+            // fixed white icon (SVG strokes are white; the color uniform
+            // stays at its -1 default so the SVG's own colors render)
+            self.draw_grp_icon.draw_abs(cx2d, btn);
+        }
+    }
+
+    /// The group's frame color as an RGBA uniform (alpha = shader stroke
+    /// alpha); falls back to the script default indigo when unset.
+    fn group_color(&self, gi: usize) -> [f32; 4] {
+        let Some(data) = &self.data else { return [0.49, 0.55, 0.83, 0.45] };
+        data.groups
+            .get(gi)
+            .and_then(|g| g.color.as_deref())
+            .and_then(parse_hex_color)
+            .unwrap_or([0.49, 0.55, 0.83, 0.45])
+    }
+
+    /// Color picker popup: a panel of preset swatches anchored below the
+    /// group's title bar, drawn in screen space (main turtle) so it stays
+    /// readable at any zoom. `popup_rect` is cached for hit-testing.
+    fn draw_color_popup(&mut self, cx: &mut Cx2d, view: Rect) {
+        let Some(gi) = self.color_popup else { return };
+        let t = self.group_title_rect(gi);
+        let tl = t.pos * self.zoom + self.pan;
+        let popup_w = POPUP_PAD * 2.0 + POPUP_COLS * POPUP_SWATCH + (POPUP_COLS - 1.0) * POPUP_GAP;
+        let rows = (GROUP_PRESET_COLORS.len() as f64 / POPUP_COLS).ceil();
+        let popup_h = POPUP_PAD * 2.0 + rows * POPUP_SWATCH + (rows - 1.0) * POPUP_GAP;
+        let mut pos = dvec2(
+            tl.x + t.size.x * self.zoom - popup_w,
+            tl.y + geometry::GROUP_TITLE_H * self.zoom + 8.0,
+        );
+        // keep the panel inside the viewport
+        pos.x = pos.x.clamp(view.pos.x, view.pos.x + view.size.x - popup_w);
+        pos.y = pos.y.clamp(view.pos.y, view.pos.y + view.size.y - popup_h);
+        let panel = Rect { pos, size: dvec2(popup_w, popup_h) };
+        self.popup_rect = panel;
+        // preset swatch rects, precomputed so no borrow of self crosses the
+        // popup_draw borrow below
+        let swatches: Vec<Rect> = (0..GROUP_PRESET_COLORS.len()).map(|i| self.popup_swatch_rect(i)).collect();
+        let Some(d) = &mut self.popup_draw else { return };
+        // panel: solid dark background + soft edge
+        d.draw_vars.set_uniform(cx, id!(color), &[0.16, 0.18, 0.24, 1.0]);
+        d.draw_vars.set_uniform(cx, id!(fill_alpha), &[0.97]);
+        d.draw_vars.set_uniform(cx, id!(width), &[4.0]);
+        d.draw_abs(cx, panel);
+        // preset swatches
+        for (i, hex) in GROUP_PRESET_COLORS.iter().enumerate() {
+            let c = parse_hex_color(hex).unwrap_or([1.0, 1.0, 1.0, 0.45]);
+            d.draw_vars.set_uniform(cx, id!(color), &[c[0], c[1], c[2], 1.0]);
+            d.draw_vars.set_uniform(cx, id!(fill_alpha), &[1.0]);
+            d.draw_vars.set_uniform(cx, id!(width), &[1.0]);
+            d.draw_abs(cx, swatches[i]);
+        }
+    }
+
+    /// Rect (window coords) of the popup swatch at preset index `i`.
+    fn popup_swatch_rect(&self, i: usize) -> Rect {
+        Rect {
+            pos: self.popup_rect.pos
+                + dvec2(
+                    POPUP_PAD + (i as f64 % POPUP_COLS) * (POPUP_SWATCH + POPUP_GAP),
+                    POPUP_PAD + (i as f64 / POPUP_COLS).floor() * (POPUP_SWATCH + POPUP_GAP),
+                ),
+            size: dvec2(POPUP_SWATCH, POPUP_SWATCH),
+        }
+    }
+
+    /// Lazily create the title-bar widget for group `gi` (mirrors card_ref).
+    fn group_ref(&mut self, cx: &mut Cx, gi: usize) -> WidgetRef {
+        if let Some(Some(w)) = self.group_refs.get(gi) {
+            return w.clone();
+        }
+        let Some(t) = &self.group_template else {
+            return WidgetRef::empty();
+        };
+        let value = t.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        let group = self.data.as_ref().unwrap().groups[gi].clone();
+        w.label(cx, ids!(title)).set_text(cx, &group.title);
+        w.text_input(cx, ids!(title_edit)).set_text(cx, &group.title);
+        if self.group_refs.len() <= gi {
+            self.group_refs.resize(gi + 1, None);
+        }
+        self.group_refs[gi] = Some(w.clone());
+        w
+    }
+
+    /// All card indices reachable from group `gi` (its cards + nested
+    /// groups' cards).
+    fn group_subtree_cards(&self, gi: usize) -> Vec<usize> {
+        let Some(data) = &self.data else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut visited = vec![false; data.groups.len()];
+        let mut stack = vec![gi];
+        while let Some(g) = stack.pop() {
+            if g >= visited.len() || visited[g] {
+                continue;
+            }
+            visited[g] = true;
+            let (cards, grps) = { let g = &data.groups[g]; (g.cards.clone(), g.groups.clone()) };
+            out.extend(cards);
+            stack.extend(grps);
+        }
+        out
+    }
+
+    /// Translate group `gi` and everything nested inside it (forest, so no
+    /// card is moved twice).
+    fn move_group(&mut self, gi: usize, delta: DVec2) {
+        let Some(data) = &mut self.data else { return };
+        let mut visited = vec![false; data.groups.len()];
+        let mut stack = vec![gi];
+        while let Some(g) = stack.pop() {
+            if g >= visited.len() || visited[g] {
+                continue;
+            }
+            visited[g] = true;
+            let (cards, grps) = { let g = &data.groups[g]; (g.cards.clone(), g.groups.clone()) };
+            for &c in &cards {
+                if let Some(n) = data.nodes.get_mut(c) {
+                    n.pos += delta;
+                }
+            }
+            stack.extend(grps);
+        }
+    }
+
+    /// Recreate the per-group draw/title state after a structural change
+    /// (group count or indices changed). Any open color popup references a
+    /// stale group index, so it closes too.
+    fn rebuild_group_widgets(&mut self, cx: &mut Cx) {
+        let n = self.data.as_ref().map(|d| d.groups.len()).unwrap_or(0);
+        self.group_draws = (0..n)
+            .map(|_| cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)))
+            .collect();
+        self.group_refs = vec![None; n];
+        self.color_popup = None;
+        self.hover_color_btn = None;
+    }
+
+    /// Ctrl+G: wrap the selected cards and selected groups in a new group.
+    /// Cards that already belong to a group stay there — their group is
+    /// nested into the new one instead (fold_selection), so grouping over
+    /// existing groups' cards wraps those groups rather than flattening them.
+    /// Selected groups are re-parented under the new one. Titles auto-number
+    /// as 组 N.
+    fn group_selected(&mut self, cx: &mut Cx) {
+        let Some(data) = &mut self.data else { return };
+        let (cards, grps) = data.fold_selection(&self.selected, &self.selected_groups);
+        let valid = cards.len() + grps.len() >= 2 || (cards.is_empty() && !grps.is_empty());
+        if !valid {
+            return;
+        }
+        // Selected groups leave their old parents (they nest under the new one).
+        for &gi in &grps {
+            if let Some(p) = data.group_parent(gi) {
+                data.groups[p].groups.retain(|&x| x != gi);
+            }
+        }
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let max_n = data
+            .groups
+            .iter()
+            .filter_map(|g| {
+                let rest = g.title.strip_prefix("组 ")?;
+                rest.parse::<u32>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        data.groups.push(Group {
+            id: format!("g{ms}"),
+            title: format!("组 {}", max_n + 1),
+            cards: cards.clone(),
+            groups: grps,
+            color: None,
+        });
+        data.prune_empty_groups();
+        let new_gi = self.data.as_ref().unwrap().groups.len() - 1;
+        self.selected_groups = vec![new_gi];
+        self.selected = self.group_subtree_cards(new_gi);
+        self.rebuild_group_widgets(cx);
+        self.reanchor_cards(cx);
+        self.save_map();
+        self.redraw(cx);
+    }
+
+    /// Ctrl+Shift+G: dissolve every selected group and every group containing
+    /// a selected card; their members (cards + nested groups) splice into the
+    /// dissolved group's parent.
+    fn ungroup_selected(&mut self, cx: &mut Cx) {
+        let Some(data) = &mut self.data else { return };
+        let mut doomed: Vec<usize> = self.selected_groups.clone();
+        for &c in &self.selected {
+            if let Some(gi) = data.group_of_card(c) {
+                if !doomed.contains(&gi) {
+                    doomed.push(gi);
+                }
+            }
+        }
+        if doomed.is_empty() {
+            return;
+        }
+        // Higher indices first: parents are created before children, so a
+        // dissolved child's members splice up into a still-present parent.
+        doomed.sort_unstable_by(|a, b| b.cmp(a));
+        for &gi in &doomed {
+            let (cards, grps) = { let g = &data.groups[gi]; (g.cards.clone(), g.groups.clone()) };
+            if let Some(p) = data.group_parent(gi) {
+                for c in cards {
+                    if !data.groups[p].cards.contains(&c) {
+                        data.groups[p].cards.push(c);
+                    }
+                }
+                for g2 in grps {
+                    if !data.groups[p].groups.contains(&g2) {
+                        data.groups[p].groups.push(g2);
+                    }
+                }
+            }
+            data.groups.remove(gi);
+            for g in &mut data.groups {
+                for c in &mut g.groups {
+                    if *c > gi {
+                        *c -= 1;
+                    }
+                }
+            }
+        }
+        self.selected_groups.clear();
+        self.rebuild_group_widgets(cx);
+        self.save_map();
+        self.redraw(cx);
+    }
+
+    /// Double-click on a group title: show the rename input.
+    fn enter_group_edit(&mut self, cx: &mut Cx, gi: usize) {
+        if self.editing_group == Some(gi) {
+            return;
+        }
+        if self.editing_card.is_some() {
+            self.commit_edit(cx);
+        }
+        let Some(w) = self.group_refs.get(gi).and_then(|c| c.clone()) else {
+            return;
+        };
+        let title = self.data.as_ref().unwrap().groups[gi].title.clone();
+        w.text_input(cx, ids!(title_edit)).set_text(cx, &title);
+        self.editing_group = Some(gi);
+        self.redraw(cx);
+    }
+
+    /// Commit the open group rename (Enter or any canvas press).
+    fn commit_group_edit(&mut self, cx: &mut Cx) {
+        let Some(gi) = self.editing_group.take() else { return };
+        let Some(w) = self.group_refs.get(gi).and_then(|c| c.clone()) else {
+            return;
+        };
+        let new_title = w.text_input(cx, ids!(title_edit)).text();
+        if let Some(data) = &mut self.data {
+            let title = new_title.trim();
+            if !title.is_empty() {
+                data.groups[gi].title = title.to_string();
+                w.label(cx, ids!(title)).set_text(cx, title);
+            }
+        }
+        self.save_map();
+        self.redraw(cx);
     }
 
     /// the last drawn (highest index) wins — same z-order as `resize_hit`.

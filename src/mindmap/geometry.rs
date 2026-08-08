@@ -1,5 +1,8 @@
 use super::*;
 
+/// Height of the clickable title strip on a group's frame.
+pub(super) const GROUP_TITLE_H: f64 = 24.0;
+
 impl MindMap {
     pub(super) fn card_rect(&self, i: usize) -> Rect {
         let node = &self.data.as_ref().unwrap().nodes[i];
@@ -7,6 +10,70 @@ impl MindMap {
             pos: node.pos,
             size: node.size,
         }
+    }
+
+    /// The group frame: member bbox (cards + nested groups' frames) +
+    /// GROUP_PAD on every side. Not stored — always derived from member
+    /// geometry, so nested borders stay a full pad apart.
+    pub(super) fn group_rect(&self, gi: usize) -> Rect {
+        let Some(data) = &self.data else { return Rect::default() };
+        let (pos, size) = group_bounds(&data.groups, &data.nodes, gi, GROUP_PAD).unwrap_or_default();
+        Rect {
+            pos: pos - dvec2(GROUP_PAD, GROUP_PAD),
+            size: size + dvec2(2.0 * GROUP_PAD, 2.0 * GROUP_PAD),
+        }
+    }
+
+    /// The clickable title strip on top of the group frame; shared by the
+    /// draw and hit-test paths so they always agree. Width hugs the title
+    /// text: text estimate + bar padding + color-button, so the button sits
+    /// right next to short titles instead of at a fixed bar's far end.
+    pub(super) fn group_title_rect(&self, gi: usize) -> Rect {
+        let frame = self.group_rect(gi);
+        let Some(data) = &self.data else { return frame };
+        let Some(g) = data.groups.get(gi) else { return frame };
+        // ponytail: char-count width estimate (12px/char at font 12), no text
+        // measurement; longer titles clip inside the cap. The +40 covers bar
+        // padding (18) + flow spacing (6) + the 16px-wide color button.
+        let w = (g.title.chars().count() as f64 * 12.0 + 40.0).clamp(76.0, 290.0);
+        Rect {
+            pos: frame.pos + dvec2(10.0, 10.0),
+            size: dvec2(w, GROUP_TITLE_H),
+        }
+    }
+
+    /// The color-swatch button (current group color) on the title bar's
+    /// right edge.
+    pub(super) fn color_button_rect(&self, gi: usize) -> Rect {
+        let t = self.group_title_rect(gi);
+        let s = 14.0;
+        Rect {
+            pos: t.pos + dvec2(t.size.x - s - 6.0, (t.size.y - s) * 0.5),
+            size: dvec2(s, s),
+        }
+    }
+
+    /// Topmost group whose color button contains `world`.
+    pub(super) fn hit_color_button(&self, world: DVec2) -> Option<usize> {
+        let data = self.data.as_ref()?;
+        for gi in (0..data.groups.len()).rev() {
+            if self.color_button_rect(gi).contains(world) {
+                return Some(gi);
+            }
+        }
+        None
+    }
+
+    /// Topmost group whose title bar contains `world` (children draw on top
+    /// of their parents, so iterate from the end).
+    pub(super) fn hit_group_title(&self, world: DVec2) -> Option<usize> {
+        let data = self.data.as_ref()?;
+        for gi in (0..data.groups.len()).rev() {
+            if self.group_title_rect(gi).contains(world) {
+                return Some(gi);
+            }
+        }
+        None
     }
 
     /// Screen coords → world coords (inverse of the pan/zoom transform).

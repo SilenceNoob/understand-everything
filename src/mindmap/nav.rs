@@ -21,14 +21,44 @@ fn axis(bits: u8, pos: u8, neg: u8) -> f64 {
 
 impl MindMap {
     pub(super) fn handle_keys(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Group rename: Enter commits, Esc cancels; the TextInput owns the
+        // letters, so the nav handling below is skipped while renaming.
+        if self.editing_group.is_some() {
+            if let Event::KeyDown(ke) = event {
+                match ke.key_code {
+                    KeyCode::ReturnKey | KeyCode::NumpadEnter => self.commit_group_edit(cx),
+                    KeyCode::Escape => {
+                        self.editing_group = None;
+                        self.redraw(cx);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Esc also closes an open color picker popup.
+        if self.color_popup.is_some() {
+            if let Event::KeyDown(ke) = event {
+                if ke.key_code == KeyCode::Escape {
+                    self.color_popup = None;
+                    self.redraw(cx);
+                }
+            }
+        }
         if self.editing_card.is_none()
+            && self.editing_group.is_none()
             && self.detail_open.is_none()
             && !crate::file_panel::is_name_editing()
             && !crate::float_panel::is_chat_input_active()
         {
             match event {
                 Event::KeyDown(ke) => {
-                    if ke.key_code == KeyCode::Space && !ke.is_repeat {
+                    if ke.modifiers.control && ke.key_code == KeyCode::KeyG && !ke.is_repeat {
+                        if ke.modifiers.shift {
+                            self.ungroup_selected(cx);
+                        } else {
+                            self.group_selected(cx);
+                        }
+                    } else if ke.key_code == KeyCode::Space && !ke.is_repeat {
                         self.select_view_center(cx, ke.modifiers.shift);
                     } else if ke.modifiers.control && arrow_mask(ke.key_code).is_some() {
                         // Ctrl+arrow pages the selected card's markdown body;
@@ -176,11 +206,13 @@ impl MindMap {
                     }
                 } else {
                     self.selected = vec![i];
+                    self.selected_groups.clear();
                 }
             }
             None => {
                 if !add {
                     self.selected.clear();
+                    self.selected_groups.clear();
                 }
             }
         }
