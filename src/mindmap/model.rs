@@ -1,6 +1,7 @@
 use makepad_widgets::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CARD_W: f64 = 360.0;
 pub const CARD_H: f64 = 520.0;
@@ -96,6 +97,123 @@ pub struct MindMapData {
 impl MindMapData {
     /// Default map file, relative to the app base dir.
     pub const DEFAULT_MAP: &'static str = "maps/map.json";
+
+    /// Remove node `i` from the tree, re-attaching its children to its parent.
+    /// Returns false if `i` is the root or out of bounds.
+    pub fn remove_node(&mut self, i: usize) -> bool {
+        if i >= self.nodes.len() {
+            return false;
+        }
+        if self.root == Some(i) {
+            return false;
+        }
+        let parent = self.nodes[i].parent;
+        for &c in self.nodes[i].children.clone().iter() {
+            if c >= self.nodes.len() {
+                continue;
+            }
+            self.nodes[c].parent = parent;
+            if let Some(p) = parent {
+                if !self.nodes[p].children.contains(&c) {
+                    self.nodes[p].children.push(c);
+                }
+            }
+        }
+        if let Some(p) = parent {
+            self.nodes[p].children.retain(|&c| c != i);
+        }
+
+        let mut map: Vec<Option<usize>> = Vec::with_capacity(self.nodes.len());
+        let mut next = 0;
+        for old in 0..self.nodes.len() {
+            if old == i {
+                map.push(None);
+            } else {
+                map.push(Some(next));
+                next += 1;
+            }
+        }
+
+        let mut nodes: Vec<Node> = Vec::with_capacity(next);
+        for (old, n) in self.nodes.iter().enumerate() {
+            if old == i {
+                continue;
+            }
+            nodes.push(Node {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                path: n.path.clone(),
+                body: n.body.clone(),
+                parent: n.parent.and_then(|p| map[p]),
+                children: n.children.iter().filter_map(|&c| map[c]).collect(),
+                pos: n.pos,
+                size: n.size,
+                subtree_h: n.subtree_h,
+            });
+        }
+        self.nodes = nodes;
+        self.root = self.nodes.iter().position(|n| n.id == "root");
+
+        for g in &mut self.groups {
+            g.cards = g.cards.iter().filter_map(|&c| map[c]).collect();
+        }
+        self.prune_empty_groups();
+        self.recompute_bounds();
+        true
+    }
+
+    /// Add a standalone (parent-less) node for the card at `path`, placed at
+    /// `pos`. Returns its index. The body file must already exist; the node
+    /// keeps its manual position (layout() only places tree children).
+    pub fn add_detached(&mut self, path: PathBuf, body: String, pos: DVec2) -> usize {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut n = 0;
+        let id = loop {
+            let id = if n == 0 {
+                format!("c{ms}")
+            } else {
+                format!("c{ms}_{n}")
+            };
+            if !self.nodes.iter().any(|x| x.id == id) {
+                break id;
+            }
+            n += 1;
+        };
+        let i = self.nodes.len();
+        self.nodes.push(Node {
+            id,
+            title: String::new(),
+            path,
+            body,
+            parent: None,
+            children: Vec::new(),
+            pos,
+            size: dvec2(CARD_W, CARD_H),
+            subtree_h: 0.0,
+        });
+        self.recompute_bounds();
+        i
+    }
+
+    /// Recompute `max_w`/`max_h` from current node/group geometry.
+    fn recompute_bounds(&mut self) {
+        let (mut max_w, mut max_h) = (0.0, 0.0);
+        for n in &self.nodes {
+            max_w = max_w.max(n.pos.x + n.size.x);
+            max_h = max_h.max(n.pos.y + n.size.y);
+        }
+        for gi in 0..self.groups.len() {
+            if let Some((p, s)) = group_bounds(&self.groups, &self.nodes, gi, GROUP_PAD) {
+                max_w = max_w.max(p.x + s.x);
+                max_h = max_h.max(p.y + s.y);
+            }
+        }
+        self.max_w = max_w + CANVAS_MARGIN;
+        self.max_h = max_h + CANVAS_MARGIN;
+    }
 
     /// Load the map JSON at `base/map_file`. Node body paths inside the JSON
     /// stay relative to `base` (not the map file's directory).
@@ -478,14 +596,63 @@ fn expand_bbox(bbox: &mut Option<(DVec2, DVec2)>, x0: f64, y0: f64, x1: f64, y1:
 /// re-attached to their nearest surviving ancestor so no dangling children
 /// references remain. Only touched maps are written back.
 pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
-    let Some(entries) = std::fs::read_dir(base.join("maps")).ok() else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().is_none_or(|x| x != "json") {
+    remove_matching(base, &|p| p.starts_with(dir_rel));
+}
+
+/// Remove the node referencing exactly `card_rel` from every map under maps/,
+/// with the same re-attach/group-cleanup rules as `remove_dir_nodes`.
+pub(crate) fn remove_card_node(base: &Path, card_rel: &str) {
+    remove_matching(base, &|p| p == card_rel);
+}
+
+/// Rel paths of every map (under maps/, recursively) whose nodes reference
+/// the card at `card_rel` (e.g. "cards/foo.md").
+pub(crate) fn maps_using_card(base: &Path, card_rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for map_rel in map_jsons(base) {
+        let Ok(json) = std::fs::read_to_string(base.join(&map_rel)) else {
             continue;
+        };
+        let Ok(map) = serde_json::from_str::<MapFile>(&json) else {
+            continue;
+        };
+        if map.nodes.iter().any(|n| n.path == card_rel) {
+            out.push(map_rel);
         }
+    }
+    out
+}
+
+/// All map json rel paths under maps/, recursively, sorted.
+fn map_jsons(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![String::from("maps")];
+    while let Some(dir) = stack.pop() {
+        if let Ok(it) = std::fs::read_dir(base.join(&dir)) {
+            for e in it.flatten() {
+                let rel = e
+                    .path()
+                    .strip_prefix(base)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if e.path().is_dir() {
+                    stack.push(rel);
+                } else if rel.ends_with(".json") {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Shared removal body: drop every node whose path matches `pred` from all
+/// maps, re-attaching survivors to their nearest surviving ancestor and
+/// cascade-dropping groups left empty.
+fn remove_matching(base: &Path, pred: &dyn Fn(&str) -> bool) {
+    for map_rel in map_jsons(base) {
+        let p = base.join(&map_rel);
         let Ok(json) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -507,7 +674,7 @@ pub(crate) fn remove_dir_nodes(base: &Path, dir_rel: &str) {
         let removed: Vec<String> = map
             .nodes
             .iter()
-            .filter(|n| Some(&n.id) != root_id.as_ref() && n.path.starts_with(dir_rel))
+            .filter(|n| Some(&n.id) != root_id.as_ref() && pred(&n.path))
             .map(|n| n.id.clone())
             .collect();
         if removed.is_empty() {
@@ -754,6 +921,35 @@ mod tests {
     }
 
     #[test]
+    fn add_detached_keeps_pos_and_path_after_reload() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-detached-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        std::fs::write(dir.join("cards/foo.md"), "body").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[{"id":"root","title":"R","path":"cards/root.md","children":null}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("cards/root.md"), "").unwrap();
+        let mut data = MindMapData::load_from(&dir, MindMapData::DEFAULT_MAP).unwrap();
+        let i = data.add_detached(dir.join("cards/foo.md"), "body".into(), dvec2(123.0, 456.0));
+        assert_eq!(data.nodes[i].parent, None);
+        assert_eq!(data.nodes[i].pos, dvec2(123.0, 456.0));
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, MindMapData::DEFAULT_MAP);
+        let again = MindMapData::load_from(&dir, MindMapData::DEFAULT_MAP).unwrap();
+        let node = again
+            .nodes
+            .iter()
+            .find(|n| n.path == dir.join("cards/foo.md"))
+            .expect("detached node survives reload");
+        assert_eq!(node.pos, dvec2(123.0, 456.0));
+        assert_eq!(node.parent, None);
+        assert_eq!(node.body, "body");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_map_preserves_subdir_path() {
         let dir = std::env::temp_dir().join(format!("ue-mindmap-test2-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("maps")).unwrap();
@@ -987,6 +1183,67 @@ mod tests {
         assert_eq!(data.groups[0].id, "g1");
         assert_eq!(data.groups[0].cards, vec![1, 2]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn maps_using_card_lists_referencing_maps_recursively() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-using-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps/backup")).unwrap();
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        std::fs::write(dir.join("cards/a.md"), "x").unwrap();
+        let map = |path: &str| {
+            format!(r#"{{"nodes":[{{"id":"root","title":"R","path":"{path}","children":null}}]}}"#)
+        };
+        std::fs::write(dir.join("maps/map.json"), map("cards/a.md")).unwrap();
+        std::fs::write(dir.join("maps/backup/old.json"), map("cards/a.md")).unwrap();
+        std::fs::write(dir.join("maps/other.json"), map("cards/b.md")).unwrap();
+        assert_eq!(
+            maps_using_card(&dir, "cards/a.md"),
+            vec!["maps/backup/old.json", "maps/map.json"]
+        );
+        assert_eq!(maps_using_card(&dir, "cards/none.md"), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_card_node_reparents_survivors_and_cleans_groups() {
+        let dir = std::env::temp_dir().join(format!("ue-mindmap-remcard-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps/backup")).unwrap();
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        let json = r#"{"nodes":[
+            {"id":"root","title":"R","path":"cards/root.md","children":["A"]},
+            {"id":"A","title":"A","path":"cards/a.md","children":["B"]},
+            {"id":"B","title":"B","path":"cards/b.md","children":null}
+        ],"groups":[
+            {"id":"g1","title":"grp","cards":["A","B"],"groups":[]}
+        ]}"#;
+        std::fs::write(dir.join("cards/root.md"), "x").unwrap();
+        std::fs::write(dir.join("cards/a.md"), "x").unwrap();
+        std::fs::write(dir.join("cards/b.md"), "x").unwrap();
+        std::fs::write(dir.join("maps/map.json"), json).unwrap();
+        std::fs::write(dir.join("maps/backup/old.json"), json).unwrap();
+        remove_card_node(&dir, "cards/a.md");
+        // A removed: B re-attaches to root; g1 keeps B.
+        for f in ["maps/map.json", "maps/backup/old.json"] {
+            let data = MindMapData::load_from(&dir, f).unwrap();
+            let a = data.nodes.iter().find(|n| n.path == dir.join("cards/a.md"));
+            assert!(a.is_none(), "{f} still references the removed card");
+            let b = data.nodes.iter().find(|n| n.path == dir.join("cards/b.md")).unwrap();
+            let root = data.nodes.iter().find(|n| n.id == "root").unwrap();
+            assert_eq!(b.parent, Some(root_idx(&data)), "{f} B not re-attached to root");
+            assert!(root.children.contains(&b_idx(&data)), "{f} root lost B");
+            assert_eq!(data.groups[0].cards, vec![b_idx(&data)]);
+        }
+        assert_eq!(maps_using_card(&dir, "cards/a.md"), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn root_idx(data: &MindMapData) -> usize {
+        data.nodes.iter().position(|n| n.id == "root").unwrap()
+    }
+
+    fn b_idx(data: &MindMapData) -> usize {
+        data.nodes.iter().position(|n| n.path.ends_with("cards/b.md")).unwrap()
     }
 
     #[test]

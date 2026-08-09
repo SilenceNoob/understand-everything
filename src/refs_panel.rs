@@ -799,6 +799,8 @@ impl RefsPanel {
         if let Event::MouseMove(e) = event {
             if !self.panel_w_dragging && self.edge_rect.contains(e.abs) {
                 cx.set_cursor(MouseCursor::ColResize);
+            } else if !self.panel_w_dragging {
+                cx.set_cursor(MouseCursor::Default);
             }
             if self.menu_open {
                 let hover = menu_item_index(self.menu_rect, 1, e.abs);

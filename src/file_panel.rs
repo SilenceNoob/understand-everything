@@ -292,15 +292,13 @@ enum MenuItem {
     Delete,
 }
 
-/// Context-menu items for a right-click: any row target adds 重命名; 删除
-/// applies to map rows (files and dirs) and card dirs.
-fn menu_items_for(target: Option<(u8, usize)>, target_is_dir: bool) -> Vec<MenuItem> {
+/// Context-menu items for a right-click: any row target adds 重命名 and 删除
+/// (card files included); blank area keeps just 新建 map / 创建新目录.
+fn menu_items_for(target: Option<(u8, usize)>, _target_is_dir: bool) -> Vec<MenuItem> {
     let mut items = vec![MenuItem::NewMap, MenuItem::NewDir];
-    if let Some((list, _)) = target {
+    if let Some((_, _)) = target {
         items.push(MenuItem::Rename);
-        if list == LIST_MAP || target_is_dir {
-            items.push(MenuItem::Delete);
-        }
+        items.push(MenuItem::Delete);
     }
     items
 }
@@ -441,6 +439,30 @@ pub(crate) fn all_map_files(base: &std::path::Path) -> Vec<String> {
                 if e.path().is_dir() {
                     stack.push(rel);
                 } else if rel.ends_with(".json") {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// All card body files (rel paths ending ".md") under cards/, recursively.
+pub(crate) fn all_card_files(base: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![String::from("cards")];
+    while let Some(dir) = stack.pop() {
+        if let Ok(it) = std::fs::read_dir(base.join(&dir)) {
+            for e in it.flatten() {
+                let rel = e
+                    .path()
+                    .strip_prefix(base)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if e.path().is_dir() {
+                    stack.push(rel);
+                } else if rel.ends_with(".md") {
                     out.push(rel);
                 }
             }
@@ -1210,6 +1232,8 @@ impl FilePanel {
                     cx.set_cursor(MouseCursor::ColResize);
                 } else if self.splitter_rect.contains(e.abs) {
                     cx.set_cursor(MouseCursor::RowResize);
+                } else {
+                    cx.set_cursor(MouseCursor::Default);
                 }
             }
             if self.menu_open {
@@ -1250,8 +1274,8 @@ impl FilePanel {
             Hit::FingerMove(fe) => {
                 self.track_drag(cx, fe.abs, list);
             }
-            Hit::FingerUp(_) => {
-                self.finish_drag(cx, list);
+            Hit::FingerUp(fe) => {
+                self.finish_drag(cx, list, fe.abs);
             }
             Hit::FingerScroll(fe) => {
                 if scroll_rows(rows_len, list_rect, fe.scroll.y, self.list_scroll_mut(list)) {
@@ -1436,7 +1460,7 @@ impl FilePanel {
                     .map(|n| format!("删除 {n}"))
                     .unwrap_or_default(),
             );
-            // 删除 exists for map rows and card dirs (matches menu_items_for).
+            // 删除 exists for every row target (maps, card files and dirs).
             menu.view(cx, ids!(menu_delete_box))
                 .set_visible(cx, self.menu_items.contains(&MenuItem::Delete));
         }
@@ -1458,9 +1482,10 @@ impl FilePanel {
 
     /// Update the drag for a press in `list`: activate past the threshold and
     /// track the hovered dir row (drop targets are dirs of the same list, so
-    /// map files can never land in card dirs and vice versa).
+    /// map files can never land in card dirs and vice versa). While dragging
+    /// a card, publish the drop-ghost state for the canvas to render.
     fn track_drag(&mut self, cx: &mut Cx, abs: DVec2, list: u8) {
-        let Some((l, _, start)) = self.drag_press else {
+        let Some((l, i, start)) = self.drag_press else {
             return;
         };
         if l != list {
@@ -1468,6 +1493,20 @@ impl FilePanel {
         }
         if !self.drag_active && (abs - start).length() >= DRAG_THRESHOLD {
             self.drag_active = true;
+            if list == LIST_CARD {
+                let title = self
+                    .row_value(list, i)
+                    .as_deref()
+                    .map(display_name)
+                    .unwrap_or_default();
+                crate::util::set_card_drag(Some(crate::util::CardDrag { title, pos: abs }));
+            }
+        } else if self.drag_active && list == LIST_CARD {
+            // Keep the drop ghost glued to the pointer.
+            if let Some(mut drag) = crate::util::card_drag() {
+                drag.pos = abs;
+                crate::util::set_card_drag(Some(drag));
+            }
         }
         let (rows, rect, scroll) = self.list_geometry(list);
         let target = if self.drag_active {
@@ -1482,8 +1521,9 @@ impl FilePanel {
     }
 
     /// End the drag for a press in `list`: drop onto a dir (move via
-    /// RenameFile) or, without drag, treat it as a click (map rows switch).
-    fn finish_drag(&mut self, cx: &mut Cx, list: u8) {
+    /// RenameFile), release a dragged card on the canvas (DropCard), or,
+    /// without drag, treat it as a click (map rows switch).
+    fn finish_drag(&mut self, cx: &mut Cx, list: u8, up_abs: DVec2) {
         let Some((l, i, _)) = self.drag_press.take() else {
             return;
         };
@@ -1503,9 +1543,14 @@ impl FilePanel {
         };
         self.drag_active = false;
         self.drag_target = None;
+        crate::util::set_card_drag(None);
         if let Some(to) = to {
             if let Some(from) = from {
                 cx.widget_action(self.widget_uid(), FilePanelAction::RenameFile(from, to));
+            }
+        } else if dragged && list == LIST_CARD {
+            if let Some(from) = from {
+                cx.widget_action(self.widget_uid(), FilePanelAction::DropCard(from, up_abs));
             }
         } else if !dragged && list == LIST_MAP {
             if let Some(from) = from {
@@ -1691,6 +1736,9 @@ pub enum FilePanelAction {
     CreateDir(String),
     /// Inline edit confirmed for 重命名; carries (old rel path, new rel path).
     RenameFile(String, String),
+    /// A card row was dragged and released; carries (card rel path, screen
+    /// position of the release). The App hit-tests the canvas and adds it.
+    DropCard(String, DVec2),
 }
 
 macro_rules! action_string_getter {
@@ -1717,6 +1765,17 @@ impl FilePanelRef {
         if let Some(item) = actions.find_widget_action(self.widget_uid()) {
             if let FilePanelAction::RenameFile(from, to) = item.cast() {
                 return Some((from, to));
+            }
+        }
+        None
+    }
+
+    /// A card row drag that ended without a dir drop target: (card rel path,
+    /// release position). The App decides whether it landed on the canvas.
+    pub fn card_dropped(&self, actions: &Actions) -> Option<(String, DVec2)> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let FilePanelAction::DropCard(rel, pos) = item.cast() {
+                return Some((rel, pos));
             }
         }
         None
@@ -1879,6 +1938,7 @@ mod test {
         for f in ["b.md", "a.md", "img.png", "tiger.svg"] {
             std::fs::write(dir.join("cards").join(f), "x").unwrap();
         }
+        std::fs::write(dir.join("cards/docs/a.md"), "x").unwrap();
         for f in ["b.json", "a.json", "notes.txt", "map.json"] {
             std::fs::write(dir.join("maps").join(f), "{}").unwrap();
         }
@@ -1908,6 +1968,11 @@ mod test {
                 "maps/backup/sub/deep.json",
                 "maps/map.json"
             ]
+        );
+        // recursive card find walks subdirs and ignores non-md files
+        assert_eq!(
+            all_card_files(&dir),
+            vec!["cards/a.md", "cards/b.md", "cards/docs/a.md"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1977,12 +2042,17 @@ mod test {
     #[test]
     fn menu_items_follow_target_row() {
         assert_eq!(menu_items_for(None, false), vec![MenuItem::NewMap, MenuItem::NewDir]);
-        // card file: no delete
+        // card file: rename + delete
         assert_eq!(
             menu_items_for(Some((LIST_CARD, 0)), false),
-            vec![MenuItem::NewMap, MenuItem::NewDir, MenuItem::Rename]
+            vec![
+                MenuItem::NewMap,
+                MenuItem::NewDir,
+                MenuItem::Rename,
+                MenuItem::Delete
+            ]
         );
-        // card dir: delete
+        // card dir: rename + delete
         assert_eq!(
             menu_items_for(Some((LIST_CARD, 0)), true),
             vec![
@@ -1992,7 +2062,7 @@ mod test {
                 MenuItem::Delete
             ]
         );
-        // map row (file or dir): delete
+        // map row (file or dir): rename + delete
         assert_eq!(
             menu_items_for(Some((LIST_MAP, 2)), false),
             vec![

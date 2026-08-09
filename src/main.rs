@@ -7,19 +7,28 @@ use std::time::{Duration, Instant};
 
 use crate::ai::{AIConfig, SseParser};
 use crate::bottom_bar::BottomBarWidgetRefExt;
+use crate::card_picker::{CardPickerWidgetRefExt, PickChoice};
+use crate::gen::{
+    generation_messages, parse_generation_output, parse_grades, parse_quiz, quiz_generation_messages,
+    quiz_grading_messages, quiz_ready, upsert_sections, GenSection,
+};
 use crate::popup_panel::PopupPanelWidgetRefExt;
+use crate::quiz_panel::{QuizPanelWidgetRefExt, QuizSubmission};
 use crate::util::cached_widget;
 
 app_main!(App);
 
 mod ai;
 mod bottom_bar;
+mod card_picker;
 mod chat_list;
 mod file_panel;
 mod float_panel;
+mod gen;
 mod markdown_media;
 mod mindmap;
 mod popup_panel;
+mod quiz_panel;
 mod rag;
 mod refs_panel;
 mod slide_panel;
@@ -397,6 +406,85 @@ script_mod! {
                     }
                     startup_popup := mod.widgets.PopupPanel{
                         content := StartupPageContent{}
+                    }
+                    quiz_popup := mod.widgets.PopupPanel{
+                        content := mod.widgets.QuizPanel{}
+                    }
+                    picker_popup := mod.widgets.PopupPanel{
+                        content := mod.widgets.CardPicker{}
+                    }
+                    confirm_popup := mod.widgets.PopupPanel{
+                        content := mod.widgets.View{
+                            width: Fill
+                            height: Fill
+                            flow: Overlay
+                            align: Align{x: 0.5, y: 0.5}
+                            draw_bg +: {
+                                pixel: fn(){
+                                    #000000cc
+                                }
+                            }
+                            panel := mod.widgets.RoundedView{
+                                width: 420
+                                height: Fit
+                                flow: Down
+                                padding: 20
+                                spacing: 12
+                                show_bg: true
+                                draw_bg +: {
+                                    color: #1f2430
+                                    border_radius: 8.0
+                                    border_size: 1.0
+                                    border_color: #ffffff14
+                                }
+                                title := mod.widgets.Label{
+                                    width: Fill
+                                    text: "删除卡片"
+                                    draw_text.text_style.font_size: 18.0
+                                    draw_text.color: #e6e9f0
+                                }
+                                card_name := mod.widgets.Label{
+                                    width: Fill
+                                    text: ""
+                                    draw_text.text_style.font_size: 14.0
+                                    draw_text.color: #e6e9f0
+                                }
+                                usage := mod.widgets.Label{
+                                    width: Fill
+                                    text: ""
+                                    draw_text.text_style.font_size: 13.0
+                                    draw_text.color: #aab0bc
+                                }
+                                btn_row := mod.widgets.View{
+                                    width: Fill
+                                    height: Fit
+                                    flow: Right
+                                    align: Align{x: 1.0, y: 0.5}
+                                    spacing: 8
+                                    delete_btn := mod.widgets.ButtonFlat{
+                                        width: Fit
+                                        text: "删除"
+                                        padding: Inset{left: 14, right: 14, top: 6, bottom: 6}
+                                        draw_bg +: {
+                                            color: #e5484d
+                                            color_hover: #f2555a
+                                            color_down: #f2555a
+                                            color_focus: #e5484d
+                                            border_radius: uniform(4.0)
+                                        }
+                                        draw_text +: {
+                                            text_style: theme.font_bold{font_size: 13.0}
+                                            color: #ffffff
+                                        }
+                                    }
+                                    cancel_btn := mod.widgets.ButtonFlat{
+                                        width: Fit
+                                        text: "取消"
+                                        padding: Inset{left: 14, right: 14, top: 6, bottom: 6}
+                                    }
+                                }
+                            }
+                        }
                     }
                     float_panel := mod.widgets.FloatPanel{}
                     ai_panel := mod.widgets.FloatPanel{
@@ -819,6 +907,16 @@ fn child_by_name(parent: &WidgetRef, id: LiveId) -> WidgetRef {
     found
 }
 
+/// A deferred generation request waiting for hybrid RAG retrieval to finish.
+struct GenWait {
+    path: String,
+    section: GenSection,
+    title: String,
+    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    fallback: String,
+    started: Instant,
+}
+
 /// A send_chat deferred until the background RAG retrieval answers (or the
 /// timeout falls back to the BM25 context computed at send time).
 struct RagWait {
@@ -919,6 +1017,28 @@ pub struct App {
     /// avoid a redraw every 250ms tick).
     #[rust]
     last_rag_label: String,
+    /// Deferred card generation waiting on hybrid RAG retrieval.
+    #[rust]
+    gen_wait: Option<GenWait>,
+    /// In-flight card generation request id and target card path.
+    #[rust]
+    gen_id: LiveId,
+    #[rust]
+    gen_path: String,
+    /// In-flight quiz generation request.
+    #[rust]
+    quiz_id: LiveId,
+    #[rust]
+    quiz_path: Option<String>,
+    #[rust]
+    quiz_body: Option<String>,
+    /// In-flight quiz grading request.
+    #[rust]
+    grade_id: LiveId,
+    /// Card awaiting delete confirmation (rel path), set while the confirm
+    /// popup is open.
+    #[rust]
+    pending_delete_card: Option<String>,
 }
 
 /// Format a token count compactly: 860, 2.4K, 1M.
@@ -991,6 +1111,8 @@ impl App {
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(picker_popup)).as_popup_panel().hide(cx);
+            self.popup_widget(live_id!(confirm_popup)).as_popup_panel().hide(cx);
             p.show(cx);
             if id == live_id!(setting_popup) {
                 let child = |path: &[LiveId]| self.popup_child(live_id!(setting_popup), path);
@@ -1355,6 +1477,9 @@ impl App {
                 {
                     self.open_map(cx, &self.next_map(&base));
                 }
+            } else if rel.starts_with("cards/") {
+                // Card file: confirm first (the dialog lists using maps).
+                self.open_card_delete_confirm(cx, &rel);
             } else {
                 std::fs::remove_file(base.join(&rel)).ok();
                 if mind_map.current_map_file().as_deref() == Some(rel.as_str()) {
@@ -1387,6 +1512,77 @@ impl App {
             .into_iter()
             .next()
             .unwrap_or_else(|| mindmap::MindMapData::DEFAULT_MAP.to_string())
+    }
+
+    /// Open the delete-confirm popup for the card at `rel`, listing every
+    /// map that references it.
+    fn open_card_delete_confirm(&mut self, cx: &mut Cx, rel: &str) {
+        self.pending_delete_card = Some(rel.to_string());
+        let base = crate::util::app_base_dir();
+        let name = std::path::Path::new(rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rel.to_string());
+        let maps = crate::mindmap::maps_using_card(&base, rel);
+        let usage = if maps.is_empty() {
+            "该卡片没有被任何 map 使用。".to_string()
+        } else {
+            let list = maps
+                .iter()
+                .map(|m| format!("• {}", file_panel::display_name(m)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("该卡片被以下 {} 个 map 使用：\n{list}", maps.len())
+        };
+        let child = |path: &[LiveId]| self.popup_child(live_id!(confirm_popup), path);
+        child(&[live_id!(content), live_id!(panel), live_id!(card_name)]).set_text(cx, &name);
+        child(&[live_id!(content), live_id!(panel), live_id!(usage)]).set_text(cx, &usage);
+        self.popup_widget(live_id!(confirm_popup)).as_popup_panel().show(cx);
+        for id in [
+            live_id!(setting_popup),
+            live_id!(about_popup),
+            live_id!(startup_popup),
+            live_id!(quiz_popup),
+            live_id!(picker_popup),
+        ] {
+            self.popup_widget(id).as_popup_panel().hide(cx);
+        }
+    }
+
+    /// Card delete-confirm popup buttons.
+    fn handle_card_delete_confirm(&mut self, cx: &mut Cx, actions: &Actions) {
+        let popup = live_id!(confirm_popup);
+        let child = |path: &[LiveId]| self.popup_child(popup, path);
+        if child(&[live_id!(content), live_id!(panel), live_id!(cancel_btn)])
+            .as_button()
+            .clicked(actions)
+        {
+            self.pending_delete_card = None;
+            self.popup_widget(popup).as_popup_panel().hide(cx);
+            return;
+        }
+        if child(&[live_id!(content), live_id!(panel), live_id!(delete_btn)])
+            .as_button()
+            .clicked(actions)
+        {
+            let rel = self.pending_delete_card.take();
+            self.popup_widget(popup).as_popup_panel().hide(cx);
+            let Some(rel) = rel else { return };
+            let base = crate::util::app_base_dir();
+            crate::mindmap::remove_card_node(&base, &rel);
+            std::fs::remove_file(base.join(&rel)).ok();
+            // Drop the ghost node from the in-memory map (if present) so a
+            // later save can't resurrect it; RAG and the file panel follow
+            // via their own mtime/fingerprint watchers.
+            self.ui.mind_map(cx, ids!(mindmap)).reload_map(cx);
+        }
+    }
+
+    /// Drop a card dragged from the file panel onto the canvas.
+    fn handle_card_drop(&mut self, cx: &mut Cx, actions: &Actions) {
+        if let Some((rel, abs)) = self.ui.file_panel(cx, ids!(file_panel)).card_dropped(actions) {
+            self.ui.mind_map(cx, ids!(mindmap)).drop_card_at(cx, &rel, abs);
+        }
     }
 
     /// Current config as typed in the settings form (empty base_url/model
@@ -1752,6 +1948,7 @@ impl App {
             self.last_rag_label = text.clone();
             self.ui.label(cx, ids!(rag_status)).set_text(cx, &text);
         }
+        self.handle_gen_rag_tick(cx);
         let Some(wait) = &mut self.rag_wait else {
             return;
         };
@@ -1837,36 +2034,396 @@ impl App {
             self.child_by_name(&tools, on_id).set_visible(cx, on);
         }
     }
+
+    /// Card context menu: generate a section, start a quiz, or open the
+    /// canvas card picker.
+    fn handle_mindmap_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        if let Some((path, section)) = mind_map.generate_clicked(actions) {
+            self.start_generation(cx, &path, section);
+        }
+        if let Some(path) = mind_map.quiz_clicked(actions) {
+            self.start_quiz(cx, &path);
+        }
+        if let Some(pos) = mind_map.canvas_menu_clicked(actions) {
+            self.open_card_picker(cx, pos);
+        }
+    }
+
+    /// Open the canvas card picker at `pos` (screen coords): scan cards/,
+    /// exclude cards already on the map, and show the popup.
+    fn open_card_picker(&mut self, cx: &mut Cx, pos: DVec2) {
+        let base = crate::util::app_base_dir();
+        let on_map = self.ui.mind_map(cx, ids!(mindmap)).card_rel_paths();
+        let candidates: Vec<String> = crate::file_panel::all_card_files(&base)
+            .into_iter()
+            .filter(|p| !on_map.contains(p))
+            .collect();
+        self.open_picker_popup(cx);
+        self.picker().open(cx, pos, &candidates);
+    }
+
+    fn picker(&self) -> crate::card_picker::CardPickerRef {
+        self.popup_child(live_id!(picker_popup), &[live_id!(content)])
+            .as_card_picker()
+    }
+
+    fn open_picker_popup(&self, cx: &mut Cx) {
+        self.popup_widget(live_id!(picker_popup)).as_popup_panel().show(cx);
+        for id in [
+            live_id!(setting_popup),
+            live_id!(about_popup),
+            live_id!(startup_popup),
+            live_id!(quiz_popup),
+            live_id!(confirm_popup),
+        ] {
+            self.popup_widget(id).as_popup_panel().hide(cx);
+        }
+    }
+
+    /// CardPicker popup: apply the choice (add existing / create new card).
+    fn handle_picker_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let picker = self.picker();
+        if picker.close_clicked(actions) {
+            self.popup_widget(live_id!(picker_popup)).as_popup_panel().hide(cx);
+            return;
+        }
+        let Some(choice) = picker.picked(actions) else {
+            return;
+        };
+        self.popup_widget(live_id!(picker_popup)).as_popup_panel().hide(cx);
+        let rel = match choice {
+            PickChoice::Card(rel) => Some(rel),
+            PickChoice::Create(name) => self.create_card_file(&name),
+            PickChoice::None => None,
+        };
+        if let Some(rel) = rel {
+            self.ui.mind_map(cx, ids!(mindmap)).add_card_at(cx, &rel);
+        }
+    }
+
+    /// Create an empty card file in the default `cards/` dir from the search
+    /// text (default "未命名" when empty); unique-ified with a numeric suffix
+    /// when the name is taken. Returns the rel path.
+    fn create_card_file(&self, name: &str) -> Option<String> {
+        let stem = crate::file_panel::normalize_name(name, Some(".md"))
+            .unwrap_or_else(|| "未命名.md".to_string());
+        let stem = stem.strip_suffix(".md").unwrap_or(&stem).to_string();
+        let base = crate::util::app_base_dir();
+        for n in 0.. {
+            let fname = if n == 0 {
+                format!("{stem}.md")
+            } else {
+                format!("{stem}-{n}.md")
+            };
+            let p = base.join("cards").join(&fname);
+            if !p.exists() {
+                std::fs::write(&p, "").ok()?;
+                return Some(format!("cards/{fname}"));
+            }
+        }
+        None
+    }
+
+    fn start_generation(&mut self, cx: &mut Cx, path: &str, section: GenSection) {
+        if self.gen_wait.is_some() || self.gen_id != LiveId::empty() {
+            return;
+        }
+        let title = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if title.is_empty() {
+            return;
+        }
+        let fallback = self.rag_bm25_context(&title);
+        let upgradeable = self
+            .rag
+            .as_ref()
+            .is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
+        if upgradeable {
+            let rx = self.rag.as_ref().unwrap().retrieve(&title);
+            self.gen_wait = Some(GenWait {
+                path: path.to_string(),
+                section,
+                title: title.clone(),
+                rx,
+                fallback,
+                started: Instant::now(),
+            });
+            self.set_card_title_indicator(cx, path, Some("生成中…"));
+        } else {
+            self.send_generation(cx, path, section, &title, &fallback);
+        }
+    }
+
+    fn send_generation(
+        &mut self,
+        cx: &mut Cx,
+        path: &str,
+        section: GenSection,
+        title: &str,
+        context: &str,
+    ) {
+        self.gen_id = LiveId::unique();
+        self.gen_path = path.to_string();
+        self.set_card_title_indicator(cx, path, Some("生成中…"));
+        let (system, user) = generation_messages(section, title, context);
+        ai::chat_completions(
+            cx,
+            self.gen_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            2048,
+        );
+    }
+
+    fn handle_gen_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.gen_id = LiveId::empty();
+        let status = response.status_code;
+        let full_path = crate::util::app_base_dir().join(&self.gen_path);
+        if status != 200 {
+            self.set_card_title_indicator(cx, &self.gen_path, None);
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            self.push_chat_msg(cx, "assistant", &format!("生成失败 ({})：{}", status, detail));
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        let sections = parse_generation_output(&content);
+        if sections.is_empty() {
+            self.set_card_title_indicator(cx, &self.gen_path, None);
+            self.push_chat_msg(cx, "assistant", "生成返回为空或格式不正确");
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        let body = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let new_body = upsert_sections(&body, &sections);
+        if let Err(e) = std::fs::write(&full_path, &new_body) {
+            self.set_card_title_indicator(cx, &self.gen_path, None);
+            self.push_chat_msg(cx, "assistant", &format!("保存卡片失败：{}", e));
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        // Update the card body if the card is still in the current map.
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        mind_map.update_card_body(cx, &full_path, new_body);
+        self.set_card_title_indicator(cx, &self.gen_path, None);
+        if let Some(rag) = &self.rag {
+            rag.set_map(&self.ui.mind_map(cx, ids!(mindmap)).current_map_file().unwrap_or_default());
+        }
+    }
+
+    fn set_card_title_indicator(&self, cx: &mut Cx, path: &str, indicator: Option<&str>) {
+        let full_path = crate::util::app_base_dir().join(path);
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        mind_map.set_card_title_indicator(cx, &full_path, indicator);
+    }
+
+    fn ensure_ai_panel_open(&mut self, cx: &mut Cx) {
+        let panel = self.ui.float_panel(cx, ids!(ai_panel));
+        if !panel.opened() {
+            self.toggle_ai_panel(cx);
+        }
+    }
+
+    fn start_quiz(&mut self, cx: &mut Cx, path: &str) {
+        let full_path = crate::util::app_base_dir().join(path);
+        let body = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let title = full_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.open_quiz_popup(cx);
+        let quiz_panel = self.quiz_panel();
+        if let Err(missing) = quiz_ready(&body) {
+            quiz_panel.show_error(cx, &format!("卡片缺少以下板块：{}", missing.join("、")));
+            return;
+        }
+        self.quiz_path = Some(path.to_string());
+        self.quiz_body = Some(body.clone());
+        quiz_panel.show_loading(cx, &title);
+        self.quiz_id = LiveId::unique();
+        let (system, user) = quiz_generation_messages(&body);
+        ai::chat_completions(
+            cx,
+            self.quiz_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            4096,
+        );
+    }
+
+    fn handle_quiz_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.quiz_id = LiveId::empty();
+        self.open_quiz_popup(cx);
+        let quiz_panel = self.quiz_panel();
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            quiz_panel.show_error(cx, &format!("出题失败：{} {}", response.status_code, detail));
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        match parse_quiz(&content) {
+            Ok(q) => {
+                let title = self
+                    .quiz_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let body = self.quiz_body.clone().unwrap_or_default();
+                quiz_panel.set_quiz(cx, &title, &body, &q);
+            }
+            Err(e) => quiz_panel.show_error(cx, &format!("题目解析失败：{}", e)),
+        }
+    }
+
+    fn handle_quiz_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let quiz_panel = self.quiz_panel();
+        if quiz_panel.close_clicked(actions) {
+            self.close_quiz_popup(cx);
+        }
+        if let Some(submission) = quiz_panel.submit_clicked(actions) {
+            self.send_grade_request(cx, submission);
+        }
+    }
+
+    fn send_grade_request(&mut self, cx: &mut Cx, submission: QuizSubmission) {
+        let Some(body) = self.quiz_body.as_deref() else { return };
+        let questions = submission.open_questions;
+        let answers = submission.open;
+        if questions.is_empty() || answers.is_empty() {
+            return;
+        }
+        let (system, user) = quiz_grading_messages(body, &questions, &answers);
+        self.grade_id = LiveId::unique();
+        ai::chat_completions(
+            cx,
+            self.grade_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            2048,
+        );
+    }
+
+    fn handle_grade_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.grade_id = LiveId::empty();
+        self.open_quiz_popup(cx);
+        let quiz_panel = self.quiz_panel();
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            quiz_panel.set_status_text(cx, &format!("评分失败：{} {}", response.status_code, detail));
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        match parse_grades(&content) {
+            Ok(g) => quiz_panel.set_grades(cx, &g),
+            Err(e) => quiz_panel.set_status_text(cx, &format!("评分解析失败：{}", e)),
+        }
+    }
+
+    fn quiz_panel(&self) -> crate::quiz_panel::QuizPanelRef {
+        self.popup_child(live_id!(quiz_popup), &[live_id!(content)])
+            .as_quiz_panel()
+    }
+
+    fn open_quiz_popup(&self, cx: &mut Cx) {
+        self.popup_widget(live_id!(quiz_popup)).as_popup_panel().show(cx);
+        for id in [
+            live_id!(setting_popup),
+            live_id!(about_popup),
+            live_id!(startup_popup),
+            live_id!(picker_popup),
+            live_id!(confirm_popup),
+        ] {
+            self.popup_widget(id).as_popup_panel().hide(cx);
+        }
+    }
+
+    fn close_quiz_popup(&self, cx: &mut Cx) {
+        self.popup_widget(live_id!(quiz_popup)).as_popup_panel().hide(cx);
+    }
+
+    /// Poll deferred card-generation retrieval and promote it to a real request.
+    fn handle_gen_rag_tick(&mut self, cx: &mut Cx) {
+        let Some(wait) = &mut self.gen_wait else { return };
+        let now = Instant::now();
+        let hits = match wait.rx.try_recv() {
+            Ok(r) if r.query == wait.title => Some(r.hits),
+            Ok(_) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
+            Err(_) => Some(Vec::new()),
+        };
+        let Some(hits) = hits else { return };
+        let ctx = if hits.is_empty() {
+            wait.fallback.clone()
+        } else {
+            rag::service::format_context(&hits)
+        };
+        let path = wait.path.clone();
+        let section = wait.section;
+        let title = wait.title.clone();
+        self.gen_wait = None;
+        self.send_generation(cx, &path, section, &title, &ctx);
+    }
 }
 
 impl MatchEvent for App {
     fn handle_http_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
-        if request_id != self.test_id || !self.testing {
+        if request_id == self.test_id && self.testing {
+            self.testing = false;
+            let status = response.status_code;
+            let msg = match status {
+                200 => "连接成功".to_string(),
+                401 => "认证失败：API Key 无效".to_string(),
+                _ => {
+                    let detail = response
+                        .get_string_body()
+                        .and_then(|b| ai::body_error_message(&b))
+                        .unwrap_or_default();
+                    format!("连接失败 ({})：{}", status, detail)
+                }
+            };
+            self.popup_child(
+                live_id!(setting_popup),
+                &[
+                    live_id!(content),
+                    live_id!(panel),
+                    live_id!(settings_form),
+                    live_id!(status),
+                ],
+            )
+            .set_text(cx, &msg);
             return;
         }
-        self.testing = false;
-        let status = response.status_code;
-        let msg = match status {
-            200 => "连接成功".to_string(),
-            401 => "认证失败：API Key 无效".to_string(),
-            _ => {
-                let detail = response
-                    .get_string_body()
-                    .and_then(|b| ai::body_error_message(&b))
-                    .unwrap_or_default();
-                format!("连接失败 ({})：{}", status, detail)
-            }
-        };
-        self.popup_child(
-            live_id!(setting_popup),
-            &[
-                live_id!(content),
-                live_id!(panel),
-                live_id!(settings_form),
-                live_id!(status),
-            ],
-        )
-        .set_text(cx, &msg);
+        if request_id == self.gen_id && self.gen_id != LiveId::empty() {
+            self.handle_gen_response(cx, response);
+            return;
+        }
+        if request_id == self.quiz_id && self.quiz_id != LiveId::empty() {
+            self.handle_quiz_response(cx, response);
+            return;
+        }
+        if request_id == self.grade_id && self.grade_id != LiveId::empty() {
+            self.handle_grade_response(cx, response);
+            return;
+        }
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
@@ -1882,6 +2439,25 @@ impl MatchEvent for App {
                 ],
             )
             .set_text(cx, &format!("连接失败：{}", err.message));
+            return;
+        }
+        if request_id == self.gen_id && self.gen_id != LiveId::empty() {
+            self.gen_id = LiveId::empty();
+            self.set_card_title_indicator(cx, &self.gen_path, None);
+            self.push_chat_msg(cx, "assistant", &format!("生成请求失败：{}", err.message));
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        if request_id == self.quiz_id && self.quiz_id != LiveId::empty() {
+            self.quiz_id = LiveId::empty();
+            self.open_quiz_popup(cx);
+            self.quiz_panel().show_error(cx, &format!("出题请求失败：{}", err.message));
+            return;
+        }
+        if request_id == self.grade_id && self.grade_id != LiveId::empty() {
+            self.grade_id = LiveId::empty();
+            self.open_quiz_popup(cx);
+            self.quiz_panel().set_status_text(cx, &format!("评分请求失败：{}", err.message));
             return;
         }
         if request_id == self.chat_id && self.chat_pending {
@@ -1950,6 +2526,8 @@ impl AppMain for App {
         crate::file_panel::script_mod(vm);
         crate::chat_list::script_mod(vm);
         crate::refs_panel::script_mod(vm);
+        crate::quiz_panel::script_mod(vm);
+        crate::card_picker::script_mod(vm);
         self::script_mod(vm)
     }
 
@@ -1997,12 +2575,30 @@ impl AppMain for App {
             self.handle_chat_actions(cx, actions);
             self.handle_file_panel_actions(cx, actions);
             self.handle_startup_actions(cx, actions);
+            self.handle_mindmap_actions(cx, actions);
+            self.handle_quiz_panel_actions(cx, actions);
+            self.handle_picker_actions(cx, actions);
+            self.handle_card_delete_confirm(cx, actions);
+            self.handle_card_drop(cx, actions);
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
         // After ui.handle_event: the dock writes pending_click while the
         // event propagates, so poll it afterwards — a click would otherwise
         // wait for the next event (never comes with a still mouse).
         self.handle_dock_clicks(cx);
+        // While a card drag is in flight, keep the canvas ghost glued to the
+        // pointer (the file panel owns the drag but can't redraw the map).
+        // MouseUp redraws unconditionally: the drag state is already cleared
+        // by then, and the ghost must not linger after a non-canvas drop.
+        match event {
+            Event::MouseMove(_) if crate::util::card_drag().is_some() => {
+                self.ui.mind_map(cx, ids!(mindmap)).redraw(cx);
+            }
+            Event::MouseUp(_) => {
+                self.ui.mind_map(cx, ids!(mindmap)).redraw(cx);
+            }
+            _ => {}
+        }
         // The dock area covers the whole window on top of the popups, so
         // root dispatch can't reach the popup's buttons/inputs; hand mouse
         // events to the open popup directly (it forwards to its content,
@@ -2012,6 +2608,9 @@ impl AppMain for App {
                 live_id!(setting_popup),
                 live_id!(about_popup),
                 live_id!(startup_popup),
+                live_id!(quiz_popup),
+                live_id!(picker_popup),
+                live_id!(confirm_popup),
             ] {
                 let p = self.popup_widget(id).as_popup_panel();
                 if p.opened() {

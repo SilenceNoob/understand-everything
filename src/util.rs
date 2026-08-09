@@ -49,6 +49,27 @@ pub fn over_any_panel(p: DVec2) -> bool {
     PANEL_RECTS.lock().unwrap().iter().any(|(_, r)| r.contains(p))
 }
 
+/// In-flight card drag from the file panel onto the canvas: the card's
+/// display title and the pointer's current screen position. Written by the
+/// file panel while dragging, read by the MindMap to draw the drop ghost.
+#[derive(Clone, Debug)]
+pub struct CardDrag {
+    pub title: String,
+    pub pos: DVec2,
+}
+
+static CARD_DRAG: Mutex<Option<CardDrag>> = Mutex::new(None);
+
+/// Set (or, with `None`, end) the file-panel card drag.
+pub fn set_card_drag(drag: Option<CardDrag>) {
+    *CARD_DRAG.lock().unwrap() = drag;
+}
+
+/// The active card drag, if any.
+pub fn card_drag() -> Option<CardDrag> {
+    CARD_DRAG.lock().unwrap().clone()
+}
+
 /// Resize direction bitmask (shared by the mindmap cards and FloatPanel,
 /// which were line-by-line mirrors of this math).
 pub const RESIZE_LEFT: u8 = 1;

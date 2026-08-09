@@ -194,7 +194,20 @@ pub fn body_error_message(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Incremental SSE parser for OpenAI-compatible streaming responses.
+/// Extract the assistant content from a non-streaming chat/completions response.
+pub fn response_content(response: &HttpResponse) -> Option<String> {
+    if response.status_code != 200 {
+        return None;
+    }
+    let body = response.get_string_body()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(|s| s.to_string())
+}
 /// Feed raw bytes in arbitrary chunk sizes; every call returns the
 /// assistant text deltas extracted since the previous call, in order.
 /// Also accumulates the raw text so error bodies stay recoverable.
