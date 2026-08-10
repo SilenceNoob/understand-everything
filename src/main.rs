@@ -1998,6 +1998,15 @@ impl App {
         self.route_root = root_rel.clone();
         self.route_diag = diagnostics.to_string();
         self.set_card_title_indicator(cx, &root_rel, Some("规划中…"));
+        // Visible progress: the root card title flips to 规划中… and the AI
+        // panel opens with a status line (it also hosts the success/failure
+        // messages later, so the whole flow is one conversation).
+        self.push_chat_msg(
+            cx,
+            "assistant",
+            &format!("正在为「{goal}」规划学习路线（诊断 + 路线生成约需 1 分钟）…"),
+        );
+        self.ensure_ai_panel_open(cx);
         let fallback = self.rag_bm25_context(goal);
         let upgradeable = self
             .rag

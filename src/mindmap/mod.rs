@@ -5,6 +5,8 @@ use crate::markdown_media::MarkdownMediaWidgetRefExt;
 use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD};
 use crate::util::{apply_resize, app_base_dir};
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 mod geometry;
 mod minimap;
@@ -712,6 +714,10 @@ pub struct MindMap {
     /// 3 everywhere else. Drives geometry and the item3 visibility.
     #[rust]
     menu_items: usize,
+    /// Title indicators (e.g. "规划中…") set before a card widget existed
+    /// (lazily created on draw); applied by `card_ref`, cleared explicitly.
+    #[rust]
+    pending_titles: HashMap<PathBuf, String>,
     #[rust]
     menu_rect: Rect,
     #[rust]
@@ -1870,6 +1876,12 @@ impl MindMap {
         let name = card_title(&node);
         w.label(cx, ids!(title)).set_text(cx, &name);
         w.label(cx, ids!(compact_label)).set_text(cx, &name);
+        // A pending title indicator (set before this widget was created)
+        // overrides the file-stem title until explicitly cleared.
+        if let Some(ind) = self.pending_titles.get(&node.path).cloned() {
+            w.label(cx, ids!(title)).set_text(cx, &ind);
+            w.label(cx, ids!(compact_label)).set_text(cx, &ind);
+        }
         w.markdown_media(cx, ids!(markdown)).set_text(cx, &node.body);
         if let Some(dir) = node.path.parent() {
             w.markdown_media(cx, ids!(markdown)).set_base_dir(dir.to_path_buf());
@@ -1949,10 +1961,22 @@ impl MindMap {
 
     /// Set the visible title (and compact title) of the card at `full_path` to
     /// `indicator`, or restore it to the file-stem title when `indicator` is None.
+    /// Card widgets are created lazily on draw, so an indicator set before the
+    /// widget exists is recorded in `pending_titles` and applied by `card_ref`
+    /// at creation; it is consumed only by an explicit None.
     pub fn set_card_title_indicator(&mut self, cx: &mut Cx, full_path: &std::path::Path, indicator: Option<&str>) {
         let Some(i) = self.data.as_mut().and_then(|d| d.nodes.iter().position(|n| n.path == full_path)) else {
             return;
         };
+        let node_path = self.data.as_ref().unwrap().nodes[i].path.clone();
+        match indicator {
+            Some(s) => {
+                self.pending_titles.insert(node_path, s.to_string());
+            }
+            None => {
+                self.pending_titles.remove(&node_path);
+            }
+        }
         let title = indicator
             .map(|s| s.to_string())
             .unwrap_or_else(|| card_title(&self.data.as_ref().unwrap().nodes[i]));
