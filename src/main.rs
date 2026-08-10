@@ -282,41 +282,120 @@ script_mod! {
                 border_size: 1.0
                 border_color: #ffffff14
             }
-            title := mod.widgets.Label{
-                width: Fill
-                text: "想学习什么？"
-                draw_text.text_style.font_size: 22.0
-                draw_text.color: #e6e9f0
-            }
-            hint := mod.widgets.Label{
-                width: Fill
-                text: "输入你想学习的概念，AI 会为你讲解"
-                draw_text.text_style.font_size: 13.0
-                draw_text.color: #aab0bc
-            }
-            hint2 := mod.widgets.Label{
-                width: Fill
-                text: "提示：可先在右侧「参考资料」中添加文档，提升回答准确率"
-                draw_text.text_style.font_size: 12.0
-                draw_text.color: #7a8192
-            }
-            input_row := mod.widgets.View{
+            goal_view := mod.widgets.View{
                 width: Fill
                 height: Fit
-                flow: Right
-                spacing: 8
-                start_input := mod.widgets.TextInput{
+                flow: Down
+                spacing: 14
+                title := mod.widgets.Label{
                     width: Fill
-                    height: (44.0)
-                    submit_on_enter: true
-                    empty_text: "提出要解释的概念…"
+                    text: "想学习什么？"
+                    draw_text.text_style.font_size: 22.0
+                    draw_text.color: #e6e9f0
                 }
-                start_send_btn := SendBtn{
-                    draw_icon +: {
-                        svg: crate_resource("self:resources/send.svg")
-                        color: #aab0bc
+                hint := mod.widgets.Label{
+                    width: Fill
+                    text: "输入你想学会的内容，AI 会先诊断你的知识水平，再规划学习路线"
+                    draw_text.text_style.font_size: 13.0
+                    draw_text.color: #aab0bc
+                }
+                hint2 := mod.widgets.Label{
+                    width: Fill
+                    text: "提示：可先在右侧「参考资料」中添加文档，规划会更贴合你的资料"
+                    draw_text.text_style.font_size: 12.0
+                    draw_text.color: #7a8192
+                }
+                input_row := mod.widgets.View{
+                    width: Fill
+                    height: Fit
+                    flow: Right
+                    spacing: 8
+                    start_input := mod.widgets.TextInput{
+                        width: Fill
+                        height: (44.0)
+                        submit_on_enter: true
+                        empty_text: "提出学习目标，如「学会浮力定律」…"
                     }
-                    icon_walk: Walk{width: 16, height: 16}
+                    start_send_btn := SendBtn{
+                        draw_icon +: {
+                            svg: crate_resource("self:resources/send.svg")
+                            color: #aab0bc
+                        }
+                        icon_walk: Walk{width: 16, height: 16}
+                    }
+                }
+            }
+            // Diagnostic interview phase: one adaptive question at a time.
+            diag_view := mod.widgets.View{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Down
+                spacing: 10
+                diag_goal_label := mod.widgets.Label{
+                    width: Fill
+                    text: ""
+                    draw_text.text_style.font_size: 13.0
+                    draw_text.color: #7a8192
+                }
+                diag_status := mod.widgets.Label{
+                    width: Fill
+                    text: ""
+                    draw_text.text_style.font_size: 13.0
+                    draw_text.color: #aab0bc
+                }
+                diag_question := mod.widgets.Label{
+                    width: Fill
+                    text: ""
+                    draw_text.text_style.font_size: 15.0
+                    draw_text.color: #e6e9f0
+                }
+                opt0 := mod.widgets.ButtonFlat{
+                    visible: false
+                    width: Fill
+                    text: ""
+                }
+                opt1 := mod.widgets.ButtonFlat{
+                    visible: false
+                    width: Fill
+                    text: ""
+                }
+                opt2 := mod.widgets.ButtonFlat{
+                    visible: false
+                    width: Fill
+                    text: ""
+                }
+                opt3 := mod.widgets.ButtonFlat{
+                    visible: false
+                    width: Fill
+                    text: ""
+                }
+                // TextInput ignores `visible` (its draw_walk never checks
+                // it), so the open-answer box toggles via this container.
+                diag_input_box := mod.widgets.View{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    diag_input := mod.widgets.TextInput{
+                        width: Fill
+                        height: (44.0)
+                        submit_on_enter: true
+                        empty_text: "输入你的回答…"
+                    }
+                }
+                diag_btn_row := mod.widgets.View{
+                    width: Fill
+                    height: Fit
+                    flow: Right
+                    spacing: 8
+                    diag_submit_btn := mod.widgets.ButtonFlat{
+                        width: Fit
+                        text: "提交，下一题"
+                    }
+                    diag_skip_btn := mod.widgets.ButtonFlat{
+                        width: Fit
+                        text: "跳过诊断，直接生成"
+                    }
                 }
             }
             skip_btn := mod.widgets.ButtonFlat{
@@ -927,6 +1006,28 @@ struct RagWait {
     started: Instant,
 }
 
+/// A learning-route plan request deferred until the hybrid RAG retrieval
+/// answers (or times out to the BM25 fallback).
+struct RouteWait {
+    goal: String,
+    /// Diagnostic transcript passed through to the route planner.
+    diag: String,
+    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    fallback: String,
+    started: Instant,
+}
+
+/// Startup popup phase: goal input vs the adaptive diagnostic interview.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupPhase {
+    Goal,
+    Diag,
+}
+
+/// Upper bound for the interview: after this many answered rounds the
+/// route is planned from the transcript alone (no further questions).
+const MAX_DIAG_ROUNDS: usize = 6;
+
 /// Upper bound for the retrieval pre-roll; on timeout the BM25 fallback
 /// context fires the request. Measured hybrid ≈ 11s (5 × ~2s rerank + embed),
 /// plus first-call reranker lazy load (~4s) and CPU contention from a
@@ -1045,6 +1146,44 @@ pub struct App {
     quiz_path: Option<String>,
     #[rust]
     quiz_body: Option<String>,
+    /// Deferred route planning waiting on hybrid RAG retrieval.
+    #[rust]
+    route_wait: Option<RouteWait>,
+    /// In-flight learning-route plan request.
+    #[rust]
+    route_id: LiveId,
+    /// The goal being planned (shown on the root card).
+    #[rust]
+    route_goal: String,
+    /// Rel path of the root goal card (set when the route starts).
+    #[rust]
+    route_root: String,
+    /// Diagnostic transcript, recorded on the root card and reused when the
+    /// route is re-planned later in the session.
+    #[rust]
+    route_diag: String,
+    /// In-flight diagnostic question request (startup popup interview).
+    #[rust]
+    diag_id: LiveId,
+    /// The goal being diagnosed.
+    #[rust]
+    diag_goal: String,
+    /// Interview transcript (question + user answer), oldest first.
+    #[rust]
+    diag_history: Vec<(crate::gen::DiagQuestion, String)>,
+    /// The question currently shown in the popup.
+    #[rust]
+    diag_current: Option<crate::gen::DiagQuestion>,
+    /// Single-choice selection (option index).
+    #[rust]
+    diag_single: Option<usize>,
+    /// Multi-choice selections.
+    #[rust]
+    diag_multi: [bool; 4],
+    /// True after one automatic retry of an empty/unparseable question
+    /// response (thinking models occasionally return empty content).
+    #[rust]
+    diag_retried: bool,
     /// In-flight quiz grading request.
     #[rust]
     grade_id: LiveId,
@@ -1063,6 +1202,24 @@ fn fmt_tokens(n: usize) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Seed body for a route card: the archetype marker (drives 生成/测试 prompt
+/// selection), the card's own input/output, and why it's in the route.
+fn route_card_seed_body(rc: &crate::gen::RouteCard) -> String {
+    let ctype = if rc.card_type == "knowledge" {
+        "联结模型"
+    } else {
+        "概念"
+    };
+    let mut body = format!("#c 知识类型 {ctype}\n");
+    if !rc.input.is_empty() || !rc.output.is_empty() {
+        body.push_str(&format!("\n#c 输入输出\n输入：{}\n输出：{}\n", rc.input, rc.output));
+    }
+    if !rc.reason.is_empty() {
+        body.push_str(&format!("\n#c 为何学\n{}\n", rc.reason));
+    }
+    body
 }
 
 impl App {
@@ -1380,7 +1537,7 @@ impl App {
         let input = self
             .popup_child(
                 live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(input_row), live_id!(start_input)],
+                &[live_id!(content), live_id!(panel), live_id!(goal_view), live_id!(input_row), live_id!(start_input)],
             )
             .as_text_input();
         for action in actions.filter_widget_actions_cast::<TextInputAction>(input.widget_uid()) {
@@ -1398,7 +1555,7 @@ impl App {
         if self
             .popup_child(
                 live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(input_row), live_id!(start_send_btn)],
+                &[live_id!(content), live_id!(panel), live_id!(goal_view), live_id!(input_row), live_id!(start_send_btn)],
             )
             .as_button()
             .clicked(actions)
@@ -1415,36 +1572,652 @@ impl App {
         {
             self.close_startup(cx);
         }
+        // Diagnostic interview: answer input focus, option toggles, submit.
+        let diag_input = self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box), live_id!(diag_input)],
+            )
+            .as_text_input();
+        for action in actions.filter_widget_actions_cast::<TextInputAction>(diag_input.widget_uid()) {
+            match action {
+                TextInputAction::KeyFocus => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(true, Ordering::Relaxed)
+                }
+                TextInputAction::KeyFocusLost => {
+                    crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed)
+                }
+                TextInputAction::Returned(_, _) => self.submit_diag_answer(cx),
+                _ => {}
+            }
+        }
+        for i in 0..4 {
+            let opt = self
+                .popup_child(
+                    live_id!(startup_popup),
+                    &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
+                )
+                .as_button();
+            if opt.clicked(actions) {
+                match self.diag_current.as_ref().map(|q| q.kind.as_str()) {
+                    Some("single") => self.diag_single = Some(i),
+                    Some("multi") => self.diag_multi[i] = !self.diag_multi[i],
+                    _ => {}
+                }
+                self.sync_diag_options(cx);
+            }
+        }
+        if self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row), live_id!(diag_submit_btn)],
+            )
+            .as_button()
+            .clicked(actions)
+        {
+            self.submit_diag_answer(cx);
+        }
+        if self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row), live_id!(diag_skip_btn)],
+            )
+            .as_button()
+            .clicked(actions)
+        {
+            self.finish_diag(cx, "");
+        }
     }
 
-    /// Dismiss the startup page and (when a concept is given) start a chat
-    /// about it in the AI panel.
+    /// Start the adaptive diagnostic interview for `goal` (startup popup
+    /// stays open, switches to the diag phase).
     fn submit_concept(&mut self, cx: &mut Cx, text: &str) {
         let text = text.trim().to_string();
-        self.close_startup(cx);
         if text.is_empty() {
             return;
         }
-        let panel = self.ui.float_panel(cx, ids!(ai_panel));
-        if !panel.opened() {
-            self.toggle_ai_panel(cx);
+        self.begin_diag(cx, &text);
+    }
+
+    /// Enter the diagnostic phase for `goal`: reset the session, switch the
+    /// popup to the interview view, and fire the first question.
+    fn begin_diag(&mut self, cx: &mut Cx, goal: &str) {
+        if self.diag_id != LiveId::empty() || goal.trim().is_empty() {
+            return;
         }
-        self.send_chat(cx, &text);
+        if self.ai_config.api_key.trim().is_empty() {
+            self.close_startup(cx);
+            self.push_chat_msg(cx, "assistant", "请先在 Setting 中配置 API Key 再生成学习路线");
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        self.reset_diag();
+        self.diag_goal = goal.trim().to_string();
+        self.set_startup_phase(cx, StartupPhase::Diag);
+        self.popup_widget(live_id!(startup_popup)).as_popup_panel().show(cx);
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_goal_label)],
+        )
+        .as_label()
+        .set_text(cx, &format!("学习目标：{}", self.diag_goal));
+        self.send_diag_request(cx);
+    }
+
+    /// Fire the next diagnostic question request (BM25 context only — the
+    /// interview must stay snappy; the final route request uses hybrid RAG).
+    fn send_diag_request(&mut self, cx: &mut Cx) {
+        if self.diag_id != LiveId::empty() || self.diag_goal.is_empty() {
+            return;
+        }
+        let goal = self.diag_goal.clone();
+        let ctx = self.rag_bm25_context(&goal);
+        let (system, user) = crate::gen::diagnostic_messages(&goal, &ctx, &self.diag_history);
+        self.diag_id = LiveId::unique();
+        self.set_diag_status(cx, "正在出题…");
+        // Clear the answered question so the popup shows a clean waiting
+        // state until the next question arrives.
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_question)],
+        )
+        .as_label()
+        .set_text(cx, "");
+        for i in 0..4 {
+            self.popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
+            )
+            .as_button()
+            .set_visible(cx, false);
+        }
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box)],
+        )
+        .set_visible(cx, false);
+        ai::chat_completions(
+            cx,
+            self.diag_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            358400,
+        );
+    }
+
+    fn handle_diag_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.diag_id = LiveId::empty();
+        // Popup closed mid-interview (user bailed): drop the session.
+        if !self.popup_widget(live_id!(startup_popup)).as_popup_panel().opened() {
+            self.reset_diag();
+            return;
+        }
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            self.set_diag_status(cx, &format!("出题失败 ({}): {}", response.status_code, detail));
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        match crate::gen::parse_diag_step(&content) {
+            Ok(crate::gen::DiagStep::Question(q)) => {
+                self.diag_current = Some(q);
+                self.diag_single = None;
+                self.diag_multi = [false; 4];
+                self.render_diag_question(cx);
+            }
+            Ok(crate::gen::DiagStep::Done(summary)) => self.finish_diag(cx, &summary),
+            Err(e) => {
+                // Empty/unparseable content is often a transient thinking-model
+                // response; retry once before surfacing the failure.
+                if !self.diag_retried {
+                    self.diag_retried = true;
+                    self.send_diag_request(cx);
+                    return;
+                }
+                let debug = ai::response_debug_preview(response);
+                self.set_diag_status(
+                    cx,
+                    &format!("出题解析失败：{e}（{debug}）。可点「跳过诊断，直接生成」"),
+                );
+            }
+        }
+    }
+
+    /// Render the current question in the popup: status, question text,
+    /// option buttons (or the open-answer input).
+    fn render_diag_question(&mut self, cx: &mut Cx) {
+        let Some(q) = &self.diag_current else { return };
+        let n = self.diag_history.len() + 1;
+        let status = if q.target.is_empty() {
+            format!("第 {n} 题")
+        } else {
+            format!("第 {n} 题 · 探测：{}", q.target)
+        };
+        self.set_diag_status(cx, &status);
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_question)],
+        )
+        .as_label()
+        .set_text(cx, &q.question);
+        let is_open = q.kind == "open";
+        for i in 0..4 {
+            let opt = self
+                .popup_child(
+                    live_id!(startup_popup),
+                    &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
+                )
+                .as_button();
+            opt.set_visible(cx, !is_open && i < q.options.len());
+        }
+        // Toggle the container, not the TextInput (which ignores `visible`).
+        let input_box = self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box)],
+        );
+        input_box.set_visible(cx, is_open);
+        if is_open {
+            self.popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box), live_id!(diag_input)],
+            )
+            .as_text_input()
+            .set_text(cx, "");
+        }
+        self.sync_diag_options(cx);
+    }
+
+    /// Refresh the option buttons' selection markers (●/○ single, ☑/☐ multi).
+    fn sync_diag_options(&mut self, cx: &mut Cx) {
+        let Some(q) = &self.diag_current else { return };
+        for i in 0..q.options.len() {
+            let mark = match q.kind.as_str() {
+                "single" => {
+                    if self.diag_single == Some(i) {
+                        "● "
+                    } else {
+                        "○ "
+                    }
+                }
+                "multi" => {
+                    if self.diag_multi[i] {
+                        "☑ "
+                    } else {
+                        "☐ "
+                    }
+                }
+                _ => "",
+            };
+            self.popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
+            )
+            .as_button()
+            .set_text(cx, &format!("{mark}{}", q.options[i]));
+        }
+    }
+
+    fn set_diag_status(&self, cx: &mut Cx, text: &str) {
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_status)],
+        )
+        .as_label()
+        .set_text(cx, text);
+    }
+
+    fn opt_id(i: usize) -> LiveId {
+        match i {
+            0 => live_id!(opt0),
+            1 => live_id!(opt1),
+            2 => live_id!(opt2),
+            _ => live_id!(opt3),
+        }
+    }
+
+    fn option_letter(i: usize) -> String {
+        char::from(b'A' + i as u8).to_string()
+    }
+
+    /// Collect the user's answer for the current question (None when they
+    /// haven't answered yet).
+    fn collect_diag_answer(&mut self) -> Option<String> {
+        let q = self.diag_current.as_ref()?;
+        match q.kind.as_str() {
+            "single" => self.diag_single.map(Self::option_letter),
+            "multi" => {
+                let sel: Vec<usize> = (0..4)
+                    .filter(|&i| self.diag_multi[i] && i < q.options.len())
+                    .collect();
+                if sel.is_empty() {
+                    None
+                } else {
+                    Some(
+                        sel.iter()
+                            .map(|&i| Self::option_letter(i))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                }
+            }
+            "open" => {
+                let text = self
+                    .popup_child(
+                        live_id!(startup_popup),
+                        &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box), live_id!(diag_input)],
+                    )
+                    .as_text_input()
+                    .text();
+                let t = text.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Append the current answer to the transcript and fire the next round;
+    /// at the cap, plan the route from the transcript alone.
+    fn submit_diag_answer(&mut self, cx: &mut Cx) {
+        let Some(q) = self.diag_current.clone() else {
+            return;
+        };
+        let Some(ans) = self.collect_diag_answer() else {
+            self.set_diag_status(
+                cx,
+                if q.kind == "open" {
+                    "请输入你的回答"
+                } else {
+                    "请先选择答案"
+                },
+            );
+            return;
+        };
+        self.diag_history.push((q, ans));
+        self.diag_current = None;
+        if self.diag_history.len() >= MAX_DIAG_ROUNDS {
+            self.finish_diag(cx, "");
+        } else {
+            self.send_diag_request(cx);
+        }
+    }
+
+    /// Close the popup and plan the route with the interview transcript
+    /// (plus the model's summary when it stopped early).
+    fn finish_diag(&mut self, cx: &mut Cx, summary: &str) {
+        let goal = self.diag_goal.clone();
+        let mut diag = crate::gen::format_diag_history(&self.diag_history);
+        if !summary.is_empty() {
+            if !diag.is_empty() {
+                diag.push('\n');
+            }
+            diag.push_str(&format!("诊断摘要：{summary}"));
+        }
+        self.reset_diag();
+        self.close_startup(cx);
+        self.start_route_plan(cx, &goal, &diag);
+    }
+
+    fn reset_diag(&mut self) {
+        self.diag_id = LiveId::empty();
+        self.diag_goal.clear();
+        self.diag_history.clear();
+        self.diag_current = None;
+        self.diag_single = None;
+        self.diag_multi = [false; 4];
+        self.diag_retried = false;
+    }
+
+    /// Switch the startup popup between the goal-input and diag phases.
+    fn set_startup_phase(&mut self, cx: &mut Cx, phase: StartupPhase) {
+        let goal_view = self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(goal_view)],
+        );
+        goal_view.set_visible(cx, phase == StartupPhase::Goal);
+        let diag_view = self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view)],
+        );
+        diag_view.set_visible(cx, phase == StartupPhase::Diag);
+    }
+
+    /// Kick off learning-route planning for `goal`: ensure the root goal card
+    /// exists (creating it on an empty map), then request the route JSON from
+    /// the model. Re-planning is refused when the route already has cards.
+    fn start_route_plan(&mut self, cx: &mut Cx, goal: &str, diagnostics: &str) {
+        if self.route_id != LiveId::empty() || self.route_wait.is_some() {
+            return;
+        }
+        if self.ai_config.api_key.trim().is_empty() {
+            self.push_chat_msg(cx, "assistant", "请先在 Setting 中配置 API Key 再生成学习路线");
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        let base = crate::util::app_base_dir();
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        let Some(map_file) = mind_map.current_map_file() else {
+            return;
+        };
+        let existing = mind_map.card_rel_paths();
+        if existing.len() > 1 {
+            self.push_chat_msg(
+                cx,
+                "assistant",
+                "当前地图已有学习路线卡片，暂不支持重新规划。",
+            );
+            self.ensure_ai_panel_open(cx);
+            return;
+        }
+        // Root card: reuse the existing one (menu path) or create it fresh.
+        let root_rel = if existing.len() == 1 {
+            existing[0].clone()
+        } else {
+            let Some(rel) = self.create_route_card_file(&map_file, "00", goal) else {
+                return;
+            };
+            // The goal itself is the target knowledge (联结模型): it gets
+            // the knowledge-card prompts for 生成/测试.
+            let body = format!("#c 知识类型 联结模型\n\n#d 学习目标\n{goal}\n");
+            if std::fs::write(base.join(&rel), body).is_err() {
+                return;
+            }
+            if std::fs::write(base.join(&map_file), mindmap::route_map_json(goal, &rel, &[])).is_err() {
+                return;
+            }
+            mind_map.reload_map(cx);
+            rel
+        };
+        self.route_goal = goal.to_string();
+        self.route_root = root_rel.clone();
+        self.route_diag = diagnostics.to_string();
+        self.set_card_title_indicator(cx, &root_rel, Some("规划中…"));
+        let fallback = self.rag_bm25_context(goal);
+        let upgradeable = self
+            .rag
+            .as_ref()
+            .is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
+        if upgradeable {
+            let rx = self.rag.as_ref().unwrap().retrieve(goal);
+            self.route_wait = Some(RouteWait {
+                goal: goal.to_string(),
+                diag: diagnostics.to_string(),
+                rx,
+                fallback,
+                started: Instant::now(),
+            });
+        } else {
+            self.send_route_request(cx, goal, diagnostics, &fallback);
+        }
+    }
+
+    /// Create a route card file `cards/<map stem>/<prefix>-<title>.md`,
+    /// unique-ified with a numeric suffix when the name is taken.
+    fn create_route_card_file(&self, map_file: &str, prefix: &str, title: &str) -> Option<String> {
+        let stem = map_file
+            .strip_prefix("maps/")
+            .unwrap_or(map_file)
+            .strip_suffix(".json")
+            .unwrap_or(map_file);
+        let safe = crate::file_panel::normalize_name(title, Some(".md"))
+            .unwrap_or_else(|| "未命名.md".to_string());
+        let safe = safe.strip_suffix(".md").unwrap_or(&safe).to_string();
+        let base = crate::util::app_base_dir();
+        for n in 0.. {
+            let fname = if n == 0 {
+                format!("{prefix}-{safe}.md")
+            } else {
+                format!("{prefix}-{safe}-{n}.md")
+            };
+            let p = base.join("cards").join(stem).join(&fname);
+            if !p.exists() {
+                std::fs::create_dir_all(p.parent()?).ok()?;
+                std::fs::write(&p, "").ok()?;
+                return Some(format!("cards/{stem}/{fname}"));
+            }
+        }
+        None
+    }
+
+    /// Fire the route-plan request (non-streaming).
+    fn send_route_request(&mut self, cx: &mut Cx, goal: &str, diagnostics: &str, context: &str) {
+        self.route_id = LiveId::unique();
+        let (system, user) = crate::gen::route_plan_messages(goal, context, diagnostics);
+        ai::chat_completions(
+            cx,
+            self.route_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            358400,
+        );
+    }
+
+    /// Abort route planning and surface `msg` in the AI panel.
+    fn abort_route(&mut self, cx: &mut Cx, msg: String) {
+        self.route_wait = None;
+        self.route_id = LiveId::empty();
+        if !self.route_root.is_empty() {
+            self.set_card_title_indicator(cx, &self.route_root, None);
+        }
+        self.push_chat_msg(cx, "assistant", &msg);
+        self.ensure_ai_panel_open(cx);
+    }
+
+    /// Materialize a parsed route plan: write the card files, rebuild the map
+    /// tree under the root goal card, and reload the canvas.
+    fn handle_route_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.route_id = LiveId::empty();
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            self.abort_route(cx, format!("路线规划失败 ({}): {}", response.status_code, detail));
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        let plan = match crate::gen::parse_route_plan(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                self.abort_route(cx, format!("路线解析失败：{e}"));
+                return;
+            }
+        };
+        let base = crate::util::app_base_dir();
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        let Some(map_file) = mind_map.current_map_file() else {
+            self.abort_route(cx, "路线生成失败：当前地图不存在".to_string());
+            return;
+        };
+        if self.route_root.is_empty() {
+            self.abort_route(cx, "路线生成失败：缺少根卡片".to_string());
+            return;
+        }
+        // Card files, numbered by learning order (leaves first). Reuse an
+        // existing library card when its title matches — never overwrite a
+        // non-empty body (other maps may reference the file).
+        let existing_cards = crate::file_panel::all_card_files(&base);
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cards: Vec<(String, String, String, Option<String>)> = Vec::new();
+        for (n, &ci) in crate::gen::learning_order(&plan.cards).iter().enumerate() {
+            let rc = &plan.cards[ci];
+            let rel = match crate::gen::match_card_path(&existing_cards, &rc.title)
+                .filter(|p| !used.contains(p))
+            {
+                Some(p) => {
+                    used.insert(p.clone());
+                    let full = base.join(&p);
+                    let body = std::fs::read_to_string(&full).unwrap_or_default();
+                    if body.trim().is_empty() {
+                        std::fs::write(&full, route_card_seed_body(rc)).ok();
+                    }
+                    p
+                }
+                None => {
+                    let Some(rel) =
+                        self.create_route_card_file(&map_file, &format!("{:02}", n + 1), &rc.title)
+                    else {
+                        self.abort_route(cx, format!("创建卡片失败：{}", rc.title));
+                        return;
+                    };
+                    if std::fs::write(base.join(&rel), route_card_seed_body(rc)).is_err() {
+                        self.abort_route(cx, format!("写入卡片失败：{}", rc.title));
+                        return;
+                    }
+                    rel
+                }
+            };
+            cards.push((rc.id.clone(), rc.title.clone(), rel, rc.parent.clone()));
+        }
+        // Goal analysis lands on the root card.
+        let root_path = base.join(&self.route_root);
+        let mut body = std::fs::read_to_string(&root_path).unwrap_or_default();
+        if !plan.goal_input.is_empty() {
+            body = crate::gen::upsert_section(&body, "#c 输入空间", &plan.goal_input);
+        }
+        if !plan.goal_output.is_empty() {
+            body = crate::gen::upsert_section(&body, "#c 输出空间", &plan.goal_output);
+        }
+        if !self.route_diag.is_empty() {
+            body = crate::gen::upsert_section(&body, "#c 用户情况", &self.route_diag);
+        }
+        std::fs::write(&root_path, body).ok();
+        std::fs::write(
+            base.join(&map_file),
+            mindmap::route_map_json(&self.route_goal, &self.route_root, &cards),
+        )
+        .ok();
+        mind_map.reload_map(cx);
+        self.set_card_title_indicator(cx, &self.route_root, None);
+        if let Some(rag) = &self.rag {
+            rag.set_map(&map_file);
+        }
+        self.push_chat_msg(
+            cx,
+            "assistant",
+            &format!(
+                "学习路线已生成：{} 张卡片（概念卡 {} 张，知识卡 {} 张）。\n\
+                 每张卡片右键「生成」学习材料、「测试」验证掌握程度；根卡片记录了学习目标的输入输出。",
+                plan.cards.len(),
+                plan.cards.iter().filter(|c| c.card_type == "concept").count(),
+                plan.cards.iter().filter(|c| c.card_type == "knowledge").count(),
+            ),
+        );
+        self.ensure_ai_panel_open(cx);
+    }
+
+    /// Poll deferred route-plan retrieval and promote it to a real request.
+    fn handle_route_rag_tick(&mut self, cx: &mut Cx) {
+        let Some(wait) = &mut self.route_wait else { return };
+        let now = Instant::now();
+        let hits = match wait.rx.try_recv() {
+            Ok(r) if r.query == wait.goal => Some(r.hits),
+            Ok(_) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
+            Err(_) => Some(Vec::new()),
+        };
+        let Some(hits) = hits else { return };
+        let ctx = if hits.is_empty() {
+            wait.fallback.clone()
+        } else {
+            rag::service::format_context(&hits)
+        };
+        let goal = wait.goal.clone();
+        let diag = wait.diag.clone();
+        self.route_wait = None;
+        self.send_route_request(cx, &goal, &diag, &ctx);
     }
 
     fn close_startup(&mut self, cx: &mut Cx) {
         // The input can't emit KeyFocusLost once the popup is gone.
         crate::float_panel::CHAT_INPUT_ACTIVE.store(false, Ordering::Relaxed);
+        self.reset_diag();
         self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
     }
 
-    /// Open the startup welcome page, clearing any leftover input text.
+    /// Open the startup welcome page, clearing any leftover input text and
+    /// resetting the diagnostic session back to the goal-input phase.
     fn show_startup(&mut self, cx: &mut Cx) {
+        self.reset_diag();
+        self.set_startup_phase(cx, StartupPhase::Goal);
         self.popup_child(
             live_id!(startup_popup),
             &[
                 live_id!(content),
                 live_id!(panel),
+                live_id!(goal_view),
                 live_id!(input_row),
                 live_id!(start_input),
             ],
@@ -1962,6 +2735,7 @@ impl App {
             self.ui.label(cx, ids!(rag_status)).set_text(cx, &text);
         }
         self.handle_gen_rag_tick(cx);
+        self.handle_route_rag_tick(cx);
         let Some(wait) = &mut self.rag_wait else {
             return;
         };
@@ -2057,6 +2831,19 @@ impl App {
         }
         if let Some(path) = mind_map.quiz_clicked(actions) {
             self.start_quiz(cx, &path);
+        }
+        if let Some(path) = mind_map.route_clicked(actions) {
+            // The menu only offers planning on the root goal card; the goal
+            // text is the card's file stem (minus a numeric order prefix).
+            // Same as the startup path: run the diagnostic interview first.
+            let goal = std::path::Path::new(&path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .map(|s| crate::gen::strip_order_prefix(&s).to_string())
+                .unwrap_or_default();
+            if !goal.is_empty() {
+                self.begin_diag(cx, &goal);
+            }
         }
         if let Some(pos) = mind_map.canvas_menu_clicked(actions) {
             self.open_card_picker(cx, pos);
@@ -2203,7 +2990,10 @@ impl App {
         let done = self.gen_total.saturating_sub(self.gen_sections.len() + 1);
         let indicator = format!("生成中… ({}/{})", done + 1, self.gen_total);
         self.set_card_title_indicator(cx, &self.gen_path, Some(&indicator));
-        let (system, user) = generation_messages(section, &self.gen_title, &self.gen_context);
+        let body = std::fs::read_to_string(crate::util::app_base_dir().join(&self.gen_path))
+            .unwrap_or_default();
+        let ctype = crate::gen::card_type(&body);
+        let (system, user) = generation_messages(section, &self.gen_title, &self.gen_context, ctype);
         ai::chat_completions(
             cx,
             self.gen_id,
@@ -2291,7 +3081,7 @@ impl App {
         self.quiz_body = Some(body.clone());
         quiz_panel.show_loading(cx, &title);
         self.quiz_id = LiveId::unique();
-        let (system, user) = quiz_generation_messages(&body);
+        let (system, user) = quiz_generation_messages(&body, crate::gen::card_type(&body));
         ai::chat_completions(
             cx,
             self.quiz_id,
@@ -2460,6 +3250,14 @@ impl MatchEvent for App {
             self.handle_gen_response(cx, response);
             return;
         }
+        if request_id == self.route_id && self.route_id != LiveId::empty() {
+            self.handle_route_response(cx, response);
+            return;
+        }
+        if request_id == self.diag_id && self.diag_id != LiveId::empty() {
+            self.handle_diag_response(cx, response);
+            return;
+        }
         if request_id == self.quiz_id && self.quiz_id != LiveId::empty() {
             self.handle_quiz_response(cx, response);
             return;
@@ -2488,6 +3286,15 @@ impl MatchEvent for App {
         if request_id == self.gen_id && self.gen_id != LiveId::empty() {
             self.gen_id = LiveId::empty();
             self.abort_generation(cx, format!("生成请求失败：{}", err.message));
+            return;
+        }
+        if request_id == self.route_id && self.route_id != LiveId::empty() {
+            self.abort_route(cx, format!("路线规划请求失败：{}", err.message));
+            return;
+        }
+        if request_id == self.diag_id && self.diag_id != LiveId::empty() {
+            self.diag_id = LiveId::empty();
+            self.set_diag_status(cx, &format!("出题请求失败：{}", err.message));
             return;
         }
         if request_id == self.quiz_id && self.quiz_id != LiveId::empty() {

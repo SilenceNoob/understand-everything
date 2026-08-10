@@ -100,24 +100,55 @@ pub fn section_kind(header: &str) -> Option<SectionKind> {
     }
 }
 
+/// Card archetype per the learning theory: 概念卡 = 判别模型 (给对象判概念),
+/// 知识卡 = 联结模型 (由输入常量推测输出常量).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardType {
+    Concept,
+    Knowledge,
+}
+
+/// Detect a card's archetype from the route-seeded marker line
+/// `#c 知识类型 联结模型` (absent -> concept, the legacy default).
+pub fn card_type(body: &str) -> CardType {
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#c 知识类型") && t.contains("联结") {
+            return CardType::Knowledge;
+        }
+    }
+    CardType::Concept
+}
+
 /// Build the (system, user) messages for generating a section of a card.
 /// `context` is the BM25/hybrid excerpt block from `rag::service::format_context`.
+/// Concept cards explain a 判别模型 (intension + 正负例); knowledge cards
+/// explain a 联结模型 (输入/输出空间 + 映射关系 + 归纳实例 + 适用边界).
 pub fn generation_messages(
     section: GenSection,
     concept_title: &str,
     context: &str,
+    ctype: CardType,
 ) -> (String, String) {
+    let system_prompt = match ctype {
+        CardType::Concept => generation_system_prompt(),
+        CardType::Knowledge => knowledge_generation_system_prompt(),
+    };
     let system = if context.is_empty() {
-        generation_system_prompt()
+        system_prompt
     } else {
-        format!("{context}\n\n{}", generation_system_prompt())
+        format!("{context}\n\n{system_prompt}")
+    };
+    let what = match ctype {
+        CardType::Concept => "概念",
+        CardType::Knowledge => "知识（联结模型）",
     };
     let user = match section {
         GenSection::All => format!(
-            "概念：{concept_title}\n\n请按顺序完整输出全部七个板块（抽象描述、通俗描述、3 个正例、1~2 个负例、作用、影响什么、被什么影响），格式见系统提示。"
+            "{what}：{concept_title}\n\n请按顺序完整输出全部七个板块（抽象描述、通俗描述、3 个正例、1~2 个负例、作用、影响什么、被什么影响），格式见系统提示。"
         ),
         _ => format!(
-            "概念：{concept_title}\n\n只输出「{}」这一板块，标签行格式为 `{}`。{}",
+            "{what}：{concept_title}\n\n只输出「{}」这一板块，标签行格式为 `{}`。{}",
             section.label(),
             section.pattern(),
             single_output_format(section)
@@ -157,6 +188,53 @@ fn generation_system_prompt() -> String {
      哪些事物会影响此概念，用 * 逐条罗列。\n\
      \n\
      注意：卡片文件名可能带有排序用的序号前缀（如「04-lifetime」），正文中请使用概念的自然名称（如「lifetime」或其中文译名）。\n\
+     \n\
+     【输出要求】\n\
+     1. 每个板块简短精炼，优先依据参考资料，参考资料不足时基于自己的知识补充。\n\
+     2. 只输出板块标签行和对应内容，不要输出其他说明、总结或 markdown 代码块。\n\
+     3. 每个标签行独占一行，内容可占多行。".to_string()
+}
+
+/// System prompt for knowledge (联结模型) cards: the card documents the
+/// input/output spaces and the mapping, plus 已见 instances (归纳依据) and
+/// out-of-extension situations (适用边界, 防判联错配).
+fn knowledge_generation_system_prompt() -> String {
+    "你是一位知识（联结模型）学习材料写作助手，依据概念学习理论为给定的知识生成学习材料。\n\
+     \n\
+     【理论基础】\n\
+     - 知识 = 联结模型：从「一个概念（变量）的外延」到「另一个概念（变量）的外延」的映射，\
+     由已见的「输入常量→输出常量」对应归纳而来；应用时用「输入常量」推测「输出常量」。\n\
+     - 材料核心：讲清楚输入空间（哪些现象属于输入空间，是适用对象）、输出空间、映射关系（通用规律），\
+     用已见实例展示「输入→输出」的对应，用不适用情形展示输入空间之外的对象（判别条件不足/对象层丢失/判联错配）。\n\
+     \n\
+     【输出格式】\n\
+     按以下板块输出（「总结标题」「例子名」「短标题」由你自拟）：\n\
+     #d {总结标题}\n\
+     抽象描述：内容开头写「输入空间：」，用 * 逐条罗列可判别的输入常量范围（哪些现象适用此知识）；\
+     再写「输出空间：」，用 * 罗列推测出的输出常量范围；最后写「映射关系：」，描述输入到输出的通用规律。\
+     这些是判断「哪些现象能用此知识处理、会得到什么结果」的依据，不要写成散文式讲解。\n\
+     \n\
+     #t {总结标题}\n\
+     通俗描述：用大白话和生活化比喻解释这个知识是做什么的、什么时候用，让外行也能看懂。\n\
+     \n\
+     #e {例子名}(正例)\n\
+     2~3 个已见实例板块，每个板块一个实例：从输入到输出的具体对应，是归纳此知识的依据。\
+     每个实例先散文描述场景，再写「输入→输出」：逐条指出输入常量、输出常量以及如何体现映射关系。实例之间要有差异。\n\
+     \n\
+     #e {例子名}(负例)\n\
+     1~2 个不适用情形板块：与输入空间相似、但不属于输入空间的现象（或套用此知识会推测出错的情形），\
+     指出它缺少输入空间所需的哪些判别特征、为什么不能用此知识处理。\n\
+     \n\
+     #c 作用 {短标题}\n\
+     学会这个知识后能解决什么实际问题（能推测什么输出）。\n\
+     \n\
+     #c influence_to {短标题}\n\
+     此知识影响/决定了哪些事物，用 * 逐条罗列。\n\
+     \n\
+     #c influenced_by {短标题}\n\
+     哪些事物会影响此知识的成立（前提条件），用 * 逐条罗列。\n\
+     \n\
+     注意：卡片文件名可能带有排序用的序号前缀（如「04-lifetime」），正文中请使用知识的自然名称。\n\
      \n\
      【输出要求】\n\
      1. 每个板块简短精炼，优先依据参考资料，参考资料不足时基于自己的知识补充。\n\
@@ -348,6 +426,449 @@ pub fn quiz_ready(body: &str) -> Result<(), Vec<String>> {
     }
 }
 
+/// A route card as planned by the model: one learning task on the map.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RouteCard {
+    /// Unique id within the plan; "root" is reserved for the goal card.
+    pub id: String,
+    /// Parent card id; None = direct child of the root (goal) card.
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub title: String,
+    /// "concept" = 判别模型卡, "knowledge" = 联结模型卡.
+    #[serde(rename = "type")]
+    pub card_type: String,
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub output: String,
+    /// Why this card exists in the route (its role in the learning order).
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// The model's route plan: goal analysis (输入/输出空间) plus the card tree.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RoutePlan {
+    #[serde(default)]
+    pub goal_input: String,
+    #[serde(default)]
+    pub goal_output: String,
+    pub cards: Vec<RouteCard>,
+}
+
+/// Build the (system, user) messages for planning a learning route from a
+/// goal. `context` is the BM25/hybrid excerpt block from
+/// `rag::service::format_context` (empty when no refs are available);
+/// `diagnostics` is the interview transcript from `format_diag_history`
+/// (empty when the user skipped the diagnostic phase).
+pub fn route_plan_messages(goal: &str, context: &str, diagnostics: &str) -> (String, String) {
+    let system = "你是一位学习路线规划助手，依据下面的概念学习理论，把一个学习目标拆解成一张知识卡片学习路线图。\n\
+         \n\
+         【理论基础】\n\
+         - 知识 = 判别模型 + 联结模型。判别模型：根据「内涵（共有属性/判别条件）」把「一个对象」判别为\
+         「此概念」或「非此概念」，输出只是标签；联结模型：从「一个概念的外延」到「另一个概念的外延」的映射，\
+         用「输入常量」推测「输出常量」。知识 = 联结模型，其输入/输出概念必须先有对应的判别模型。\n\
+         - 学习的第一原则是「明确输入输出」：明确知识的输入空间（对象层：学习者要面对的现象集合）和\
+         输出空间（学会后要能推测/产出的结果），即明确每个概念的外延。\n\
+         - 两种常见的失败：对象层丢失（只背联结模型，无法把现实现象判别到概念下，知识悬空）和\
+         判联错配（用错误的判别模型套用联结模型，产生推理谬误）。路线必须让每个概念的判别模型先于\
+         使用它的联结模型出现，且每张卡都要写明自己的输入输出。\n\
+         - 学习顺序：先学概念（判别模型），再学基于这些概念的联结模型（知识）。拆解树中，\
+         「子卡是父卡的前置」：要学会父卡，必须先掌握它的子卡；学习顺序从叶子到根，根卡片（学习目标）最后学。\n\
+         \n\
+         【因材施教】\n\
+         当提供用户诊断记录时，路线必须针对用户的已有知识裁剪（这是本助手的核心职责）：\n\
+         - 用户已能正确判别/运用的概念与知识：不单独出卡，也不向下拆它的前置（它已是叶子）。\n\
+         - 用户部分掌握、但它是学习目标或必要前置的：出薄卡，reason 注明「快速复习：<具体薄弱点>」。\n\
+         - 用户答错、答不出或跳过的：补齐其前置概念卡，reason 注明该薄弱点，后续材料生成应更详细。\n\
+         - 诊断记录与路线矛盾时，以诊断记录为准。\n\
+         \n\
+         【任务】\n\
+         1. 明确输入输出：分析学习目标的输入空间（学会后要能判别/处理哪些现象）和输出空间（学会后要能\
+         推测/产出什么）。\n\
+         2. 递归拆解学习任务（重点：拆成树，不是一条链）：\n\
+         - 根卡 = 学习目标本身（最后学）。从根卡开始拆：目标知识（联结模型）涉及的输入概念、输出概念、\
+         关键中间概念，全部拆为根卡的直接子卡。一个联结模型至少涉及两个概念（输入+输出），\
+         所以树天然应当分叉；若某张卡的子卡只有一个，检查是否是拆解不足（通常应有多个前置）。\n\
+         - 对每张新拆出的卡继续递归：掌握它是否还需要更基础的概念/知识？需要就继续拆成它的子卡。\
+         一直拆到「用户已掌握」（见诊断记录）或「凭日常经验即可判别」的概念才停止。\n\
+         - 卡片总数 8~15 张；每个分支的深度由用户水平决定，不要为了凑数把树压成链。\n\
+         - 对偏内隐（判别条件难以言述，如「悲伤」这类）的概念，在 reason 中注明「需大量正反例」。\n\
+         \n\
+         【输出】\n\
+         必须只输出 JSON，不要 markdown 代码块、不要解释：\n\
+         {{\n\
+           \"goal_input\": \"学习目标的输入空间：…\",\n\
+           \"goal_output\": \"学习目标的输出空间：…\",\n\
+           \"cards\": [\n\
+             {{\"id\": \"c1\", \"parent\": null, \"title\": \"输入概念 A\", \"type\": \"concept\", \
+         \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}},\n\
+             {{\"id\": \"c2\", \"parent\": null, \"title\": \"输出概念 B\", \"type\": \"concept\", \
+         \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}},\n\
+             {{\"id\": \"c3\", \"parent\": \"c1\", \"title\": \"A 的更基础前置\", \"type\": \"concept\", \
+         \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}}\n\
+           ]\n\
+         }}\n\
+         要求：id 唯一且不能是 \"root\"；parent 必须是已出现的卡片 id 或 null（null = 根卡片之子）；\
+         type 只能是 \"concept\" 或 \"knowledge\"；卡片标题是概念/知识的自然名称，不要带序号前缀，\
+         也不要包含 / 、\\ 等路径字符；输入输出要具体到能指导后续生成学习材料。"
+            .to_string();
+    let mut user = if context.is_empty() {
+        format!("学习目标：{goal}\n\n没有参考资料，请基于自己的知识规划。")
+    } else {
+        format!("学习目标：{goal}\n\n参考资料（供规划时参考，可能不完整）：\n{context}")
+    };
+    if !diagnostics.is_empty() {
+        user.push_str(&format!("\n\n【用户情况】（诊断记录，已标注答对/答错）\n{diagnostics}"));
+    }
+    (system, user)
+}
+
+/// One round of the adaptive diagnostic interview: a question probing one
+/// concept's 判别模型 or one knowledge's 联结模型.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DiagQuestion {
+    /// "single" | "multi" | "open"
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub question: String,
+    /// Options with letter prefixes ("A. …"), single/multi only.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Normalized correct answer letters: ["A"] single, ["A","C"] multi.
+    #[serde(default)]
+    pub answer: Vec<String>,
+    /// Reference answer for open questions (and context for the grader).
+    #[serde(default)]
+    pub reference_answer: String,
+    /// The concept/knowledge this question probes.
+    #[serde(default)]
+    pub target: String,
+}
+
+/// The model's next move in the adaptive interview.
+pub enum DiagStep {
+    Question(DiagQuestion),
+    /// Interview over; the summary assesses the user's mastery.
+    Done(String),
+}
+
+/// Build the (system, user) messages for the next adaptive diagnostic round.
+/// `history` holds prior rounds (question + user answer, oldest first);
+/// empty = first question. `context` is the BM25 excerpt block.
+pub fn diagnostic_messages(
+    goal: &str,
+    context: &str,
+    history: &[(DiagQuestion, String)],
+) -> (String, String) {
+    let system = "你是一位学习诊断面试官，依据概念学习理论，通过一次一道题探明用户已有的知识，\
+为后续规划个性化学习路线做准备。\n\
+         \n\
+         【理论基础】\n\
+         - 学会 = 建构概念的判别模型（根据内涵把对象判别为此概念/非此概念）+ 知识的联结模型\
+（由输入常量推测输出常量）。\n\
+         - 因此诊断的不是「用户会不会」，而是：能否把具体现象正确判别到概念下（判别模型），\
+能否由具体输入推测正确输出（联结模型）。\n\
+         \n\
+         【出题要求】\n\
+         - 严禁自我报告题（如「你了解 X 吗」「你学过 X 吗」）。必须给出具体现象/案例让用户判别或推测：\n\
+         · 测判别模型（单选/多选）：给出具体对象（可含易混负例），让用户判断它是否属于某概念、\
+为什么（选项里给出理由或现象描述）。\n\
+         · 测联结模型（单选/多选/主观）：给出具体的输入常量，让用户选择/写出输出常量或处理方式。\n\
+         · 主观题（open）：让用户用自己的话解释或推测，探测理解深度。\n\
+         - 一次只出一道题。根据用户前面的作答自适应：\n\
+         · 前置概念答错/答不出 → 下一题往更基础的概念挖，不要问更高阶的。\n\
+         · 答对 → 向学习目标推进。\n\
+         · 已探明的概念/知识不要重复问。\n\
+         - 覆盖顺序：目标的前置基础概念 → 目标知识本身。\n\
+         - 当信息足够判断用户已具备/缺失哪些判别模型与联结模型时，停止出题并输出掌握情况摘要。\
+最多再出 6 题。\n\
+         \n\
+         【输出】只输出 JSON，不要 markdown 代码块、不要解释：\n\
+         继续出题：{\"done\": false, \"kind\": \"single\", \"question\": \"...\", \
+\"options\": [\"A. ...\", \"B. ...\", \"C. ...\", \"D. ...\"], \"answer\": \"A\", \
+\"reference_answer\": \"...\", \"target\": \"本题探测的概念/知识\"}\n\
+         多选：kind 为 \"multi\"，answer 为 [\"A\",\"C\"]；主观题：kind 为 \"open\"，无 options、\
+answer 可省略，给出 reference_answer。\n\
+         结束诊断：{\"done\": true, \"summary\": \"已掌握：…；未掌握：…；薄弱点：…\"}"
+            .to_string();
+    let mut user = format!("学习目标：{goal}\n");
+    if !context.is_empty() {
+        user.push_str(&format!("\n参考资料（可能不完整）：\n{context}\n"));
+    }
+    if history.is_empty() {
+        user.push_str("\n这是第一道题。");
+    } else {
+        user.push_str(&format!(
+            "\n前面的问答记录：\n{}\n请根据作答情况出下一道题，或（信息足够时）输出 done 结束诊断。",
+            format_diag_history(history)
+        ));
+    }
+    (system, user)
+}
+
+/// Render the interview transcript: each round with the question, options,
+/// the user's answer and a 答对/答错 annotation (single/multi judged against
+/// the stored answer; open questions are left for the model to judge against
+/// `reference_answer`).
+pub fn format_diag_history(history: &[(DiagQuestion, String)]) -> String {
+    let mut out = String::new();
+    for (i, (q, user_ans)) in history.iter().enumerate() {
+        out.push_str(&format!("Q{}（{}", i + 1, q.kind));
+        if !q.target.is_empty() {
+            out.push_str(&format!("，探测：{}", q.target));
+        }
+        out.push_str("）：");
+        out.push_str(&q.question);
+        if !q.options.is_empty() {
+            out.push_str("\n选项：");
+            out.push_str(&q.options.join("；"));
+        }
+        out.push_str(&format!("\n用户答案：{user_ans}"));
+        match q.kind.as_str() {
+            "single" | "multi" => {
+                let ua: Vec<String> = user_ans
+                    .chars()
+                    .filter(|c| c.is_ascii_uppercase())
+                    .map(|c| c.to_string())
+                    .collect();
+                let ok = !ua.is_empty() && ua == q.answer;
+                out.push_str(&format!(
+                    "（标准答案：{}，{}）",
+                    q.answer.join(","),
+                    if ok { "答对" } else { "答错" }
+                ));
+            }
+            _ => {
+                if !q.reference_answer.is_empty() {
+                    out.push_str(&format!("（参考解：{}，请对照评判）", q.reference_answer));
+                }
+            }
+        }
+        if i + 1 < history.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Parse the model's next interview step (fenced JSON tolerated). Choices
+/// are validated (kind, option count, answer letters).
+pub fn parse_diag_step(text: &str) -> Result<DiagStep, String> {
+    let v: serde_json::Value = serde_json::from_str(strip_json_fence(text))
+        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+    if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
+        let summary = v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok(DiagStep::Done(summary));
+    }
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or_default().to_string();
+    if !matches!(kind.as_str(), "single" | "multi" | "open") {
+        return Err(format!("未知题型：{kind}"));
+    }
+    let question = v
+        .get("question")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if question.is_empty() {
+        return Err("诊断题缺少 question 字段".to_string());
+    }
+    let mut q = DiagQuestion {
+        kind,
+        question,
+        ..Default::default()
+    };
+    if let Some(opts) = v.get("options").and_then(|o| o.as_array()) {
+        q.options = opts
+            .iter()
+            .filter_map(|o| o.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    if q.kind != "open" {
+        if q.options.len() < 2 || q.options.len() > 4 {
+            return Err(format!("选择题选项数必须为 2~4，收到 {}", q.options.len()));
+        }
+        q.answer = normalize_answer_letters(&v.get("answer"));
+        if q.answer.is_empty() {
+            return Err("选择题缺少 answer 字段".to_string());
+        }
+    }
+    q.reference_answer = v
+        .get("reference_answer")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    q.target = v.get("target").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    Ok(DiagStep::Question(q))
+}
+
+/// Extract uppercase answer letters from a JSON string ("A") or array
+/// (["A","C"]), sorted and deduped.
+fn normalize_answer_letters(v: &Option<&serde_json::Value>) -> Vec<String> {
+    let Some(v) = v else { return Vec::new() };
+    let mut out = Vec::new();
+    match v {
+        serde_json::Value::String(s) => {
+            out.extend(s.chars().filter(|c| c.is_ascii_uppercase()).map(|c| c.to_string()))
+        }
+        serde_json::Value::Array(a) => {
+            for item in a {
+                if let Some(s) = item.as_str() {
+                    out.extend(
+                        s.chars()
+                            .filter(|c| c.is_ascii_uppercase())
+                            .map(|c| c.to_string()),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Strip a possibly fenced JSON response (fences may sit anywhere, with
+/// leading/trailing prose like "好的" from the model).
+fn strip_json_fence(text: &str) -> &str {
+    let mut t = text.trim();
+    if let Some(start) = t.find("```") {
+        let rest = &t[start + 3..];
+        t = rest.strip_prefix("json").unwrap_or(rest).trim_start();
+    }
+    if let Some(end) = t.rfind("```") {
+        t = &t[..end];
+    }
+    t.trim()
+}
+
+/// Parse and validate a route plan. Unknown/missing parents are re-attached
+/// to the root; cycles are broken the same way. Type strings are normalized
+/// to "concept"/"knowledge".
+pub fn parse_route_plan(text: &str) -> Result<RoutePlan, String> {
+    let mut plan: RoutePlan =
+        serde_json::from_str(strip_json_fence(text)).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    if plan.cards.is_empty() {
+        return Err("路线为空（没有规划出任何卡片）".to_string());
+    }
+    if plan.cards.len() > 20 {
+        return Err(format!("卡片过多（{} 张，上限 20）", plan.cards.len()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for c in &plan.cards {
+        if c.id.is_empty() || c.id == "root" {
+            return Err(format!("卡片 id 非法：{c:?}"));
+        }
+        if !seen.insert(c.id.clone()) {
+            return Err(format!("卡片 id 重复：{}", c.id));
+        }
+    }
+    let ids: std::collections::HashSet<&str> = seen.iter().map(|s| s.as_str()).collect();
+    for c in &mut plan.cards {
+        if c.title.trim().is_empty() {
+            return Err("存在标题为空的卡片".to_string());
+        }
+        if let Some(p) = &c.parent {
+            if !ids.contains(p.as_str()) {
+                c.parent = None;
+            }
+        }
+        c.card_type = if c.card_type.contains("联结") || c.card_type == "knowledge" {
+            "knowledge".to_string()
+        } else {
+            "concept".to_string()
+        };
+    }
+    // Break cycles: a card whose parent chain loops back to itself roots.
+    for i in 0..plan.cards.len() {
+        let mut cur = i;
+        let mut steps = 0;
+        while let Some(p) = plan.cards[cur]
+            .parent
+            .as_deref()
+            .and_then(|pid| plan.cards.iter().position(|c| c.id == pid))
+        {
+            if p == i || steps >= plan.cards.len() {
+                plan.cards[i].parent = None;
+                break;
+            }
+            cur = p;
+            steps += 1;
+        }
+    }
+    Ok(plan)
+}
+
+/// Strip a "NN-" order prefix from a card title or file stem
+/// ("01-实体（Entity）" -> "实体（Entity）"); anything else passes through.
+pub fn strip_order_prefix(s: &str) -> &str {
+    match s.split_once('-') {
+        Some((p, rest)) if p.len() <= 2 && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            rest
+        }
+        _ => s,
+    }
+}
+
+/// Learning order for route cards: post-order DFS over the parent tree
+/// (leaves first, since 子卡是父卡的前置). Parents were validated/re-rooted
+/// by `parse_route_plan`, but unreachable cards are appended defensively.
+pub fn learning_order(cards: &[RouteCard]) -> Vec<usize> {
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); cards.len()];
+    let mut roots = Vec::new();
+    for (i, c) in cards.iter().enumerate() {
+        match &c.parent {
+            Some(p) => {
+                if let Some(pi) = cards.iter().position(|c| &c.id == p) {
+                    children[pi].push(i);
+                } else {
+                    roots.push(i);
+                }
+            }
+            None => roots.push(i),
+        }
+    }
+    fn dfs(i: usize, children: &[Vec<usize>], out: &mut Vec<usize>) {
+        for &c in &children[i] {
+            dfs(c, children, out);
+        }
+        out.push(i);
+    }
+    let mut out = Vec::with_capacity(cards.len());
+    for &r in &roots {
+        dfs(r, &children, &mut out);
+    }
+    for i in 0..cards.len() {
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Match a planned card `title` against existing card files (rel paths,
+/// e.g. "cards/xx/01-实体（Entity）.md"), ignoring "NN-" order prefixes.
+/// Exact match on the stripped stem; no fuzzy matching (v1).
+pub fn match_card_path(existing: &[String], title: &str) -> Option<String> {
+    let want = strip_order_prefix(title.trim());
+    existing
+        .iter()
+        .find(|p| {
+            std::path::Path::new(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy())
+                .is_some_and(|s| strip_order_prefix(&s) == want)
+        })
+        .cloned()
+}
+
 /// Quiz data emitted by the model and consumed by the quiz panel.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Quiz {
@@ -377,13 +898,23 @@ pub struct OpenQuestion {
 }
 
 /// Build the (system, user) messages for generating a quiz from a card body.
-pub fn quiz_generation_messages(body: &str) -> (String, String) {
+/// Concept cards test 判别能力 (给对象判概念 + 举新例); knowledge cards test
+/// 联结模型应用 (由输入推测输出 + 适用范围判别).
+pub fn quiz_generation_messages(body: &str, ctype: CardType) -> (String, String) {
+    let extra = match ctype {
+        CardType::Concept => String::new(),
+        CardType::Knowledge => {
+            "题目围绕知识应用：给出具体的输入常量（现象）选择正确的输出常量（推测结果），\
+或判断现象是否属于该知识的输入空间（适用范围），不要只考背诵。"
+                .to_string()
+        }
+    };
     let system = format!(
-        "你根据下面的概念学习卡片内容出题。要求：\n\
+        "你根据下面的知识卡片内容出题。要求：\n\
          1. 单选题 3 道，每道 4 个选项，答案为 A/B/C/D 中的一个字母。\n\
          2. 多选题 2 道，每道 4 个选项，答案为字母数组（如 [\"A\",\"C\"]）。\n\
-         3. 费曼学习法开放题 1 道，要求学生用自己的话解释概念，并给出标准解答。\n\
-         4. 题目要围绕概念理解，不要只是死记硬背。\n\
+         3. 费曼学习法开放题 1 道，要求学生用自己的话解释知识，并给出标准解答。\n\
+         4. 题目要围绕知识理解，不要只是死记硬背。{extra}\n\
          5. 必须只输出 JSON，不要 markdown 代码块、不要解释。\n\n\
          卡片内容：\n{}\n\n\
          JSON 格式：\n{}",
@@ -586,5 +1117,178 @@ mod tests {
         let g = parse_grades(text).unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].score, 7);
+    }
+
+    #[test]
+    fn parse_route_plan_ok() {
+        let text = r#"{
+  "goal_input": "任意物体",
+  "goal_output": "是否能浮起来",
+  "cards": [
+    {"id": "c1", "parent": null, "title": "浮力", "type": "concept", "input": "水中的物体", "output": "浮力/非浮力", "reason": "浮力概念"},
+    {"id": "c2", "parent": "c1", "title": "浮力定律", "type": "knowledge", "input": "浸入液体中的物体", "output": "浮力大小", "reason": "联结模型"}
+  ]
+}"#;
+        let plan = parse_route_plan(text).unwrap();
+        assert_eq!(plan.cards.len(), 2);
+        assert_eq!(plan.goal_input, "任意物体");
+        assert_eq!(plan.cards[1].parent.as_deref(), Some("c1"));
+        assert_eq!(plan.cards[0].card_type, "concept");
+        assert_eq!(plan.cards[1].card_type, "knowledge");
+    }
+
+    #[test]
+    fn parse_route_plan_fenced() {
+        let text = "好的\n```json\n{\"cards\":[{\"id\":\"c1\",\"title\":\"T\",\"type\":\"联结模型\"}]}\n```";
+        let plan = parse_route_plan(text).unwrap();
+        assert_eq!(plan.cards[0].card_type, "knowledge");
+    }
+
+    #[test]
+    fn parse_route_plan_repairs_and_rejects() {
+        // unknown parent re-attached to root, cycle broken
+        let text = r#"{"cards":[
+            {"id":"c1","title":"A","type":"concept","parent":"ghost"},
+            {"id":"c2","title":"B","type":"concept","parent":"c3"},
+            {"id":"c3","title":"C","type":"concept","parent":"c2"}
+        ]}"#;
+        let plan = parse_route_plan(text).unwrap();
+        assert_eq!(plan.cards[0].parent, None);
+        assert_eq!(plan.cards[1].parent, None);
+        assert_eq!(plan.cards[2].parent, Some("c2".to_string()));
+        // empty / duplicate-id / root-id rejected
+        assert!(parse_route_plan(r#"{"cards":[]}"#).is_err());
+        assert!(parse_route_plan(r#"{"cards":[{"id":"a","title":"x","type":"c"},{"id":"a","title":"y","type":"c"}]}"#).is_err());
+        assert!(parse_route_plan(r#"{"cards":[{"id":"root","title":"x","type":"c"}]}"#).is_err());
+    }
+
+    #[test]
+    fn card_type_detects_marker() {
+        assert_eq!(card_type("#d 学习目标\nx"), CardType::Concept);
+        assert_eq!(card_type("#c 知识类型 联结模型\nx"), CardType::Knowledge);
+        assert_eq!(card_type("#c 知识类型 概念\nx"), CardType::Concept);
+    }
+
+    #[test]
+    fn parse_diag_step_question_and_done() {
+        let text = r#"{"done": false, "kind": "single", "question": "下面哪个是负例？", "options": ["A. 苹果", "B. 香蕉", "C. 石头"], "answer": "C", "target": "水果判别"}"#;
+        match parse_diag_step(text).unwrap() {
+            DiagStep::Question(q) => {
+                assert_eq!(q.kind, "single");
+                assert_eq!(q.options.len(), 3);
+                assert_eq!(q.answer, vec!["C".to_string()]);
+                assert_eq!(q.target, "水果判别");
+            }
+            _ => panic!("expected question"),
+        }
+        // multi answer array, normalized+sorted
+        let text = r#"{"kind": "multi", "question": "q", "options": ["A. a", "B. b", "C. c", "D. d"], "answer": ["C", "A"]}"#;
+        match parse_diag_step(text).unwrap() {
+            DiagStep::Question(q) => assert_eq!(q.answer, vec!["A".to_string(), "C".to_string()]),
+            _ => panic!("expected question"),
+        }
+        // done
+        match parse_diag_step(r#"{"done": true, "summary": "已掌握：水果"}"#).unwrap() {
+            DiagStep::Done(s) => assert_eq!(s, "已掌握：水果"),
+            _ => panic!("expected done"),
+        }
+        // fenced + prose
+        match parse_diag_step("好的\n```json\n{\"kind\":\"open\",\"question\":\"解释\",\"reference_answer\":\"r\"}\n```").unwrap() {
+            DiagStep::Question(q) => {
+                assert_eq!(q.kind, "open");
+                assert_eq!(q.reference_answer, "r");
+            }
+            _ => panic!("expected question"),
+        }
+        // invalid: bad kind, bad option count, missing answer
+        assert!(parse_diag_step(r#"{"kind":"x","question":"q"}"#).is_err());
+        assert!(parse_diag_step(r#"{"kind":"single","question":"q","options":["A. a"],"answer":"A"}"#).is_err());
+        assert!(parse_diag_step(r#"{"kind":"single","question":"q","options":["A. a","B. b"]}"#).is_err());
+    }
+
+    #[test]
+    fn format_diag_history_annotates_correctness() {
+        let q1 = DiagQuestion {
+            kind: "single".to_string(),
+            question: "石头是苹果吗？".to_string(),
+            options: vec!["A. 是".to_string(), "B. 不是".to_string()],
+            answer: vec!["B".to_string()],
+            target: "苹果判别".to_string(),
+            ..Default::default()
+        };
+        let q2 = DiagQuestion {
+            kind: "open".to_string(),
+            question: "为什么？".to_string(),
+            reference_answer: "因为石头不可食用".to_string(),
+            ..Default::default()
+        };
+        let h = vec![(q1, "A".to_string()), (q2, "因为石头没有苹果的内涵".to_string())];
+        let s = format_diag_history(&h);
+        assert!(s.contains("探测：苹果判别"), "{s}");
+        assert!(s.contains("用户答案：A（标准答案：B，答错）"), "{s}");
+        assert!(s.contains("参考解：因为石头不可食用"), "{s}");
+    }
+
+    #[test]
+    fn route_plan_messages_includes_diagnostics() {
+        let (system, user) = route_plan_messages("目标", "", "Q1…答对");
+        assert!(system.contains("因材施教"));
+        assert!(user.contains("【用户情况】"), "{user}");
+        let (_, user2) = route_plan_messages("目标", "", "");
+        assert!(!user2.contains("用户情况"));
+    }
+
+    #[test]
+    fn strip_order_prefix_strips_only_numeric_prefixes() {
+        assert_eq!(strip_order_prefix("01-实体（Entity）"), "实体（Entity）");
+        assert_eq!(strip_order_prefix("实体（Entity）"), "实体（Entity）");
+        assert_eq!(strip_order_prefix("2024财报"), "2024财报");
+    }
+
+    #[test]
+    fn learning_order_leaves_first() {
+        let card = |id: &str, parent: Option<&str>| RouteCard {
+            id: id.to_string(),
+            parent: parent.map(|s| s.to_string()),
+            title: id.to_string(),
+            card_type: "concept".to_string(),
+            ..Default::default()
+        };
+        // chain: c1 -> c2 -> c3 (c2's child c3 is the deepest leaf)
+        let chain = vec![card("c1", None), card("c2", Some("c1")), card("c3", Some("c2"))];
+        assert_eq!(learning_order(&chain), vec![2, 1, 0]);
+        // branching: root children c1, c2; c1 has child c3
+        let tree = vec![
+            card("c1", None),
+            card("c2", None),
+            card("c3", Some("c1")),
+        ];
+        assert_eq!(learning_order(&tree), vec![2, 0, 1]);
+        // unreachable parent reference (shouldn't happen post-validation)
+        let stray = vec![card("c1", None), card("c2", Some("ghost"))];
+        let order = learning_order(&stray);
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&1));
+    }
+
+    #[test]
+    fn match_card_path_matches_stripped_stems() {
+        let existing = vec![
+            "cards/TestMap/01-实体（Entity）.md".to_string(),
+            "cards/02-ownership.md".to_string(),
+            "cards/TestCard.md".to_string(),
+        ];
+        assert_eq!(
+            match_card_path(&existing, "实体（Entity）"),
+            Some("cards/TestMap/01-实体（Entity）.md".to_string())
+        );
+        assert_eq!(
+            match_card_path(&existing, "ownership"),
+            Some("cards/02-ownership.md".to_string())
+        );
+        // Exact match only: a different title (even related) creates a new card.
+        assert_eq!(match_card_path(&existing, "所有权 Ownership"), None);
+        assert_eq!(match_card_path(&existing, "不存在的概念"), None);
+        assert_eq!(match_card_path(&existing, "TestCard"), Some("cards/TestCard.md".to_string()));
     }
 }

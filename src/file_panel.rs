@@ -269,18 +269,21 @@ const INDENT: f64 = 16.0;
 const ARROW_W: f64 = 24.0;
 
 /// Trim `raw`; None when empty. Inputs without an extension get `default_ext`
-/// appended (maps `.json`, cards `.md`, dirs None).
+/// appended (maps `.json`, cards `.md`, dirs None). Path separators (`/`,
+/// `\`) are replaced with the full-width `／` so a name like
+/// "附加/移除" can never create a nested directory (LLM card titles did).
 pub(crate) fn normalize_name(raw: &str, default_ext: Option<&str>) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
     }
+    let s = s.replace(['/', '\\'], "／");
     if !s.contains('.') {
         if let Some(ext) = default_ext {
             return Some(format!("{s}{ext}"));
         }
     }
-    Some(s.to_string())
+    Some(s)
 }
 
 /// Context-menu items, in DSL order (NewMap, NewDir, Rename, Delete).
@@ -2037,6 +2040,23 @@ mod test {
         assert_eq!(normalize_name("docs", None), Some("docs".to_string()));
         assert_eq!(normalize_name(" card ", Some(".md")), Some("card.md".to_string()));
         assert_eq!(normalize_name("", None), None);
+    }
+
+    #[test]
+    fn normalize_name_replaces_path_separators() {
+        assert_eq!(
+            normalize_name("实体与组件的关联（附加/移除）", Some(".md")),
+            Some("实体与组件的关联（附加／移除）.md".to_string())
+        );
+        assert_eq!(
+            normalize_name("a\\b", Some(".md")),
+            Some("a／b.md".to_string())
+        );
+        let name = normalize_name("实体与组件的关联（附加/移除）", Some(".md")).unwrap();
+        // A separator-free name joins into a single file, never a nested dir.
+        let p = std::path::Path::new(&name);
+        assert_eq!(p.file_name(), Some(std::ffi::OsStr::new("实体与组件的关联（附加／移除）.md")));
+        assert_eq!(p.parent(), Some(std::path::Path::new("")));
     }
 
     #[test]

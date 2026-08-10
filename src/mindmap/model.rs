@@ -760,6 +760,62 @@ pub fn new_map_json() -> String {
     serde_json::json!({"nodes":[]}).to_string()
 }
 
+/// Build map JSON for a generated learning route: a root node (id "root",
+/// required for non-empty maps to load) plus the planned cards attached by
+/// parent id. `cards` is (id, title, rel_path, parent_id) in DFS order;
+/// unknown/missing parents fall back to the root. Positions are omitted so
+/// the auto-layout arranges the tree.
+pub fn route_map_json(
+    root_title: &str,
+    root_path: &str,
+    cards: &[(String, String, String, Option<String>)],
+) -> String {
+    let mut nodes = vec![MapNodeFile {
+        id: "root".to_string(),
+        title: root_title.to_string(),
+        path: root_path.to_string(),
+        children: None,
+        x: None,
+        y: None,
+        w: None,
+        h: None,
+    }];
+    let mut index = std::collections::HashMap::new();
+    index.insert("root", 0usize);
+    for (i, c) in cards.iter().enumerate() {
+        index.insert(c.0.as_str(), i + 1);
+        nodes.push(MapNodeFile {
+            id: c.0.clone(),
+            title: c.1.clone(),
+            path: c.2.clone(),
+            children: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+        });
+    }
+    let mut child_ids: Vec<Vec<String>> = vec![Vec::new(); nodes.len()];
+    for c in cards {
+        let pi = c
+            .3
+            .as_deref()
+            .and_then(|p| index.get(p).copied())
+            .unwrap_or(0);
+        child_ids[pi].push(c.0.clone());
+    }
+    for (i, ids) in child_ids.into_iter().enumerate() {
+        nodes[i].children = if ids.is_empty() { None } else { Some(ids) };
+    }
+    let map = MapFile {
+        pan: None,
+        zoom: None,
+        nodes,
+        groups: Vec::new(),
+    };
+    serde_json::to_string_pretty(&map).unwrap_or_default()
+}
+
 /// Card display title: the stem of its body file (the same name the file
 /// panel shows); falls back to the legacy JSON title when there's no file.
 pub(crate) fn card_title(node: &Node) -> String {
@@ -1005,6 +1061,38 @@ mod tests {
         write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/x.json");
         let again = MindMapData::load_from(&dir, "maps/x.json").unwrap();
         assert!(again.nodes.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn route_map_json_builds_tree() {
+        let dir = std::env::temp_dir().join(format!("ue-route-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("cards/route")).unwrap();
+        for f in ["00-goal.md", "01-a.md", "02-b.md", "03-c.md"] {
+            std::fs::write(dir.join("cards/route").join(f), "").unwrap();
+        }
+        let json = route_map_json(
+            "学会浮力",
+            "cards/route/00-goal.md",
+            &[
+                ("c1".into(), "浮力".into(), "cards/route/01-a.md".into(), None),
+                ("c2".into(), "密度".into(), "cards/route/02-b.md".into(), Some("c1".into())),
+                ("c3".into(), "浮沉条件".into(), "cards/route/03-c.md".into(), Some("missing".into())),
+            ],
+        );
+        std::fs::write(dir.join("maps/x.json"), json).unwrap();
+        let data = MindMapData::load_from(&dir, "maps/x.json").expect("route map loads");
+        let root = data.root.expect("has root");
+        assert_eq!(data.nodes[root].id, "root");
+        assert_eq!(data.nodes[root].title, "学会浮力");
+        // c1 and c3 (missing parent) hang off the root; c2 under c1.
+        let c1 = data.nodes.iter().position(|n| n.id == "c1").unwrap();
+        let c2 = data.nodes.iter().position(|n| n.id == "c2").unwrap();
+        let c3 = data.nodes.iter().position(|n| n.id == "c3").unwrap();
+        assert_eq!(data.nodes[root].children, vec![c1, c3]);
+        assert_eq!(data.nodes[c1].children, vec![c2]);
+        assert_eq!(data.nodes[c2].children, Vec::<usize>::new());
         std::fs::remove_dir_all(&dir).ok();
     }
 

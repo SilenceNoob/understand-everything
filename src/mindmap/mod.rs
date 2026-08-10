@@ -430,6 +430,7 @@ script_mod! {
             item0 := MenuItem{ label.text: "从 map 中移除" }
             item1 := MenuItem{ label.text: "生成 ▶" }
             item2 := MenuItem{ label.text: "测试" }
+            item3 := MenuItem{ label.text: "生成学习路线" }
         }
         sub_menu := mod.widgets.RoundedView{
             width: (180.0)
@@ -707,6 +708,10 @@ pub struct MindMap {
     menu_card: Option<usize>,
     #[rust]
     menu_card_path: String,
+    /// Visible menu row count: 4 on the root goal card (生成学习路线),
+    /// 3 everywhere else. Drives geometry and the item3 visibility.
+    #[rust]
+    menu_items: usize,
     #[rust]
     menu_rect: Rect,
     #[rust]
@@ -2017,8 +2022,15 @@ impl MindMap {
         let view = self.area.rect(cx);
         self.menu_card = Some(card);
         self.menu_card_path = path;
-        self.menu_rect = menu_rect(view, abs, 3);
-        self.menu_hover = menu_item_index(self.menu_rect, 3, abs);
+        // 生成学习路线 only for the root goal card, and only while it has no
+        // children yet (v1 plans once; a planned map gets no re-plan entry).
+        self.menu_items = if data.root == Some(card) && data.nodes[card].children.is_empty() {
+            4
+        } else {
+            3
+        };
+        self.menu_rect = menu_rect(view, abs, self.menu_items);
+        self.menu_hover = menu_item_index(self.menu_rect, self.menu_items, abs);
         self.sub_open = false;
         self.sub_hover = None;
         self.compute_sub_rect(view);
@@ -2081,7 +2093,7 @@ impl MindMap {
     }
 
     fn update_menu_hover(&mut self, cx: &mut Cx, abs: DVec2) {
-        let main = menu_item_index(self.menu_rect, 3, abs);
+        let main = menu_item_index(self.menu_rect, self.menu_items, abs);
         let in_sub = self.sub_open && self.sub_rect.contains(abs);
         let sub_hover = if in_sub { menu_item_index(self.sub_rect, 8, abs) } else { None };
         let want_sub = main == Some(1) || in_sub;
@@ -2166,6 +2178,9 @@ impl MindMap {
             return;
         }
         if let Some(w) = self.ctx_menu_widget(cx) {
+            // The 生成学习路线 row exists in the template but is only shown
+            // on the root goal card (menu_items == 4).
+            w.view(cx, ids!(item3)).set_visible(cx, self.menu_items == 4);
             let _ = w.draw_walk(
                 cx,
                 scope,
@@ -2236,7 +2251,7 @@ impl MindMap {
     }
 
     fn on_menu_click(&mut self, cx: &mut Cx, abs: DVec2) {
-        if let Some(idx) = menu_item_index(self.menu_rect, 3, abs) {
+        if let Some(idx) = menu_item_index(self.menu_rect, self.menu_items, abs) {
             if idx == 0 {
                 if let Some(i) = self.menu_card {
                     let root = self.data.as_ref().and_then(|d| d.root);
@@ -2257,6 +2272,16 @@ impl MindMap {
             if idx == 2 {
                 if !self.menu_card_path.is_empty() {
                     cx.widget_action(self.widget_uid(), MindMapAction::Quiz(self.menu_card_path.clone()));
+                }
+                self.close_menu(cx);
+                return;
+            }
+            if idx == 3 {
+                if !self.menu_card_path.is_empty() {
+                    cx.widget_action(
+                        self.widget_uid(),
+                        MindMapAction::PlanRoute(self.menu_card_path.clone()),
+                    );
                 }
                 self.close_menu(cx);
                 return;
@@ -2297,6 +2322,8 @@ pub enum MindMapAction {
     None,
     Generate(String, GenSection),
     Quiz(String),
+    /// Root goal card: plan the learning route under it.
+    PlanRoute(String),
     /// Canvas right-click at the given screen position: open the card picker.
     CanvasMenu(DVec2),
 }
@@ -2322,6 +2349,17 @@ impl MindMapRef {
     pub fn quiz_clicked(&self, actions: &Actions) -> Option<String> {
         if let Some(item) = actions.find_widget_action(self.widget_uid()) {
             if let MindMapAction::Quiz(p) = item.cast() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Poll the action list for a "生成学习路线" menu click; returns the
+    /// root goal card's path.
+    pub fn route_clicked(&self, actions: &Actions) -> Option<String> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::PlanRoute(p) = item.cast() {
                 return Some(p);
             }
         }

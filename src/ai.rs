@@ -210,10 +210,22 @@ pub fn response_content(response: &HttpResponse) -> Option<String> {
 /// Diagnostics for a failed/unparseable generation: finish_reason plus a
 /// ~200-char preview of the content (or the reasoning content when the
 /// content itself is empty), so a truncation is distinguishable from a
-/// format miss.
+/// format miss. When the body isn't JSON at all (SSE despite stream:false,
+/// an error page, …), falls back to a raw body prefix.
 pub fn response_debug_preview(response: &HttpResponse) -> String {
     let body = response.get_string_body().unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            let raw = body.trim();
+            let raw = if raw.chars().count() > 200 {
+                raw.chars().take(200).collect::<String>() + "…"
+            } else {
+                raw.to_string()
+            };
+            return format!("body 非 JSON，原始内容：{raw}");
+        }
+    };
     let choice = v.get("choices").and_then(|c| c.get(0));
     let finish = choice
         .and_then(|c| c.get("finish_reason"))
