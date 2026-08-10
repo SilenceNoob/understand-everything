@@ -311,6 +311,34 @@ script_mod! {
             }
         }
 
+        pill_c := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Flow.Right
+            align: Align{y: 0.5}
+            spacing: 2
+            padding: Inset{left: 7, right: 4, top: 0, bottom: 0}
+            margin: Inset{left: 2, right: 2}
+            show_bg: true
+            draw_bg +: {
+                color: #1f4433
+                border_radius: 5.0
+                border_size: 1.0
+                border_color: #22c55e80
+            }
+            icon := mod.widgets.Icon{
+                icon_walk: Walk{width: 7, height: 7}
+                draw_icon +: {
+                    svg: crate_resource("self:resources/about.svg")
+                    color: #a7f3d0
+                }
+            }
+            label := mod.widgets.Label{
+                draw_text.text_style.font_size: 8.5
+                draw_text.color: #a7f3d0
+            }
+        }
+
         mark := mod.widgets.RoundedView{
             width: Fit
             height: Fit
@@ -361,7 +389,7 @@ pub struct MarkdownMedia {
     in_splash_block: bool,
     #[rust]
     splash_block_string: String,
-    /// Pending `#d/#t/#e/#n` pill: kind plus accumulated text.
+    /// Pending `#d/#t/#e/#c/#n` pill: kind plus accumulated text.
     #[rust]
     pill: Option<(PillKind, String)>,
     /// Pending `==...==` mark: accumulated text while an open `==` is active.
@@ -848,7 +876,7 @@ fn alignment_to_x(alignment: &Alignment) -> f64 {
     }
 }
 
-/// The kind of a `#d/#t/#e/#n` pill tag.
+/// The kind of a `#d/#t/#e/#c/#n` pill tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PillKind {
     /// `#d` — 描述, blue.
@@ -857,12 +885,14 @@ enum PillKind {
     Move,
     /// `#e` — 例子, red.
     Example,
+    /// `#c` — 评论/作用, green.
+    Comment,
     /// `#n` — 作用, gray.
     Effect,
 }
 
 /// Splits a text run into plain-text and pill segments. A `#x` token
-/// (`x` in d/t/e/n) starts a pill that extends to the next token or the
+/// (`x` in d/t/e/c/n) starts a pill that extends to the next token or the
 /// end of the run. A token is only recognized when not followed by an
 /// ASCII alphanumeric or `#`, so `#data`/`##d` don't match.
 fn scan_pills(text: &str) -> Vec<(Option<PillKind>, &str)> {
@@ -877,6 +907,7 @@ fn scan_pills(text: &str) -> Vec<(Option<PillKind>, &str)> {
                 b'd' => Some(PillKind::Desc),
                 b't' => Some(PillKind::Move),
                 b'e' => Some(PillKind::Example),
+                b'c' => Some(PillKind::Comment),
                 b'n' => Some(PillKind::Effect),
                 _ => None,
             };
@@ -922,6 +953,7 @@ fn draw_pill(tf: &mut TextFlow, cx: &mut Cx2d, kind: PillKind, text: &str) {
         PillKind::Desc => live_id!(pill_d),
         PillKind::Move => live_id!(pill_t),
         PillKind::Example => live_id!(pill_e),
+        PillKind::Comment => live_id!(pill_c),
         PillKind::Effect => live_id!(pill_n),
     };
     let entry_id = tf.new_counted_id();
@@ -1051,13 +1083,14 @@ mod tests {
     #[test]
     fn scan_pills_all_kinds_and_plain() {
         assert_eq!(
-            scan_pills("前置 #d 一 #t 二 #n 三 #e 四 后置"),
+            scan_pills("前置 #d 一 #t 二 #c 三 #n 四 #e 五 后置"),
             vec![
                 (None, "前置 "),
                 (Some(PillKind::Desc), " 一 "),
                 (Some(PillKind::Move), " 二 "),
-                (Some(PillKind::Effect), " 三 "),
-                (Some(PillKind::Example), " 四 后置"),
+                (Some(PillKind::Comment), " 三 "),
+                (Some(PillKind::Effect), " 四 "),
+                (Some(PillKind::Example), " 五 后置"),
             ]
         );
     }

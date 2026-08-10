@@ -444,12 +444,13 @@ script_mod! {
                 border_color: #ffffff3d
             }
             item0 := MenuItem{ label.text: "所有" }
-            item1 := MenuItem{ label.text: "专业描述" }
+            item1 := MenuItem{ label.text: "抽象描述" }
             item2 := MenuItem{ label.text: "通俗描述" }
-            item3 := MenuItem{ label.text: "正面例子" }
-            item4 := MenuItem{ label.text: "反面例子" }
-            item5 := MenuItem{ label.text: "影响什么" }
-            item6 := MenuItem{ label.text: "被什么影响" }
+            item3 := MenuItem{ label.text: "正例" }
+            item4 := MenuItem{ label.text: "负例" }
+            item5 := MenuItem{ label.text: "作用" }
+            item6 := MenuItem{ label.text: "影响什么" }
+            item7 := MenuItem{ label.text: "被什么影响" }
         }
         // File-panel card drag ghost: translucent card preview drawn at the
         // pointer while dragging a card over the canvas.
@@ -2064,7 +2065,7 @@ impl MindMap {
     /// Compute the submenu rect anchored to the right of the "生成" row.
     fn compute_sub_rect(&mut self, view: Rect) {
         let sub_w = 180.0;
-        let sub_h = MENU_PAD * 2.0 + 7.0 * MENU_ITEM_H;
+        let sub_h = MENU_PAD * 2.0 + 8.0 * MENU_ITEM_H;
         let mut x = self.menu_rect.pos.x + self.menu_rect.size.x;
         let mut y = self.menu_rect.pos.y + MENU_PAD + 1.0 * MENU_ITEM_H;
         if x + sub_w > view.pos.x + view.size.x {
@@ -2082,7 +2083,7 @@ impl MindMap {
     fn update_menu_hover(&mut self, cx: &mut Cx, abs: DVec2) {
         let main = menu_item_index(self.menu_rect, 3, abs);
         let in_sub = self.sub_open && self.sub_rect.contains(abs);
-        let sub_hover = if in_sub { menu_item_index(self.sub_rect, 7, abs) } else { None };
+        let sub_hover = if in_sub { menu_item_index(self.sub_rect, 8, abs) } else { None };
         let want_sub = main == Some(1) || in_sub;
         if self.menu_hover != main || self.sub_open != want_sub || self.sub_hover != sub_hover {
             self.menu_hover = main;
@@ -2262,15 +2263,16 @@ impl MindMap {
             }
         }
         if self.sub_open {
-            if let Some(idx) = menu_item_index(self.sub_rect, 7, abs) {
+            if let Some(idx) = menu_item_index(self.sub_rect, 8, abs) {
                 let section = match idx {
                     0 => GenSection::All,
                     1 => GenSection::Desc,
                     2 => GenSection::Plain,
                     3 => GenSection::PosExample,
                     4 => GenSection::NegExample,
-                    5 => GenSection::Affect,
-                    6 => GenSection::Affected,
+                    5 => GenSection::Purpose,
+                    6 => GenSection::Affect,
+                    7 => GenSection::Affected,
                     _ => GenSection::All,
                 };
                 if !self.menu_card_path.is_empty() {

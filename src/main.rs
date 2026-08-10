@@ -910,7 +910,8 @@ fn child_by_name(parent: &WidgetRef, id: LiveId) -> WidgetRef {
 /// A deferred generation request waiting for hybrid RAG retrieval to finish.
 struct GenWait {
     path: String,
-    section: GenSection,
+    /// The sections to generate, in order (7 items for "所有").
+    sections: Vec<GenSection>,
     title: String,
     rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
     fallback: String,
@@ -1025,6 +1026,18 @@ pub struct App {
     gen_id: LiveId,
     #[rust]
     gen_path: String,
+    /// Remaining sections of the current generation queue (empty for
+    /// single-section jobs whose request is already in flight).
+    #[rust]
+    gen_sections: Vec<GenSection>,
+    /// Total queue length, for the "生成中… (2/7)" progress indicator.
+    #[rust]
+    gen_total: usize,
+    /// Context/title reused across the queue's sequential requests.
+    #[rust]
+    gen_context: String,
+    #[rust]
+    gen_title: String,
     /// In-flight quiz generation request.
     #[rust]
     quiz_id: LiveId,
@@ -2136,6 +2149,14 @@ impl App {
         if title.is_empty() {
             return;
         }
+        // "所有" becomes a queue of per-section requests; each section is
+        // generated in its own request so a thinking model can't eat the
+        // whole output budget with reasoning.
+        let sections: Vec<GenSection> = if section == GenSection::All {
+            GenSection::all().to_vec()
+        } else {
+            vec![section]
+        };
         let fallback = self.rag_bm25_context(&title);
         let upgradeable = self
             .rag
@@ -2145,7 +2166,7 @@ impl App {
             let rx = self.rag.as_ref().unwrap().retrieve(&title);
             self.gen_wait = Some(GenWait {
                 path: path.to_string(),
-                section,
+                sections,
                 title: title.clone(),
                 rx,
                 fallback,
@@ -2153,7 +2174,7 @@ impl App {
             });
             self.set_card_title_indicator(cx, path, Some("生成中…"));
         } else {
-            self.send_generation(cx, path, section, &title, &fallback);
+            self.send_generation(cx, path, sections, &title, &fallback);
         }
     }
 
@@ -2161,21 +2182,43 @@ impl App {
         &mut self,
         cx: &mut Cx,
         path: &str,
-        section: GenSection,
+        mut sections: Vec<GenSection>,
         title: &str,
         context: &str,
     ) {
-        self.gen_id = LiveId::unique();
         self.gen_path = path.to_string();
-        self.set_card_title_indicator(cx, path, Some("生成中…"));
-        let (system, user) = generation_messages(section, title, context);
+        self.gen_title = title.to_string();
+        self.gen_context = context.to_string();
+        self.gen_total = sections.len();
+        let Some(first) = sections.drain(..1).next() else {
+            return;
+        };
+        self.gen_sections = sections;
+        self.send_gen_section(cx, first);
+    }
+
+    /// Fire the HTTP request for one generation section, with progress.
+    fn send_gen_section(&mut self, cx: &mut Cx, section: GenSection) {
+        self.gen_id = LiveId::unique();
+        let done = self.gen_total.saturating_sub(self.gen_sections.len() + 1);
+        let indicator = format!("生成中… ({}/{})", done + 1, self.gen_total);
+        self.set_card_title_indicator(cx, &self.gen_path, Some(&indicator));
+        let (system, user) = generation_messages(section, &self.gen_title, &self.gen_context);
         ai::chat_completions(
             cx,
             self.gen_id,
             &self.ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            2048,
+            358400,
         );
+    }
+
+    /// Abort the current generation queue and surface `msg` in the AI panel.
+    fn abort_generation(&mut self, cx: &mut Cx, msg: String) {
+        self.gen_sections.clear();
+        self.set_card_title_indicator(cx, &self.gen_path, None);
+        self.push_chat_msg(cx, "assistant", &msg);
+        self.ensure_ai_panel_open(cx);
     }
 
     fn handle_gen_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
@@ -2183,37 +2226,38 @@ impl App {
         let status = response.status_code;
         let full_path = crate::util::app_base_dir().join(&self.gen_path);
         if status != 200 {
-            self.set_card_title_indicator(cx, &self.gen_path, None);
             let detail = response
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
-            self.push_chat_msg(cx, "assistant", &format!("生成失败 ({})：{}", status, detail));
-            self.ensure_ai_panel_open(cx);
+            self.abort_generation(cx, format!("生成失败 ({})：{}", status, detail));
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
         let sections = parse_generation_output(&content);
         if sections.is_empty() {
-            self.set_card_title_indicator(cx, &self.gen_path, None);
-            self.push_chat_msg(cx, "assistant", "生成返回为空或格式不正确");
-            self.ensure_ai_panel_open(cx);
+            let debug = ai::response_debug_preview(response);
+            self.abort_generation(cx, format!("生成返回为空或格式不正确（{debug}）"));
             return;
         }
         let body = std::fs::read_to_string(&full_path).unwrap_or_default();
         let new_body = upsert_sections(&body, &sections);
         if let Err(e) = std::fs::write(&full_path, &new_body) {
-            self.set_card_title_indicator(cx, &self.gen_path, None);
-            self.push_chat_msg(cx, "assistant", &format!("保存卡片失败：{}", e));
-            self.ensure_ai_panel_open(cx);
+            self.abort_generation(cx, format!("保存卡片失败：{}", e));
             return;
         }
         // Update the card body if the card is still in the current map.
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         mind_map.update_card_body(cx, &full_path, new_body);
-        self.set_card_title_indicator(cx, &self.gen_path, None);
-        if let Some(rag) = &self.rag {
-            rag.set_map(&self.ui.mind_map(cx, ids!(mindmap)).current_map_file().unwrap_or_default());
+        // Continue the queue, or finish when it is exhausted.
+        if !self.gen_sections.is_empty() {
+            let next = self.gen_sections.remove(0);
+            self.send_gen_section(cx, next);
+        } else {
+            self.set_card_title_indicator(cx, &self.gen_path, None);
+            if let Some(rag) = &self.rag {
+                rag.set_map(&self.ui.mind_map(cx, ids!(mindmap)).current_map_file().unwrap_or_default());
+            }
         }
     }
 
@@ -2253,7 +2297,7 @@ impl App {
             self.quiz_id,
             &self.ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            4096,
+            358400,
         );
     }
 
@@ -2377,10 +2421,10 @@ impl App {
             rag::service::format_context(&hits)
         };
         let path = wait.path.clone();
-        let section = wait.section;
+        let sections = std::mem::take(&mut wait.sections);
         let title = wait.title.clone();
         self.gen_wait = None;
-        self.send_generation(cx, &path, section, &title, &ctx);
+        self.send_generation(cx, &path, sections, &title, &ctx);
     }
 }
 
@@ -2443,9 +2487,7 @@ impl MatchEvent for App {
         }
         if request_id == self.gen_id && self.gen_id != LiveId::empty() {
             self.gen_id = LiveId::empty();
-            self.set_card_title_indicator(cx, &self.gen_path, None);
-            self.push_chat_msg(cx, "assistant", &format!("生成请求失败：{}", err.message));
-            self.ensure_ai_panel_open(cx);
+            self.abort_generation(cx, format!("生成请求失败：{}", err.message));
             return;
         }
         if request_id == self.quiz_id && self.quiz_id != LiveId::empty() {

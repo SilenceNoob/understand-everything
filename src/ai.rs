@@ -208,6 +208,36 @@ pub fn response_content(response: &HttpResponse) -> Option<String> {
         .as_str()
         .map(|s| s.to_string())
 }
+
+/// Diagnostics for a failed/unparseable generation: finish_reason plus a
+/// ~200-char preview of the content (or the reasoning content when the
+/// content itself is empty), so a truncation is distinguishable from a
+/// format miss.
+pub fn response_debug_preview(response: &HttpResponse) -> String {
+    let body = response.get_string_body().unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let choice = v.get("choices").and_then(|c| c.get(0));
+    let finish = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("?");
+    let msg = choice.and_then(|c| c.get("message"));
+    let content = msg.and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("");
+    let preview = if content.trim().is_empty() {
+        msg.and_then(|m| m.get("reasoning_content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+    } else {
+        content
+    };
+    let preview = preview.trim();
+    let preview = if preview.chars().count() > 200 {
+        preview.chars().take(200).collect::<String>() + "…"
+    } else {
+        preview.to_string()
+    };
+    format!("finish_reason={finish}, 内容预览：{preview}")
+}
 /// Feed raw bytes in arbitrary chunk sizes; every call returns the
 /// assistant text deltas extracted since the previous call, in order.
 /// Also accumulates the raw text so error bodies stay recoverable.

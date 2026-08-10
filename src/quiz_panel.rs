@@ -1,6 +1,10 @@
 use makepad_widgets::*;
 
 use crate::gen::{GradeResult, Quiz};
+use crate::util::{apply_resize, resize_dir, RESIZE_BOTTOM, RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP};
+
+const RESIZE_T: f64 = 6.0;
+const RESIZE_MIN: DVec2 = dvec2(480.0, 400.0);
 
 /// A user's collected answers to a quiz, emitted by the quiz panel when the
 /// submit button is pressed.
@@ -152,91 +156,89 @@ script_mod! {
     mod.widgets.QuizPanel = set_type_default() do mod.widgets.QuizPanelBase{
         width: Fill
         height: Fill
-        content := mod.widgets.View{
+        backdrop := mod.widgets.View{
             width: Fill
             height: Fill
-            flow: Overlay
-            align: Align{x: 0.5, y: 0.5}
             draw_bg +: {
                 color: #000000cc
             }
-            panel := mod.widgets.RoundedView{
-                width: 560
-                height: (640.0)
-                flow: Down
-                show_bg: true
-                draw_bg +: {
-                    color: #1f2430
-                    border_radius: 8.0
-                    border_size: 1.0
-                    border_color: #ffffff14
-                }
-                header := mod.widgets.View{
-                    width: Fill
-                    height: (44.0)
-                    flow: Right
-                    align: Align{y: 0.5}
-                    padding: Inset{left: 16, right: 12}
-                    title := mod.widgets.Label{
-                        width: Fill
-                        height: Fit
-                        text: "测验"
-                        draw_text.text_style.font_size: 16.0
-                        draw_text.color: #e6e9f0
-                    }
-                    close_btn := mod.widgets.ButtonFlat{
-                        width: Fit
-                        height: Fit
-                        text: "✕"
-                        draw_text.text_style.font_size: 14.0
-                        draw_text.color: #e6e9f0
-                    }
-                }
-                body := mod.widgets.ScrollYView{
-                    width: Fill
-                    height: Fill
-                    questions := mod.widgets.View{
-                        width: Fill
-                        height: Fit
-                        flow: Down
-                        single0 := SingleQuestion{}
-                        single1 := SingleQuestion{}
-                        single2 := SingleQuestion{}
-                        multi0 := MultiQuestion{}
-                        multi1 := MultiQuestion{}
-                        open0 := OpenQuestion{}
-                    }
-                }
-                status := mod.widgets.Label{
+        }
+        panel := mod.widgets.RoundedView{
+            width: 720
+            height: (640.0)
+            flow: Down
+            show_bg: true
+            draw_bg +: {
+                color: #1f2430
+                border_radius: 8.0
+                border_size: 1.0
+                border_color: #ffffff14
+            }
+            header := mod.widgets.View{
+                width: Fill
+                height: (44.0)
+                flow: Right
+                align: Align{y: 0.5}
+                padding: Inset{left: 16, right: 12}
+                title := mod.widgets.Label{
                     width: Fill
                     height: Fit
-                    padding: Inset{left: 16, right: 16, top: 8, bottom: 8}
-                    text: ""
-                    draw_text.text_style.font_size: 12.0
-                    draw_text.color: #aab0bc
+                    text: "测验"
+                    draw_text.text_style.font_size: 16.0
+                    draw_text.color: #e6e9f0
                 }
-                footer := mod.widgets.View{
+                close_btn := mod.widgets.ButtonFlat{
+                    width: Fit
+                    height: Fit
+                    text: "×"
+                    draw_text.text_style.font_size: 14.0
+                    draw_text.color: #e6e9f0
+                }
+            }
+            body := mod.widgets.ScrollYView{
+                width: Fill
+                height: Fill
+                questions := mod.widgets.View{
                     width: Fill
-                    height: (52.0)
-                    flow: Right
-                    align: Align{x: 1.0, y: 0.5}
-                    padding: Inset{left: 16, right: 16, bottom: 12}
-                    submit_btn := mod.widgets.ButtonFlat{
-                        width: Fit
-                        height: Fit
-                        text: "提交"
-                        padding: Inset{left: 14, right: 14, top: 6, bottom: 6}
-                        draw_bg +: {
-                            color: #4c6ef5
-                            color_hover: #5c7cfa
-                            color_down: #5c7cfa
-                            color_focus: #4c6ef5
-                            border_radius: uniform(4.0)
-                        }
-                        draw_text +: {
-                            text_style: theme.font_bold{font_size: 13.0}
-                            color: #ffffff
-                        }
+                    height: Fit
+                    flow: Down
+                    single0 := SingleQuestion{}
+                    single1 := SingleQuestion{}
+                    single2 := SingleQuestion{}
+                    multi0 := MultiQuestion{}
+                    multi1 := MultiQuestion{}
+                    open0 := OpenQuestion{}
+                }
+            }
+            status := mod.widgets.Label{
+                width: Fill
+                height: Fit
+                padding: Inset{left: 16, right: 16, top: 8, bottom: 8}
+                text: ""
+                draw_text.text_style.font_size: 12.0
+                draw_text.color: #aab0bc
+            }
+            footer := mod.widgets.View{
+                width: Fill
+                height: (52.0)
+                flow: Right
+                align: Align{x: 1.0, y: 0.5}
+                padding: Inset{left: 16, right: 16, bottom: 12}
+                submit_btn := mod.widgets.ButtonFlat{
+                    width: Fit
+                    height: Fit
+                    text: "提交"
+                    padding: Inset{left: 14, right: 14, top: 6, bottom: 6}
+                    draw_bg +: {
+                        color: #4c6ef5
+                        color_hover: #5c7cfa
+                        color_down: #5c7cfa
+                        color_focus: #4c6ef5
+                        border_radius: uniform(4.0)
+                    }
+                    draw_text +: {
+                        text_style: theme.font_bold{font_size: 13.0}
+                        color: #ffffff
                     }
                 }
             }
@@ -259,6 +261,22 @@ pub struct QuizPanel {
 
     #[rust]
     area: Area,
+    #[rust(dvec2(720.0, 640.0))]
+    panel_size: DVec2,
+    #[rust]
+    panel_area: Area,
+    #[rust]
+    window_size: DVec2,
+    #[rust]
+    pos: DVec2,
+    #[rust]
+    dragging: bool,
+    #[rust]
+    grab: DVec2,
+    #[rust]
+    inited: bool,
+    #[rust]
+    resizing: u8,
     #[rust]
     quiz: Option<Quiz>,
     #[rust]
@@ -288,21 +306,122 @@ impl ScriptHook for QuizPanel {}
 
 impl Widget for QuizPanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.window_size = cx.current_pass_size();
+        // Center the panel on its first draw; after that the user's drag
+        // position persists (FloatPanel-style).
+        if !self.inited {
+            self.inited = true;
+            self.pos = dvec2(
+                ((self.window_size.x - self.panel_size.x) / 2.0).max(0.0),
+                ((self.window_size.y - self.panel_size.y) / 2.0).max(0.0),
+            );
+        }
+        // Keep the panel inside the window (dragged/resized or window shrunk).
+        self.pos.x = self.pos.x.clamp(0.0, (self.window_size.x - self.panel_size.x).max(0.0));
+        self.pos.y = self.pos.y.clamp(0.0, (self.window_size.y - self.panel_size.y).max(0.0));
         cx.begin_turtle(walk, self.layout);
-        let _ = self.view.draw_walk(cx, scope, walk);
+        // Draw the window-sized backdrop, then the panel at its runtime
+        // position/size (the DSL size is a fallback; the walk below wins).
+        if let Some(bg) = self.backdrop(cx) {
+            let _ = bg.draw_walk(
+                cx,
+                scope,
+                Walk {
+                    width: Size::Fixed(self.window_size.x),
+                    height: Size::Fixed(self.window_size.y),
+                    ..Walk::default()
+                },
+            );
+        }
+        if let Some(panel) = self.panel(cx) {
+            let panel_rect = Rect {
+                pos: self.pos,
+                size: self.panel_size,
+            };
+            let panel_walk = Walk {
+                abs_pos: Some(self.pos),
+                width: Size::Fixed(self.panel_size.x),
+                height: Size::Fixed(self.panel_size.y),
+                ..Walk::default()
+            };
+            // Clip over the panel rect so child draw_clip data (ScrollYView)
+            // resolves against the real panel bounds.
+            cx.push_clip_rect(panel_rect);
+            let _ = panel.draw_walk(cx, scope, panel_walk);
+            cx.add_aligned_rect_area(&mut self.panel_area, panel_rect);
+            cx.pop_clip_rect();
+        }
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        let Event::Actions(actions) = event else { return };
-        let content = self.content(cx);
-        let close_btn = content.widget(cx, ids!(panel)).widget(cx, ids!(header)).widget(cx, ids!(close_btn));
+        // Snapshot before hits below capture the digit to our own area: a
+        // child widget that grabbed the press must not start a resize.
+        let child_grabbed = cx.fingers.any_areas_captured();
+        match event.hits_with_capture_overload(cx, self.panel_area, true) {
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                if !child_grabbed {
+                    let dir = self.resize_hit(fe.abs);
+                    if dir != 0 {
+                        self.resizing = dir;
+                    } else {
+                        self.dragging = true;
+                        self.grab = fe.abs - self.pos;
+                    }
+                }
+            }
+            Hit::FingerMove(fe) => {
+                if self.resizing != 0 {
+                    apply_resize(
+                        &mut self.pos,
+                        &mut self.panel_size,
+                        fe.abs,
+                        self.resizing,
+                        RESIZE_MIN,
+                        self.window_size,
+                    );
+                    self.redraw(cx);
+                } else if self.dragging {
+                    let max_x = (self.window_size.x - self.panel_size.x).max(0.0);
+                    let max_y = (self.window_size.y - self.panel_size.y).max(0.0);
+                    let pos = fe.abs - self.grab;
+                    self.pos.x = pos.x.clamp(0.0, max_x);
+                    self.pos.y = pos.y.clamp(0.0, max_y);
+                    self.redraw(cx);
+                }
+            }
+            Hit::FingerUp(_) => {
+                self.dragging = false;
+                self.resizing = 0;
+            }
+            _ => {}
+        }
+        if let Event::MouseMove(e) = event {
+            if self.resizing == 0 && !self.dragging {
+                let dir = self.resize_hit(e.abs);
+                let cursor = match (
+                    dir & (RESIZE_LEFT | RESIZE_RIGHT) != 0,
+                    dir & (RESIZE_TOP | RESIZE_BOTTOM) != 0,
+                ) {
+                    // Diagonal resize cursors crash makepad's macOS
+                    // load_undocumented_cursor; use the native axis cursor.
+                    (true, _) => MouseCursor::EwResize,
+                    (false, true) => MouseCursor::NsResize,
+                    (false, false) => MouseCursor::Default,
+                };
+                cx.set_cursor(cursor);
+            }
+        }
+        let (Event::Actions(actions), Some(panel)) = (event, self.panel(cx)) else {
+            return;
+        };
+        let close_btn = panel.widget(cx, ids!(header)).widget(cx, ids!(close_btn));
         if close_btn.as_button().clicked(actions) {
             cx.widget_action(self.widget_uid(), QuizPanelAction::Close);
         }
-        let submit_btn = content.widget(cx, ids!(panel)).widget(cx, ids!(footer)).widget(cx, ids!(submit_btn));
+        let submit_btn = panel.widget(cx, ids!(footer)).widget(cx, ids!(submit_btn));
         if submit_btn.as_button().clicked(actions) && self.quiz.is_some() && !self.graded && !self.loading {
             let submission = self.collect_submission(cx);
             cx.widget_action(self.widget_uid(), QuizPanelAction::Submit(submission));
@@ -312,24 +431,46 @@ impl Widget for QuizPanel {
 }
 
 impl QuizPanel {
-    fn content(&self, cx: &Cx) -> WidgetRef {
-        self.view.widget(cx, ids!(content))
+    fn backdrop(&self, cx: &Cx) -> Option<WidgetRef> {
+        let w = self.view.widget(cx, ids!(backdrop));
+        if w.is_empty() {
+            None
+        } else {
+            Some(w)
+        }
     }
 
-    fn panel(&self, cx: &Cx) -> WidgetRef {
-        self.content(cx).widget(cx, ids!(panel))
+    fn panel(&self, cx: &Cx) -> Option<WidgetRef> {
+        let w = self.view.widget(cx, ids!(panel));
+        if w.is_empty() {
+            None
+        } else {
+            Some(w)
+        }
+    }
+
+    /// Resize direction for a pointer within `RESIZE_T` px of the panel's
+    /// edges (0 = not on any edge). Window coords.
+    fn resize_hit(&self, p: DVec2) -> u8 {
+        resize_dir(Rect { pos: self.pos, size: self.panel_size }, p, RESIZE_T)
     }
 
     fn status(&self, cx: &Cx) -> WidgetRef {
-        self.panel(cx).widget(cx, ids!(status))
+        self.panel(cx)
+            .map(|p| p.widget(cx, ids!(status)))
+            .unwrap_or_default()
     }
 
     fn submit_btn(&self, cx: &Cx) -> WidgetRef {
-        self.panel(cx).widget(cx, ids!(footer)).widget(cx, ids!(submit_btn))
+        self.panel(cx)
+            .map(|p| p.widget(cx, ids!(footer)).widget(cx, ids!(submit_btn)))
+            .unwrap_or_default()
     }
 
     fn question_view(&self, cx: &Cx) -> WidgetRef {
-        self.panel(cx).widget(cx, ids!(body)).widget(cx, ids!(questions))
+        self.panel(cx)
+            .map(|p| p.widget(cx, ids!(body)).widget(cx, ids!(questions)))
+            .unwrap_or_default()
     }
 
     fn single_slot(&self, cx: &Cx, i: usize) -> WidgetRef {
@@ -529,7 +670,7 @@ impl QuizPanelRef {
             w.set_status(cx, "选择/填写后点击提交");
             w.submit_btn(cx).set_visible(cx, true);
 
-            let panel = w.panel(cx);
+            let Some(panel) = w.panel(cx) else { return };
             panel.widget(cx, ids!(header)).widget(cx, ids!(title)).as_label().set_text(cx, &format!("测验 · {title}"));
 
             for qi in 0..3 {

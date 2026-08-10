@@ -1,5 +1,5 @@
 /// Concept-card generation and quiz helpers: section formats, prompt builders,
-/// upserting `#d/#t/#e/#n` tagged sections, and quiz JSON parsing.
+/// upserting `#d/#t/#e/#c/#n` tagged sections, and quiz JSON parsing.
 use serde::{Deserialize, Serialize};
 
 /// Section requested from the card context menu.
@@ -10,6 +10,7 @@ pub enum GenSection {
     Plain,
     PosExample,
     NegExample,
+    Purpose,
     Affect,
     Affected,
 }
@@ -18,41 +19,84 @@ impl GenSection {
     pub fn label(self) -> &'static str {
         match self {
             GenSection::All => "所有",
-            GenSection::Desc => "专业描述",
+            GenSection::Desc => "抽象描述",
             GenSection::Plain => "通俗描述",
-            GenSection::PosExample => "正面例子",
-            GenSection::NegExample => "反面例子",
+            GenSection::PosExample => "正例",
+            GenSection::NegExample => "负例",
+            GenSection::Purpose => "作用",
             GenSection::Affect => "影响什么",
             GenSection::Affected => "被什么影响",
         }
     }
 
-    /// The tag line ("#d 专业描述") used in the card body.
-    pub fn header(self) -> String {
-        format!("{} {}", self.tag(), self.label())
-    }
-
-    /// Tag prefix: #d / #t / #e / #n.
-    fn tag(self) -> &'static str {
+    /// The header pattern this section's tag lines follow.
+    fn pattern(self) -> &'static str {
         match self {
-            GenSection::Desc => "#d",
-            GenSection::Plain => "#t",
-            GenSection::PosExample | GenSection::NegExample => "#e",
-            GenSection::Affect | GenSection::Affected => "#n",
             GenSection::All => unreachable!(),
+            GenSection::Desc => "#d {总结标题}",
+            GenSection::Plain => "#t {总结标题}",
+            GenSection::PosExample => "#e {例子名}(正例)",
+            GenSection::NegExample => "#e {例子名}(负例)",
+            GenSection::Purpose => "#c 作用 {短标题}",
+            GenSection::Affect => "#c influence_to {短标题}",
+            GenSection::Affected => "#c influenced_by {短标题}",
         }
     }
 
     /// All sections except `All`, in the order they appear in the full output.
-    pub fn all() -> [GenSection; 6] {
+    pub fn all() -> [GenSection; 7] {
         [
             GenSection::Desc,
             GenSection::Plain,
             GenSection::PosExample,
             GenSection::NegExample,
+            GenSection::Purpose,
             GenSection::Affect,
             GenSection::Affected,
         ]
+    }
+}
+
+/// The role a tag line plays in a card, regardless of its literal title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SectionKind {
+    DescAbstract,
+    DescPlain,
+    PosExample,
+    NegExample,
+    Purpose,
+    Affect,
+    Affected,
+}
+
+/// Classify a tag line's role: `#d` = abstract description, `#t` = plain
+/// description, `#e` + (负例) = negative example, `#c` keywords = purpose
+/// and influence sections.
+pub fn section_kind(header: &str) -> Option<SectionKind> {
+    let tag = tag_of(header)?;
+    let rest = header[tag.len() + 1..].trim_start();
+    match tag {
+        "#d" => Some(SectionKind::DescAbstract),
+        "#t" => Some(SectionKind::DescPlain),
+        "#e" => {
+            if rest.contains("负例") {
+                Some(SectionKind::NegExample)
+            } else {
+                Some(SectionKind::PosExample)
+            }
+        }
+        "#c" => {
+            if rest.starts_with("作用") {
+                Some(SectionKind::Purpose)
+            } else if rest.starts_with("influence_to") {
+                Some(SectionKind::Affect)
+            } else if rest.starts_with("influenced_by") {
+                Some(SectionKind::Affected)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -70,12 +114,12 @@ pub fn generation_messages(
     };
     let user = match section {
         GenSection::All => format!(
-            "概念：{concept_title}\n\n请按顺序完整输出全部六个板块的内容。{}",
-            all_output_format()
+            "概念：{concept_title}\n\n请按顺序完整输出全部七个板块（抽象描述、通俗描述、3 个正例、1~2 个负例、作用、影响什么、被什么影响），格式见系统提示。"
         ),
         _ => format!(
-            "概念：{concept_title}\n\n只输出「{}」这一板块。{}",
+            "概念：{concept_title}\n\n只输出「{}」这一板块，标签行格式为 `{}`。{}",
             section.label(),
+            section.pattern(),
             single_output_format(section)
         ),
     };
@@ -83,92 +127,129 @@ pub fn generation_messages(
 }
 
 fn generation_system_prompt() -> String {
-    "你是一位擅长概念学习卡片写作的助手。请依据提供的参考资料，为给定的概念输出学习材料。要求：\n\
+    "你是一位概念学习材料写作助手，依据概念学习理论为给定的概念生成学习材料。\n\
+     \n\
+     【理论基础】\n\
+     - 学习材料服务于「判别」：学习者要根据概念的「内涵」（从已见对象提取的共有属性，即判别特征），判断任意一个对象是否属于此概念。\n\
+     - 因此材料的核心是：给出概念的判别特征清单，用正例展示特征如何被满足，用负例展示特征如何被违反，让学习者通过对比多个正例抽象出它们的共性（即抽象描述中的特征）。\n\
+     \n\
+     【输出格式】\n\
+     按以下板块输出（「总结标题」「例子名」「短标题」由你自拟）：\n\
+     #d {总结标题}\n\
+     抽象描述：标签行中的总结标题概括本节内容（如「#d 两个层面」），不要照搬卡片文件名。内容开头写「概念可以通过以下特征来定义：」，随后用 * 逐条罗列判别特征（特征名：说明）。这些特征是判断任意对象是否属于此概念的判别依据，全部满足才归为此概念；不要写成散文式定义。\n\
+     \n\
+     #t {总结标题}\n\
+     通俗描述：用大白话和生活化比喻解释这个概念，让外行也能看懂。标签行同样是概括本节内容的总结标题。\n\
+     \n\
+     #e {例子名}(正例)\n\
+     3 个正例板块，每个板块一个例子：满足全部特征的具体现象，现象之间要有差异，以便学习者通过对比抽象出共性。每个正例先散文描述现象，再写「特征对比」：逐条指出该现象如何满足每个特征。\n\
+     \n\
+     #e {例子名}(负例)\n\
+     1~2 个负例板块，每个板块一个例子：与正例相似但缺失某个关键特征的具体现象，指出它违反了哪些特征。\n\
+     \n\
+     #c 作用 {短标题}\n\
+     学会这个概念后有什么用处（能判别什么问题、指导什么实践）。\n\
+     \n\
+     #c influence_to {短标题}\n\
+     此概念会影响哪些事物，用 * 逐条罗列。\n\
+     \n\
+     #c influenced_by {短标题}\n\
+     哪些事物会影响此概念，用 * 逐条罗列。\n\
+     \n\
+     注意：卡片文件名可能带有排序用的序号前缀（如「04-lifetime」），正文中请使用概念的自然名称（如「lifetime」或其中文译名）。\n\
+     \n\
+     【输出要求】\n\
      1. 每个板块简短精炼，优先依据参考资料，参考资料不足时基于自己的知识补充。\n\
      2. 只输出板块标签行和对应内容，不要输出其他说明、总结或 markdown 代码块。\n\
-     3. 标签行和内容必须在同一行开始，内容可占多行。".to_string()
+     3. 每个标签行独占一行，内容可占多行。".to_string()
 }
 
 fn single_output_format(section: GenSection) -> String {
-    format!(
-        "格式要求：第一行必须是标签行 `{header}`，下面是该板块的纯文本内容。不要包含其他板块。",
-        header = section.header()
-    )
-}
-
-fn all_output_format() -> String {
-    "格式要求：按以下顺序输出，每个板块以标签行开头，后面紧跟内容。不要添加额外说明。\n\n".to_string()
-        + &GenSection::all()
-            .iter()
-            .map(|s| s.header())
-            .collect::<Vec<_>>()
-            .join("\n")
+    match section {
+        GenSection::All => String::new(),
+        GenSection::PosExample => "共输出 3 个正例板块。".to_string(),
+        GenSection::NegExample => "共输出 1~2 个负例板块。".to_string(),
+        GenSection::Desc => "第一行标签行必须是 `#d {总结标题}`，标题概括本节内容，不要照搬卡片文件名。".to_string(),
+        GenSection::Plain => "第一行标签行必须是 `#t {总结标题}`，标题概括本节内容。".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Recognised tag prefixes in the card body.
-const TAGS: [&str; 4] = ["#d", "#t", "#e", "#n"];
+const TAGS: [&str; 5] = ["#d", "#t", "#e", "#c", "#n"];
 
-/// True if `line` starts with one of the recognised tags followed by a space.
+/// True if `line` starts with one of the recognised tags followed by a space
+/// and a non-empty label (labels may start with ASCII, e.g. `#c influence_to`).
 fn is_tag_line(line: &str) -> bool {
     TAGS.iter().any(|tag| {
         line.starts_with(tag)
             && line[tag.len()..].starts_with(' ')
-            && line[tag.len() + 1..].chars().next().map(|c| !c.is_ascii_alphanumeric()) == Some(true)
+            && line[tag.len() + 1..].chars().next().is_some()
     })
 }
 
-/// Extract the tag from a tag line (e.g. "#d 专业描述" -> "#d").
+/// Extract the tag from a tag line (e.g. "#d 抽象描述" -> "#d").
 fn tag_of(line: &str) -> Option<&str> {
     TAGS.iter()
         .find(|tag| line.starts_with(*tag) && line[tag.len()..].starts_with(" "))
         .copied()
 }
 
-/// Replace the section with `header` in `body` by `content`, or append it if absent.
-/// `header` is e.g. "#d 专业描述".
+/// Insert a section into `body` after the last section of the same kind, or
+/// before the first section of a later kind, or append at the end. Sections
+/// are identified by role (SectionKind), not by literal header, so dynamic
+/// titles like `#e 图形面积计算(正例)` still group correctly.
 pub fn upsert_section(body: &str, header: &str, content: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut idx = None;
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim_start() == header {
-            idx = Some(i);
-            break;
-        }
-    }
     let content = trim_blank_lines(content);
     let content_lines: Vec<&str> = content.lines().collect();
-    let mut out: Vec<String> = Vec::new();
+    let Some(kind) = section_kind(header) else {
+        let end = lines.len();
+        return splice_insert(lines, header, content_lines, end);
+    };
 
-    if let Some(start) = idx {
-        // keep lines before the section
-        out.extend(lines[..start].iter().map(|s| s.to_string()));
-        // insert the new header and content
-        out.push(header.to_string());
-        out.extend(content_lines.iter().map(|s| s.to_string()));
-        // skip the old header and its body until the next tag line
-        let mut i = start + 1;
-        while i < lines.len() && !is_tag_line(lines[i].trim_start()) {
-            i += 1;
+    // Classify the body's sections.
+    let mut sections: Vec<(usize, usize, SectionKind)> = Vec::new();
+    let mut start: Option<(usize, SectionKind)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if is_tag_line(t) {
+            if let Some((s, k)) = start.take() {
+                sections.push((s, i, k));
+            }
+            if let Some(k) = section_kind(t) {
+                start = Some((i, k));
+            }
         }
-        // keep trailing lines from the next tag onward
-        out.extend(lines[i..].iter().map(|s| s.to_string()));
-    } else {
-        // append
-        if !body.is_empty() && !body.ends_with('\n') {
-            out.push(body.to_string());
-        } else if !body.is_empty() {
-            out.push(body.to_string());
-        }
-        // separate from existing content
-        if !out.is_empty() && !out.last().map(|s| s.is_empty()).unwrap_or(true) {
-            out.push(String::new());
-        }
-        out.push(header.to_string());
-        out.extend(content_lines.iter().map(|s| s.to_string()));
+    }
+    if let Some((s, k)) = start.take() {
+        sections.push((s, lines.len(), k));
     }
 
-    // ensure trailing blank line kept only if there is trailing content
-    while out.len() > 1 && out.last().map(|s| s.is_empty()).unwrap_or(false) && out[out.len() - 2].is_empty() {
+    // After the last same-kind section; else before the first later-kind one;
+    // else append at the end.
+    let mut insert = lines.len();
+    if let Some((_, end, _)) = sections.iter().rev().find(|(_, _, k)| *k == kind) {
+        insert = *end;
+    } else if let Some((start_idx, _, _)) = sections.iter().find(|(_, _, k)| *k > kind) {
+        insert = *start_idx;
+    }
+    splice_insert(lines, header, content_lines, insert)
+}
+
+fn splice_insert(lines: Vec<&str>, header: &str, content_lines: Vec<&str>, insert: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(lines[..insert].iter().map(|s| s.to_string()));
+    if !out.is_empty() && !out.last().map(|s| s.is_empty()).unwrap_or(true) {
+        out.push(String::new());
+    }
+    out.push(header.to_string());
+    out.extend(content_lines.iter().map(|s| s.to_string()));
+    if insert < lines.len() {
+        out.push(String::new());
+        out.extend(lines[insert..].iter().map(|s| s.to_string()));
+    }
+    while out.last().map(|s| s.is_empty()).unwrap_or(false) {
         out.pop();
     }
     out.join("\n")
@@ -191,9 +272,7 @@ pub fn parse_generation_output(text: &str) -> Vec<(String, String)> {
         let trimmed = line.trim_start();
         if let Some(tag) = tag_of(trimmed) {
             let rest = &trimmed[tag.len() + 1..];
-            if !rest.is_empty()
-                && rest.chars().next().map(|c| !c.is_ascii_alphanumeric()) == Some(true)
-            {
+            if !rest.is_empty() {
                 if let Some((h, lines)) = current.take() {
                     out.push((h, trim_blank_lines(&lines.join("\n"))));
                 }
@@ -228,7 +307,8 @@ fn trim_blank_lines(s: &str) -> String {
 }
 
 /// Check whether a card body contains the four sections required for a quiz.
-/// Returns the missing human-readable names on failure.
+/// Returns the missing human-readable names on failure. Legacy `#n` headers
+/// are still accepted alongside the current `#c influence_to/influenced_by`.
 pub fn quiz_ready(body: &str) -> Result<(), Vec<String>> {
     let mut has_desc = false;
     let mut has_example = false;
@@ -241,9 +321,9 @@ pub fn quiz_ready(body: &str) -> Result<(), Vec<String>> {
             has_desc = true;
         } else if t.starts_with("#e ") {
             has_example = true;
-        } else if t.starts_with("#n 影响什么") {
+        } else if t.starts_with("#c influence_to") || t.starts_with("#n 影响什么") {
             has_affect = true;
-        } else if t.starts_with("#n 被什么影响") {
+        } else if t.starts_with("#c influenced_by") || t.starts_with("#n 被什么影响") {
             has_affected = true;
         }
     }
@@ -393,48 +473,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upsert_replaces_existing_section() {
-        let body = "intro\n#d 专业描述\nold\n#e 正面例子\nexample";
-        let out = upsert_section(body, "#d 专业描述", "new def");
-        assert!(out.contains("#d 专业描述\nnew def"), "{out}");
-        assert!(!out.contains("old"), "{out}");
-        assert!(out.contains("#e 正面例子\nexample"), "{out}");
+    fn upsert_inserts_after_same_kind() {
+        let body = "#d 抽象描述\nold\n#e 已有例子(正例)\nex1\n#e 已有例子(负例)\nneg1";
+        let out = upsert_section(body, "#e 新例子(正例)", "new pos");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "#d 抽象描述",
+                "old",
+                "#e 已有例子(正例)",
+                "ex1",
+                "",
+                "#e 新例子(正例)",
+                "new pos",
+                "",
+                "#e 已有例子(负例)",
+                "neg1",
+            ],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_inserts_before_later_kind_when_absent() {
+        let body = "#e 已有例子(负例)\nneg1";
+        let out = upsert_section(body, "#e 新例子(正例)", "new pos");
+        assert!(out.starts_with("#e 新例子(正例)\nnew pos\n"), "{out}");
+        assert!(out.contains("#e 已有例子(负例)"), "{out}");
     }
 
     #[test]
     fn upsert_appends_missing_section() {
         let body = "intro\n";
-        let out = upsert_section(body, "#t 通俗描述", "plain words");
-        assert!(out.ends_with("#t 通俗描述\nplain words"), "{out}");
+        let out = upsert_section(body, "#c 作用 用途", "plain words");
+        assert!(out.ends_with("#c 作用 用途\nplain words"), "{out}");
+    }
+
+    #[test]
+    fn upsert_unrecognized_header_appends() {
+        let body = "intro\n";
+        let out = upsert_section(body, "#c something_new 标题", "x");
+        assert!(out.ends_with("#c something_new 标题\nx"), "{out}");
     }
 
     #[test]
     fn upsert_sections_all_at_once() {
-        let body = "#d 专业描述\nold";
+        let body = "#d 抽象描述\nold";
         let sections = vec![
-            ("#d 专业描述".to_string(), "new def".to_string()),
-            ("#t 通俗描述".to_string(), "plain".to_string()),
+            ("#d 抽象描述".to_string(), "new def".to_string()),
+            ("#t 通俗描述".to_string(), "plain words".to_string()),
+            ("#e 新例子(正例)".to_string(), "pos".to_string()),
+            ("#c 作用 用途".to_string(), "use".to_string()),
         ];
         let out = upsert_sections(body, &sections);
-        assert!(out.contains("#d 专业描述\nnew def"), "{out}");
-        assert!(out.contains("#t 通俗描述\nplain"), "{out}");
+        assert!(out.contains("#d 抽象描述\nnew def"), "{out}");
+        assert!(out.contains("#t 通俗描述\nplain words"), "{out}");
+        assert!(out.contains("#e 新例子(正例)\npos"), "{out}");
+        assert!(out.contains("#c 作用 用途\nuse"), "{out}");
+        assert!(out.ends_with("#c 作用 用途\nuse"), "{out}");
+    }
+
+    #[test]
+    fn section_kind_classifies_headers() {
+        assert_eq!(section_kind("#d 概念名"), Some(SectionKind::DescAbstract));
+        assert_eq!(section_kind("#t 通俗描述"), Some(SectionKind::DescPlain));
+        assert_eq!(section_kind("#e 面积(正例)"), Some(SectionKind::PosExample));
+        assert_eq!(section_kind("#e 继承(负例)"), Some(SectionKind::NegExample));
+        assert_eq!(section_kind("#c 作用 标准化"), Some(SectionKind::Purpose));
+        assert_eq!(
+            section_kind("#c influence_to 前兆"),
+            Some(SectionKind::Affect)
+        );
+        assert_eq!(
+            section_kind("#c influenced_by 后继"),
+            Some(SectionKind::Affected)
+        );
+        assert_eq!(section_kind("#c unknown 标题"), None);
     }
 
     #[test]
     fn parse_generation_output_with_tags() {
-        let text = "好的\n#d 专业描述\n定义\n\n#t 通俗描述\n比喻\n#e 正面例子\n正例\n#e 反面例子\n反例\n#n 影响什么\n影响\n#n 被什么影响\n被影响";
+        let text = "好的\n#d 概念名\n特征列表\n#t 通俗描述\n大白话\n#e 面积(正例)\n正例\n#e 继承(负例)\n负例\n#c 作用 用途\n作用\n#c influence_to 前兆\n影响\n#c influenced_by 后继\n被影响";
         let out = parse_generation_output(text);
-        assert_eq!(out.len(), 6);
-        assert_eq!(out[0], ("#d 专业描述".to_string(), "定义".to_string()));
-        assert_eq!(out[5], ("#n 被什么影响".to_string(), "被影响".to_string()));
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[0], ("#d 概念名".to_string(), "特征列表".to_string()));
+        assert_eq!(out[1], ("#t 通俗描述".to_string(), "大白话".to_string()));
+        assert_eq!(out[6], ("#c influenced_by 后继".to_string(), "被影响".to_string()));
     }
 
     #[test]
     fn quiz_ready_detects_missing() {
-        let body = "#d 专业描述\nx\n#e 正面例子\ny\n#n 影响什么\nz";
+        let body = "#d 概念名\nx\n#e 面积(正例)\ny\n#c influence_to 前兆\nz";
         assert!(quiz_ready(body).is_err());
-        let body2 = "#t 通俗描述\nx\n#e 反面例子\ny\n#n 影响什么\nz\n#n 被什么影响\nw";
+        let body2 = "#d 概念名\nx\n#e 继承(负例)\ny\n#c influence_to 前兆\nz\n#c influenced_by 后继\nw";
         assert!(quiz_ready(body2).is_ok());
+        let legacy = "#d 概念名\nx\n#e 正例\ny\n#n 影响什么\nz\n#n 被什么影响\nw";
+        assert!(quiz_ready(legacy).is_ok());
     }
 
     #[test]
