@@ -24,29 +24,30 @@ fn default_thinking() -> String {
     "max".to_string()
 }
 
-/// The 渐构 concept-card sections, in display order: (id, title). The
+/// The 渐构 concept-card sections, in display order: (id, tag line). The
 /// ai_panel shows one pill button per section; enabled ids are persisted in
-/// settings.json and the prompt is built from them.
+/// settings.json and the prompt is built from them. Ids match the card
+/// generation sections, so both surfaces share the same tag-line format.
 pub const JIANGOU_SECTIONS: [(&str, &str); 7] = [
-    ("desc", "#d 标准描述"),
-    ("plain", "#t 通俗描述"),
-    ("pos", "#e 正面例子"),
-    ("neg", "#e 反面例子"),
-    ("affect", "#n 影响什么"),
-    ("affected", "#n 被啥影响"),
-    ("use", "#n 概念作用"),
+    ("desc", "#d {总结标题}"),
+    ("plain", "#t {总结标题}"),
+    ("pos", "#e {例子名}(正例)"),
+    ("neg", "#e {例子名}(负例)"),
+    ("use", "#c 作用 {短标题}"),
+    ("affect", "#c influence_to {短标题}"),
+    ("affected", "#c influenced_by {短标题}"),
 ];
 
 /// Instruction for one enabled section: (id, section body).
 fn jiangou_section_instruction(id: &str) -> &'static str {
     match id {
-        "desc" => "用一两句话给出准确严谨的定义。",
-        "plain" => "用生活化的比喻或大白话解释这个概念。",
-        "pos" => "给出一个符合该概念的正面例子。",
-        "neg" => "给出一个不符合该概念的负面例子，并说明为什么不符合。",
-        "affect" => "说明这个概念会支持、影响或催生什么。",
-        "affected" => "说明什么因素会影响、决定或催生这个概念。",
-        "use" => "说明学会这个概念后有什么用，可以用在哪些场景。",
+        "desc" => "抽象描述：开头写「概念可以通过以下特征来定义：」，随后用 * 逐条罗列判别特征（特征名：说明）。这些特征是判断任意对象是否属于此概念的判别依据，全部满足才归为此概念；不要写成散文式定义。",
+        "plain" => "通俗描述：用大白话和生活化比喻解释这个概念，让外行也能看懂。",
+        "pos" => "1~3 个正例板块（视问题复杂度而定），每个板块一个例子：满足全部特征的具体现象。每个正例先散文描述现象，再写「特征对比」：逐条指出该现象如何满足每个特征。",
+        "neg" => "1~2 个负例板块，每个板块一个例子：与正例相似但缺失某个关键特征的具体现象，指出它违反了哪些特征。",
+        "use" => "作用：学会这个概念后有什么用处（能判别什么问题、指导什么实践）。",
+        "affect" => "此概念会影响哪些事物，用 * 逐条罗列。",
+        "affected" => "哪些事物会影响此概念，用 * 逐条罗列。",
         _ => "",
     }
 }
@@ -82,22 +83,19 @@ impl Default for AIConfig {
 }
 
 /// System-prompt instruction for 渐构-style concept answers, listing only
-/// the enabled sections. Injected on every request while any section is on
-/// (never stored in chat_history).
+/// the enabled sections as tag lines. Injected on every request while any
+/// section is on (never stored in chat_history).
 pub fn jiangou_format_prompt(enabled: &[String]) -> String {
     let mut out = String::from(
-        "当用户的问题是在解释或学习某个概念时，请按以下板块回答，板块标题用 markdown 标题：\n",
+        "当用户的问题是在解释或学习某个概念时，请按以下板块回答。标签行格式如下（「总结标题」「例子名」「短标题」由你自拟，概括本节内容，不要照搬问题文字）：\n",
     );
     for (id, title) in JIANGOU_SECTIONS {
         if enabled.iter().any(|s| s == id) {
-            out.push_str(&format!(
-                "## {title}\n{}\n",
-                jiangou_section_instruction(id)
-            ));
+            out.push_str(&format!("{title}\n{}\n", jiangou_section_instruction(id)));
         }
     }
     out.push_str(
-        "要求：每个板块简短精炼；回答优先依据提供的参考资料和卡片内容，并在引用处标注 [编号]；参考资料不足时明确说明并基于自己的知识补充；若用户的问题不是概念解释类（例如编程任务、总结、闲聊），则直接正常回答，不要套用上述格式。",
+        "要求：每个标签行独占一行，内容可占多行，板块之间空一行；每个板块简短精炼；回答优先依据提供的参考资料和卡片内容，并在引用处标注 [编号]；参考资料不足时明确说明并基于自己的知识补充；若用户的问题不是概念解释类（例如编程任务、总结、闲聊），则直接正常回答，不要套用上述格式。",
     );
     out
 }

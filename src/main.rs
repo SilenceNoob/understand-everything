@@ -798,26 +798,26 @@ script_mod! {
                                 flow: Right
                                 spacing: 0
                                 padding: Inset{left: 12, right: 12, bottom: 8}
-                                desc_btn := JiangouSectionBtn{ text: "标准描述" }
-                                desc_on_btn := JiangouSectionBtnOn{ visible: false, text: "标准描述" }
+                                desc_btn := JiangouSectionBtn{ text: "抽象描述" }
+                                desc_on_btn := JiangouSectionBtnOn{ visible: false, text: "抽象描述" }
                                 spacer1 := mod.widgets.View{ width: Fill, height: Fit }
                                 plain_btn := JiangouSectionBtn{ text: "通俗描述" }
                                 plain_on_btn := JiangouSectionBtnOn{ visible: false, text: "通俗描述" }
                                 spacer2 := mod.widgets.View{ width: Fill, height: Fit }
-                                pos_btn := JiangouSectionBtn{ text: "正面例子" }
-                                pos_on_btn := JiangouSectionBtnOn{ visible: false, text: "正面例子" }
+                                pos_btn := JiangouSectionBtn{ text: "正例" }
+                                pos_on_btn := JiangouSectionBtnOn{ visible: false, text: "正例" }
                                 spacer3 := mod.widgets.View{ width: Fill, height: Fit }
-                                neg_btn := JiangouSectionBtn{ text: "反面例子" }
-                                neg_on_btn := JiangouSectionBtnOn{ visible: false, text: "反面例子" }
+                                neg_btn := JiangouSectionBtn{ text: "负例" }
+                                neg_on_btn := JiangouSectionBtnOn{ visible: false, text: "负例" }
                                 spacer4 := mod.widgets.View{ width: Fill, height: Fit }
+                                use_btn := JiangouSectionBtn{ text: "作用" }
+                                use_on_btn := JiangouSectionBtnOn{ visible: false, text: "作用" }
+                                spacer5 := mod.widgets.View{ width: Fill, height: Fit }
                                 affect_btn := JiangouSectionBtn{ text: "影响什么" }
                                 affect_on_btn := JiangouSectionBtnOn{ visible: false, text: "影响什么" }
-                                spacer5 := mod.widgets.View{ width: Fill, height: Fit }
-                                affected_btn := JiangouSectionBtn{ text: "被啥影响" }
-                                affected_on_btn := JiangouSectionBtnOn{ visible: false, text: "被啥影响" }
                                 spacer6 := mod.widgets.View{ width: Fill, height: Fit }
-                                use_btn := JiangouSectionBtn{ text: "概念作用" }
-                                use_on_btn := JiangouSectionBtnOn{ visible: false, text: "概念作用" }
+                                affected_btn := JiangouSectionBtn{ text: "被什么影响" }
+                                affected_on_btn := JiangouSectionBtnOn{ visible: false, text: "被什么影响" }
                             }
                             ctx_row := mod.widgets.View{
                                 width: Fill
