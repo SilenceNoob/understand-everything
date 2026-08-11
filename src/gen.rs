@@ -665,7 +665,8 @@ pub fn route_plan_messages(goal: &str, context: &str, diagnostics: &str) -> (Str
         }\n\
          要求：id 唯一且不能是 \"root\"；parent 必须是已出现的卡片 id 或 null（null = 根卡片之子）；\
          type 只能是 \"concept\" 或 \"knowledge\"；卡片标题是概念/知识的自然名称，不要带序号前缀，\
-         也不要包含 / 、\\ 等路径字符；输入输出要具体到能指导后续生成学习材料。"
+         也不要包含 / 、\\ 等路径字符；输入输出要具体到能指导后续生成学习材料；\
+         cards 不要包含学习目标本身（根卡由程序创建，只列出根卡的子卡及更深层卡片）。"
             .to_string();
     let mut user = if context.is_empty() {
         format!("学习目标：{goal}\n\n没有参考资料，请基于自己的知识规划。")
@@ -957,6 +958,33 @@ pub fn parse_route_plan(text: &str) -> Result<RoutePlan, String> {
         }
     }
     Ok(plan)
+}
+
+/// Drop plan cards whose title equals the goal itself (planners sometimes
+/// list the root as a card — "根卡 = 学习目标本身" — even though the root is
+/// created by the program). Their children re-attach to the root (parent
+/// None = 根卡之子, the same convention `parse_route_plan` uses for unknown
+/// parents).
+pub fn drop_goal_duplicates(plan: &mut RoutePlan, goal: &str) {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        return;
+    }
+    let dup_ids: std::collections::HashSet<String> = plan
+        .cards
+        .iter()
+        .filter(|c| c.title.trim() == goal)
+        .map(|c| c.id.clone())
+        .collect();
+    if dup_ids.is_empty() {
+        return;
+    }
+    plan.cards.retain(|c| !dup_ids.contains(&c.id));
+    for c in &mut plan.cards {
+        if c.parent.as_ref().is_some_and(|p| dup_ids.contains(p)) {
+            c.parent = None;
+        }
+    }
 }
 
 /// Strip a "NN-" order prefix from a card title or file stem
@@ -1506,6 +1534,42 @@ mod tests {
         let order = learning_order(&stray);
         assert_eq!(order.len(), 2);
         assert!(order.contains(&1));
+    }
+
+    #[test]
+    fn drop_goal_duplicates_removes_goal_card_and_reparents() {
+        let card = |id: &str, parent: Option<&str>, title: &str| RouteCard {
+            id: id.to_string(),
+            parent: parent.map(|s| s.to_string()),
+            title: title.to_string(),
+            card_type: "concept".to_string(),
+            ..Default::default()
+        };
+        // goal card + its child + an unrelated card
+        let mut plan = RoutePlan {
+            cards: vec![
+                card("goal", None, "酸辣土豆丝的做法"),
+                card("c1", Some("goal"), "土豆切丝"),
+                card("c2", None, "淀粉"),
+            ],
+            ..Default::default()
+        };
+        drop_goal_duplicates(&mut plan, " 酸辣土豆丝的做法 ");
+        assert_eq!(plan.cards.len(), 2);
+        assert!(plan.cards.iter().all(|c| c.id != "goal"));
+        // the goal card's child re-attaches to the root
+        let c1 = plan.cards.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(c1.parent, None);
+        // the unrelated card is untouched
+        let c2 = plan.cards.iter().find(|c| c.id == "c2").unwrap();
+        assert_eq!(c2.parent, None);
+        // empty goal is a no-op
+        let mut plan2 = RoutePlan {
+            cards: vec![card("goal", None, "酸辣土豆丝的做法")],
+            ..Default::default()
+        };
+        drop_goal_duplicates(&mut plan2, "");
+        assert_eq!(plan2.cards.len(), 1);
     }
 
     #[test]

@@ -109,6 +109,43 @@ script_mod! {
         }
     }
 
+    // Diagnostic interview choice options: same look as the quiz panel's
+    // OptionBtn — wrap text to the button width (Right wrap flow + Fill
+    // label walk) and highlight the selection with a blue-bordered twin.
+    let DiagOptionBtn = mod.widgets.ButtonFlat{
+        width: Fill
+        height: Fit
+        flow: Flow.Right{wrap: true}
+        padding: Inset{left: 8, right: 8, top: 4, bottom: 4}
+        margin: Inset{right: 4}
+        draw_bg +: {
+            color: #0000
+            color_hover: #ffffff10
+            color_down: #ffffff18
+            color_focus: #0000
+            border_size: uniform(1.0)
+            border_color: #ffffff30
+            border_radius: uniform(4.0)
+        }
+        draw_text +: {
+            text_style: theme.font_regular{font_size: 12.0}
+            color: #e6e9f0
+        }
+    }
+    let DiagOptionBtnOn = DiagOptionBtn{
+        draw_bg +: {
+            color: #4c6ef520
+            color_hover: #5c7cfa30
+            color_down: #5c7cfa30
+            color_focus: #4c6ef520
+            border_color: #4c6ef5
+        }
+        draw_text +: {
+            text_style: theme.font_bold{font_size: 12.0}
+            color: #e6e9f0
+        }
+    }
+
     // Popup content shared by the Setting/About PopupPanel instances; the
     // panel widget draws it window-sized only while opened (the old
     // visible:false View never drew, so its area stayed empty and
@@ -270,7 +307,7 @@ script_mod! {
             }
         }
         panel := mod.widgets.RoundedView{
-            width: 480
+            width: 720
             height: Fit
             flow: Down
             padding: 28
@@ -350,25 +387,25 @@ script_mod! {
                     draw_text.text_style.font_size: 15.0
                     draw_text.color: #e6e9f0
                 }
-                opt0 := mod.widgets.ButtonFlat{
-                    visible: false
+                diag_opt_ab := mod.widgets.View{
                     width: Fill
-                    text: ""
+                    height: Fit
+                    flow: Right
+                    spacing: 4
+                    opt0_off := DiagOptionBtn{ visible: false, text: "" }
+                    opt0_on := DiagOptionBtnOn{ visible: false, text: "" }
+                    opt1_off := DiagOptionBtn{ visible: false, text: "" }
+                    opt1_on := DiagOptionBtnOn{ visible: false, text: "" }
                 }
-                opt1 := mod.widgets.ButtonFlat{
-                    visible: false
+                diag_opt_cd := mod.widgets.View{
                     width: Fill
-                    text: ""
-                }
-                opt2 := mod.widgets.ButtonFlat{
-                    visible: false
-                    width: Fill
-                    text: ""
-                }
-                opt3 := mod.widgets.ButtonFlat{
-                    visible: false
-                    width: Fill
-                    text: ""
+                    height: Fit
+                    flow: Right
+                    spacing: 4
+                    opt2_off := DiagOptionBtn{ visible: false, text: "" }
+                    opt2_on := DiagOptionBtnOn{ visible: false, text: "" }
+                    opt3_off := DiagOptionBtn{ visible: false, text: "" }
+                    opt3_on := DiagOptionBtnOn{ visible: false, text: "" }
                 }
                 // TextInput ignores `visible` (its draw_walk never checks
                 // it), so the open-answer box toggles via this container.
@@ -392,28 +429,6 @@ script_mod! {
                         width: Fit
                         text: "提交，下一题"
                     }
-                    diag_skip_btn := mod.widgets.ButtonFlat{
-                        width: Fit
-                        text: "跳过诊断，直接生成"
-                    }
-                }
-            }
-            skip_btn := mod.widgets.ButtonFlat{
-                width: Fit
-                text: "先看看导图 →"
-                padding: Inset{left: 0, right: 0, top: 2, bottom: 2}
-                draw_bg +: {
-                    color: #0000
-                    color_hover: #ffffff0a
-                    color_down: #ffffff0a
-                    color_focus: #0000
-                    border_size: uniform(0.0)
-                }
-                draw_text +: {
-                    text_style: theme.font_regular{
-                        font_size: 12.0
-                    }
-                    color: #7a8192
                 }
             }
         }
@@ -1568,16 +1583,6 @@ impl App {
         {
             self.submit_concept(cx, &input.text());
         }
-        if self
-            .popup_child(
-                live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(skip_btn)],
-            )
-            .as_button()
-            .clicked(actions)
-        {
-            self.close_startup(cx);
-        }
         // Diagnostic interview: answer input focus, option toggles, submit.
         let diag_input = self
             .popup_child(
@@ -1598,19 +1603,29 @@ impl App {
             }
         }
         for i in 0..4 {
-            let opt = self
-                .popup_child(
-                    live_id!(startup_popup),
-                    &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
-                )
+            let off = self
+                .popup_child(live_id!(startup_popup), &Self::opt_path(i, false))
                 .as_button();
-            if opt.clicked(actions) {
+            if off.clicked(actions) {
                 match self.diag_current.as_ref().map(|q| q.kind.as_str()) {
                     Some("single") => self.diag_single = Some(i),
-                    Some("multi") => self.diag_multi[i] = !self.diag_multi[i],
+                    Some("multi") => self.diag_multi[i] = true,
                     _ => {}
                 }
                 self.sync_diag_options(cx);
+            }
+            let on = self
+                .popup_child(live_id!(startup_popup), &Self::opt_path(i, true))
+                .as_button();
+            if on.clicked(actions) {
+                match self.diag_current.as_ref().map(|q| q.kind.as_str()) {
+                    // clicking the already-selected option in single-choice keeps it
+                    Some("multi") => {
+                        self.diag_multi[i] = false;
+                        self.sync_diag_options(cx);
+                    }
+                    _ => {}
+                }
             }
         }
         if self
@@ -1622,16 +1637,6 @@ impl App {
             .clicked(actions)
         {
             self.submit_diag_answer(cx);
-        }
-        if self
-            .popup_child(
-                live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row), live_id!(diag_skip_btn)],
-            )
-            .as_button()
-            .clicked(actions)
-        {
-            self.finish_diag(cx, "");
         }
     }
 
@@ -1690,16 +1695,24 @@ impl App {
         .as_label()
         .set_text(cx, "");
         for i in 0..4 {
-            self.popup_child(
-                live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
-            )
-            .as_button()
-            .set_visible(cx, false);
+            self.popup_child(live_id!(startup_popup), &Self::opt_path(i, false))
+                .as_button()
+                .set_visible(cx, false);
+            self.popup_child(live_id!(startup_popup), &Self::opt_path(i, true))
+                .as_button()
+                .set_visible(cx, false);
         }
         self.popup_child(
             live_id!(startup_popup),
             &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_input_box)],
+        )
+        .set_visible(cx, false);
+        // The submit row stays hidden while 出题中 (clicking it with no
+        // question loaded was a silent no-op); render_diag_question re-shows
+        // it, and the failure paths re-show it as a retry entry.
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row)],
         )
         .set_visible(cx, false);
         ai::chat_completions(
@@ -1724,6 +1737,7 @@ impl App {
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
             self.set_diag_status(cx, &format!("出题失败 ({}): {}", response.status_code, detail));
+            self.diag_btn_row_visible(cx, true);
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
@@ -1744,10 +1758,8 @@ impl App {
                     return;
                 }
                 let debug = ai::response_debug_preview(response);
-                self.set_diag_status(
-                    cx,
-                    &format!("出题解析失败：{e}（{debug}）。可点「跳过诊断，直接生成」"),
-                );
+                self.set_diag_status(cx, &format!("出题解析失败：{e}（{debug}）。可点「提交」重试"));
+                self.diag_btn_row_visible(cx, true);
             }
         }
     }
@@ -1771,13 +1783,13 @@ impl App {
         .set_text(cx, &q.question);
         let is_open = q.kind == "open";
         for i in 0..4 {
-            let opt = self
-                .popup_child(
-                    live_id!(startup_popup),
-                    &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
-                )
+            let off = self
+                .popup_child(live_id!(startup_popup), &Self::opt_path(i, false))
                 .as_button();
-            opt.set_visible(cx, !is_open && i < q.options.len());
+            off.set_visible(cx, !is_open && i < q.options.len());
+            self.popup_child(live_id!(startup_popup), &Self::opt_path(i, true))
+                .as_button()
+                .set_visible(cx, false);
         }
         // Toggle the container, not the TextInput (which ignores `visible`).
         let input_box = self.popup_child(
@@ -1793,36 +1805,30 @@ impl App {
             .as_text_input()
             .set_text(cx, "");
         }
+        self.diag_btn_row_visible(cx, true);
         self.sync_diag_options(cx);
     }
 
-    /// Refresh the option buttons' selection markers (●/○ single, ☑/☐ multi).
+    /// Refresh the option buttons: text on both twins, selection shown by
+    /// swapping to the highlighted on-variant (●/○ prefix is gone).
     fn sync_diag_options(&mut self, cx: &mut Cx) {
         let Some(q) = &self.diag_current else { return };
         for i in 0..q.options.len() {
-            let mark = match q.kind.as_str() {
-                "single" => {
-                    if self.diag_single == Some(i) {
-                        "● "
-                    } else {
-                        "○ "
-                    }
-                }
-                "multi" => {
-                    if self.diag_multi[i] {
-                        "☑ "
-                    } else {
-                        "☐ "
-                    }
-                }
-                _ => "",
+            let selected = match q.kind.as_str() {
+                "single" => self.diag_single == Some(i),
+                "multi" => self.diag_multi[i],
+                _ => false,
             };
-            self.popup_child(
-                live_id!(startup_popup),
-                &[live_id!(content), live_id!(panel), live_id!(diag_view), Self::opt_id(i)],
-            )
-            .as_button()
-            .set_text(cx, &format!("{mark}{}", q.options[i]));
+            let off = self
+                .popup_child(live_id!(startup_popup), &Self::opt_path(i, false))
+                .as_button();
+            let on = self
+                .popup_child(live_id!(startup_popup), &Self::opt_path(i, true))
+                .as_button();
+            off.set_text(cx, &q.options[i]);
+            on.set_text(cx, &q.options[i]);
+            off.set_visible(cx, !selected);
+            on.set_visible(cx, selected);
         }
     }
 
@@ -1835,13 +1841,47 @@ impl App {
         .set_text(cx, text);
     }
 
-    fn opt_id(i: usize) -> LiveId {
-        match i {
-            0 => live_id!(opt0),
-            1 => live_id!(opt1),
-            2 => live_id!(opt2),
-            _ => live_id!(opt3),
+    fn diag_btn_row_visible(&self, cx: &mut Cx, visible: bool) {
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row)],
+        )
+        .set_visible(cx, visible);
+    }
+
+    fn opt_id(i: usize, on: bool) -> LiveId {
+        match (i, on) {
+            (0, false) => live_id!(opt0_off),
+            (0, true) => live_id!(opt0_on),
+            (1, false) => live_id!(opt1_off),
+            (1, true) => live_id!(opt1_on),
+            (2, false) => live_id!(opt2_off),
+            (2, true) => live_id!(opt2_on),
+            (3, false) => live_id!(opt3_off),
+            _ => live_id!(opt3_on),
         }
+    }
+
+    /// The row view hosting option `i` (0/1 in row ab, 2/3 in row cd).
+    fn opt_row_id(i: usize) -> LiveId {
+        if i < 2 {
+            live_id!(diag_opt_ab)
+        } else {
+            live_id!(diag_opt_cd)
+        }
+    }
+
+    /// Full lookup path for an option button: every segment is a direct
+    /// child of the previous one (startup-popup lookups are only reliable
+    /// along direct-child chains).
+    fn opt_path(i: usize, on: bool) -> [LiveId; 5] {
+        [
+            live_id!(content),
+            live_id!(panel),
+            live_id!(diag_view),
+            Self::opt_row_id(i),
+            Self::opt_id(i, on),
+        ]
     }
 
     fn option_letter(i: usize) -> String {
@@ -1892,6 +1932,12 @@ impl App {
     /// at the cap, plan the route from the transcript alone.
     fn submit_diag_answer(&mut self, cx: &mut Cx) {
         let Some(q) = self.diag_current.clone() else {
+            // No question loaded: the button acts as 重试出题 after a
+            // question-request failure.
+            if self.diag_id == LiveId::empty() {
+                self.diag_retried = false;
+                self.send_diag_request(cx);
+            }
             return;
         };
         let Some(ans) = self.collect_diag_answer() else {
@@ -2097,13 +2143,17 @@ impl App {
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
-        let plan = match crate::gen::parse_route_plan(&content) {
+        let mut plan = match crate::gen::parse_route_plan(&content) {
             Ok(p) => p,
             Err(e) => {
                 self.abort_route(cx, format!("路线解析失败：{e}"));
                 return;
             }
         };
+        // The planner sometimes lists the goal itself as a card; the root
+        // already exists, so drop those and re-attach their children to the
+        // root (else a "-1" duplicate root gets created).
+        crate::gen::drop_goal_duplicates(&mut plan, &self.route_goal);
         let base = crate::util::app_base_dir();
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         let Some(map_file) = mind_map.current_map_file() else {
