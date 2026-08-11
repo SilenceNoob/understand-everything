@@ -425,6 +425,11 @@ script_mod! {
                     height: Fit
                     flow: Right
                     spacing: 8
+                    diag_unknown_btn := mod.widgets.ButtonFlat{
+                        visible: false
+                        width: Fit
+                        text: "我不知道"
+                    }
                     diag_submit_btn := mod.widgets.ButtonFlat{
                         width: Fit
                         text: "提交，下一题"
@@ -1032,6 +1037,15 @@ struct RouteWait {
     started: Instant,
 }
 
+/// Route-plan retrieval fired when the diagnostic interview starts (the
+/// query is just the goal, known minutes before the interview ends); adopted
+/// by `start_route_plan` when the goal matches, dropped otherwise.
+struct RoutePrefetch {
+    goal: String,
+    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    started: Instant,
+}
+
 /// Startup popup phase: goal input vs the adaptive diagnostic interview.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartupPhase {
@@ -1105,6 +1119,20 @@ pub struct App {
     /// Incremental SSE decoder for the in-flight reply.
     #[rust]
     chat_parser: SseParser,
+    /// Route-plan stream state (mirrors the chat trio; parsed at stream end).
+    #[rust]
+    route_buf: String,
+    #[rust]
+    route_think: String,
+    #[rust]
+    route_parser: SseParser,
+    /// True after one automatic retry of an unparseable route plan response
+    /// (thinking models occasionally emit malformed JSON).
+    #[rust]
+    route_retried: bool,
+    /// RAG context of the in-flight route request, reused by the retry.
+    #[rust]
+    route_context: String,
     /// The ai_panel's ChatList widget, resolved via live child traversal
     /// (the widget-tree graph can't see deep into FloatPanel subtrees).
     #[rust]
@@ -1170,6 +1198,10 @@ pub struct App {
     /// Deferred route planning waiting on hybrid RAG retrieval.
     #[rust]
     route_wait: Option<RouteWait>,
+    /// Route-plan retrieval fired at diagnostic start; adopted by
+    /// start_route_plan when the goal matches.
+    #[rust]
+    route_prefetch: Option<RoutePrefetch>,
     /// In-flight learning-route plan request.
     #[rust]
     route_id: LiveId,
@@ -1638,6 +1670,16 @@ impl App {
         {
             self.submit_diag_answer(cx);
         }
+        if self
+            .popup_child(
+                live_id!(startup_popup),
+                &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row), live_id!(diag_unknown_btn)],
+            )
+            .as_button()
+            .clicked(actions)
+        {
+            self.submit_diag_unknown(cx);
+        }
     }
 
     /// Start the adaptive diagnostic interview for `goal` (startup popup
@@ -1664,6 +1706,22 @@ impl App {
         }
         self.reset_diag();
         self.diag_goal = goal.trim().to_string();
+        // Prefetch the route-plan retrieval now: the query is just the goal,
+        // so by the time the interview ends the result is ready and the
+        // route request fires immediately. Only when the current map's index
+        // actually has chunks (empty index would return no hits anyway).
+        self.route_prefetch = None;
+        let map_file = self.ui.mind_map(cx, ids!(mindmap)).current_map_file();
+        if let (Some(rag), Some(map)) = (&self.rag, map_file) {
+            if rag.models().is_some_and(|m| m.embedding_ready()) && rag.has_chunks_for(&map) {
+                let rx = rag.retrieve(&self.diag_goal);
+                self.route_prefetch = Some(RoutePrefetch {
+                    goal: self.diag_goal.clone(),
+                    rx,
+                    started: Instant::now(),
+                });
+            }
+        }
         self.set_startup_phase(cx, StartupPhase::Diag);
         self.popup_widget(live_id!(startup_popup)).as_popup_panel().show(cx);
         self.popup_child(
@@ -1737,6 +1795,7 @@ impl App {
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
             self.set_diag_status(cx, &format!("出题失败 ({}): {}", response.status_code, detail));
+            self.diag_unknown_btn(cx).set_visible(cx, false);
             self.diag_btn_row_visible(cx, true);
             return;
         }
@@ -1759,6 +1818,7 @@ impl App {
                 }
                 let debug = ai::response_debug_preview(response);
                 self.set_diag_status(cx, &format!("出题解析失败：{e}（{debug}）。可点「提交」重试"));
+                self.diag_unknown_btn(cx).set_visible(cx, false);
                 self.diag_btn_row_visible(cx, true);
             }
         }
@@ -1806,6 +1866,8 @@ impl App {
             .set_text(cx, "");
         }
         self.diag_btn_row_visible(cx, true);
+        // 我不知道 is a choice-question escape hatch; hidden for open answers.
+        self.diag_unknown_btn(cx).set_visible(cx, !is_open);
         self.sync_diag_options(cx);
     }
 
@@ -1847,6 +1909,14 @@ impl App {
             &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row)],
         )
         .set_visible(cx, visible);
+    }
+
+    /// The 我不知道 button inside the submit row (choice questions only).
+    fn diag_unknown_btn(&self, _cx: &Cx) -> WidgetRef {
+        self.popup_child(
+            live_id!(startup_popup),
+            &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row), live_id!(diag_unknown_btn)],
+        )
     }
 
     fn opt_id(i: usize, on: bool) -> LiveId {
@@ -1951,6 +2021,22 @@ impl App {
             );
             return;
         };
+        self.record_diag_answer(cx, q, ans);
+    }
+
+    /// The 我不知道 escape hatch: records the round as unknown (never 答对),
+    /// available only on choice questions with a loaded question.
+    fn submit_diag_unknown(&mut self, cx: &mut Cx) {
+        let Some(q) = self.diag_current.clone() else { return };
+        if !matches!(q.kind.as_str(), "single" | "multi") {
+            return;
+        }
+        self.record_diag_answer(cx, q, crate::gen::DIAG_UNKNOWN.to_string());
+    }
+
+    /// Record the (question, answer) round and advance: finish at the round
+    /// cap, otherwise request the next question.
+    fn record_diag_answer(&mut self, cx: &mut Cx, q: crate::gen::DiagQuestion, ans: String) {
         self.diag_history.push((q, ans));
         self.diag_current = None;
         if self.diag_history.len() >= MAX_DIAG_ROUNDS {
@@ -2049,6 +2135,7 @@ impl App {
         self.route_goal = goal.to_string();
         self.route_root = root_rel.clone();
         self.route_diag = diagnostics.to_string();
+        self.route_retried = false;
         self.set_card_title_indicator(cx, &root_rel, Some("规划中…"));
         // Visible progress: the root card title flips to 规划中… and the AI
         // panel opens with a status line (it also hosts the success/failure
@@ -2060,11 +2147,24 @@ impl App {
         );
         self.ensure_ai_panel_open(cx);
         let fallback = self.rag_bm25_context(goal);
-        let upgradeable = self
-            .rag
-            .as_ref()
-            .is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
-        if upgradeable {
+        let upgradeable = self.rag.as_ref().is_some_and(|r| {
+            r.models().is_some_and(|m| m.embedding_ready()) && r.has_chunks_for(&map_file)
+        });
+        // A prefetch fired at diagnostic start (goal matches) skips the
+        // retrieval wait entirely; a stale/goalless prefetch is dropped.
+        let prefetch = match self.route_prefetch.take() {
+            Some(p) if p.goal == goal => Some(p),
+            _ => None,
+        };
+        if let Some(p) = prefetch {
+            self.route_wait = Some(RouteWait {
+                goal: goal.to_string(),
+                diag: diagnostics.to_string(),
+                rx: p.rx,
+                fallback,
+                started: p.started,
+            });
+        } else if upgradeable {
             let rx = self.rag.as_ref().unwrap().retrieve(goal);
             self.route_wait = Some(RouteWait {
                 goal: goal.to_string(),
@@ -2106,17 +2206,54 @@ impl App {
         None
     }
 
-    /// Fire the route-plan request (non-streaming).
+    /// Fire the route-plan request (streaming; parsed when the stream ends).
     fn send_route_request(&mut self, cx: &mut Cx, goal: &str, diagnostics: &str, context: &str) {
         self.route_id = LiveId::unique();
+        self.route_buf.clear();
+        self.route_think.clear();
+        self.route_parser = ai::SseParser::new();
+        self.route_context = context.to_string();
         let (system, user) = crate::gen::route_plan_messages(goal, context, diagnostics);
-        ai::chat_completions(
+        ai::chat_stream_request_max(
             cx,
             self.route_id,
             &self.ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
             358400,
         );
+    }
+
+    /// Live progress for route planning: a transient chat_extra assistant
+    /// bubble updated per stream chunk, removed when the request ends. The
+    /// thinking phase streams reasoning_content only, so show thinking chars
+    /// until content starts (else the bubble sits at 0 字 for tens of seconds).
+    fn update_route_progress(&mut self, cx: &mut Cx) {
+        let text = if self.route_buf.is_empty() {
+            format!(
+                "正在规划学习路线…思考中（已生成 {} 字思考）",
+                self.route_think.chars().count()
+            )
+        } else {
+            format!(
+                "正在规划学习路线…生成中（已接收 {} 字）",
+                self.route_buf.chars().count()
+            )
+        };
+        if let Some((_, c)) = self
+            .chat_extra
+            .iter_mut()
+            .rev()
+            .find(|(_, c)| c.starts_with("正在规划学习路线"))
+        {
+            *c = text;
+        } else {
+            self.chat_extra.push(("assistant".to_string(), text));
+        }
+        self.render_msgs(cx);
+    }
+
+    fn clear_route_progress(&mut self) {
+        self.chat_extra.retain(|(_, c)| !c.starts_with("正在规划学习路线"));
     }
 
     /// Abort route planning and surface `msg` in the AI panel.
@@ -2131,22 +2268,24 @@ impl App {
     }
 
     /// Materialize a parsed route plan: write the card files, rebuild the map
-    /// tree under the root goal card, and reload the canvas.
-    fn handle_route_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
-        self.route_id = LiveId::empty();
-        if response.status_code != 200 {
-            let detail = response
-                .get_string_body()
-                .and_then(|b| ai::body_error_message(&b))
-                .unwrap_or_default();
-            self.abort_route(cx, format!("路线规划失败 ({}): {}", response.status_code, detail));
-            return;
-        }
-        let content = ai::response_content(response).unwrap_or_default();
+    /// tree under the root goal card, and reload the canvas. `think` is the
+    /// streamed reasoning chain, attached to the success message when present.
+    fn apply_route_plan(&mut self, cx: &mut Cx, content: String, think: String) {
         let mut plan = match crate::gen::parse_route_plan(&content) {
             Ok(p) => p,
             Err(e) => {
-                self.abort_route(cx, format!("路线解析失败：{e}"));
+                if !self.route_retried {
+                    // Same goal/context/diag, fresh draw: intermittent
+                    // malformed-JSON output usually parses on the retry.
+                    self.route_retried = true;
+                    let goal = self.route_goal.clone();
+                    let diag = self.route_diag.clone();
+                    let ctx = self.route_context.clone();
+                    self.send_route_request(cx, &goal, &diag, &ctx);
+                    return;
+                }
+                let preview: String = content.chars().take(200).collect();
+                self.abort_route(cx, format!("路线解析失败：{e}\n原始输出预览：{preview}"));
                 return;
             }
         };
@@ -2237,17 +2376,18 @@ impl App {
         if let Some(rag) = &self.rag {
             rag.set_map(&map_file);
         }
-        self.push_chat_msg(
-            cx,
-            "assistant",
-            &format!(
-                "学习路线已生成：{} 张卡片（概念卡 {} 张，知识卡 {} 张）。\n\
-                 每张卡片右键「生成」学习材料、「测试」验证掌握程度；根卡片记录了学习目标的输入输出。",
-                plan.cards.len(),
-                plan.cards.iter().filter(|c| c.card_type == "concept").count(),
-                plan.cards.iter().filter(|c| c.card_type == "knowledge").count(),
-            ),
+        let summary = format!(
+            "学习路线已生成：{} 张卡片（概念卡 {} 张，知识卡 {} 张）。\n\
+             每张卡片右键「生成」学习材料、「测试」验证掌握程度；根卡片记录了学习目标的输入输出。",
+            plan.cards.len(),
+            plan.cards.iter().filter(|c| c.card_type == "concept").count(),
+            plan.cards.iter().filter(|c| c.card_type == "knowledge").count(),
         );
+        if think.is_empty() {
+            self.push_chat_msg(cx, "assistant", &summary);
+        } else {
+            self.push_chat_msg_thinking(cx, &summary, &think);
+        }
         self.ensure_ai_panel_open(cx);
     }
 
@@ -3488,10 +3628,6 @@ impl MatchEvent for App {
             self.handle_subcard_response(cx, response);
             return;
         }
-        if request_id == self.route_id && self.route_id != LiveId::empty() {
-            self.handle_route_response(cx, response);
-            return;
-        }
         if request_id == self.diag_id && self.diag_id != LiveId::empty() {
             self.handle_diag_response(cx, response);
             return;
@@ -3532,6 +3668,9 @@ impl MatchEvent for App {
             return;
         }
         if request_id == self.route_id && self.route_id != LiveId::empty() {
+            self.route_buf.clear();
+            self.route_think.clear();
+            self.clear_route_progress();
             self.abort_route(cx, format!("路线规划请求失败：{}", err.message));
             return;
         }
@@ -3561,6 +3700,19 @@ impl MatchEvent for App {
     /// A chunk of the streaming reply; feed it to the SSE parser and refresh
     /// the "思考中…" bubble with the accumulated text.
     fn handle_http_stream(&mut self, cx: &mut Cx, request_id: LiveId, data: &HttpResponse) {
+        if request_id == self.route_id && self.route_id != LiveId::empty() {
+            if let Some(bytes) = data.body() {
+                let (content, thinking) = self.route_parser.feed(bytes);
+                for delta in content {
+                    self.route_buf.push_str(&delta);
+                }
+                for delta in thinking {
+                    self.route_think.push_str(&delta);
+                }
+                self.update_route_progress(cx);
+            }
+            return;
+        }
         if request_id != self.chat_id || !self.chat_pending {
             return;
         }
@@ -3577,6 +3729,27 @@ impl MatchEvent for App {
     }
 
     fn handle_http_stream_complete(&mut self, cx: &mut Cx, request_id: LiveId, data: &HttpResponse) {
+        if request_id == self.route_id && self.route_id != LiveId::empty() {
+            self.clear_route_progress();
+            self.route_id = LiveId::empty();
+            // macOS 的 makepad 流式后端把 status_code 硬编码为 0，成功流按
+            // "status 0 + [DONE]" 判定（同 chat 的处理）。
+            let ok = data.status_code == 200
+                || (data.status_code == 0 && self.route_parser.raw().contains("[DONE]"));
+            let buf = std::mem::take(&mut self.route_buf);
+            let think = std::mem::take(&mut self.route_think);
+            if ok {
+                self.apply_route_plan(cx, buf, think);
+            } else {
+                // Non-200 stream: the body was raw JSON (not SSE), recovered
+                // from the parser's raw buffer.
+                let raw = self.route_parser.raw();
+                let detail = ai::body_error_message(&raw)
+                    .unwrap_or_else(|| raw.chars().take(200).collect());
+                self.abort_route(cx, format!("路线规划失败 ({}): {}", data.status_code, detail));
+            }
+            return;
+        }
         if request_id != self.chat_id || !self.chat_pending {
             return;
         }

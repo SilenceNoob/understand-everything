@@ -140,11 +140,23 @@ pub fn chat_completions(
 /// `MatchEvent::handle_http_stream`, the final status via
 /// `handle_http_stream_complete` (both keyed by `request_id`).
 pub fn chat_stream_request(cx: &mut Cx, request_id: LiveId, config: &AIConfig, messages: &[(String, String)]) {
+    chat_stream_request_max(cx, request_id, config, messages, 4096);
+}
+
+/// Streaming variant with an explicit max_tokens cap (route planning
+/// outputs more than the chat default).
+pub fn chat_stream_request_max(
+    cx: &mut Cx,
+    request_id: LiveId,
+    config: &AIConfig,
+    messages: &[(String, String)],
+    max_tokens: usize,
+) {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": config.model,
         "messages": messages.iter().map(|(role, content)| serde_json::json!({"role": role, "content": content})).collect::<Vec<_>>(),
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "stream": true,
         (THINKING_PARAM.to_string()): config.thinking,
     })
@@ -248,6 +260,177 @@ pub fn response_debug_preview(response: &HttpResponse) -> String {
     };
     format!("finish_reason={finish}, 内容预览：{preview}")
 }
+/// Incremental decoder for `Transfer-Encoding: chunked` HTTP bodies.
+/// makepad's Linux streaming backend forwards raw socket bytes, chunk
+/// framing included (only the non-streaming path decodes chunked — see
+/// platform/network/src/backend/linux/http.rs). Auto-detects: the first
+/// complete line decides — a pure-hex chunk size (with optional `;ext`)
+/// means chunked mode; a bare `\n` or any non-hex first line means
+/// passthrough forever (plain SSE, or backends that already decoded).
+#[derive(Default)]
+struct ChunkDecoder {
+    /// None = undecided, Some(false) = passthrough, Some(true) = chunked.
+    mode: Option<bool>,
+    /// Partial chunk-size line held across feeds.
+    size_buf: Vec<u8>,
+    /// Payload bytes of the current chunk still to emit.
+    remaining: usize,
+    /// CRLF after a chunk payload still to swallow (0..=2).
+    crlf: u8,
+    /// 0-size chunk seen: swallow everything after it (trailers).
+    done: bool,
+    out: Vec<u8>,
+}
+
+/// Parse a chunk-size line (`<hex>` with optional `;ext`); None when invalid.
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    let hex = line.split(|&b| b == b';').next()?;
+    if hex.is_empty() || hex.len() > 16 {
+        return None;
+    }
+    let mut size = 0usize;
+    for &b in hex {
+        size = size.checked_mul(16)?;
+        size = size.checked_add(match b {
+            b'0'..=b'9' => (b - b'0') as usize,
+            b'a'..=b'f' => (b - b'a' + 10) as usize,
+            b'A'..=b'F' => (b - b'A' + 10) as usize,
+            _ => return None,
+        })?;
+    }
+    Some(size)
+}
+
+fn find_crlf(hay: &[u8], from: usize) -> Option<usize> {
+    hay[from..].windows(2).position(|w| w == b"\r\n").map(|p| p + from)
+}
+
+impl ChunkDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.out.clear();
+        if self.done {
+            return std::mem::take(&mut self.out);
+        }
+        if self.mode == Some(false) {
+            self.out.extend_from_slice(bytes);
+            return std::mem::take(&mut self.out);
+        }
+        if self.mode.is_none() {
+            // Hold bytes until the first complete line decides the framing.
+            self.size_buf.extend_from_slice(bytes);
+            // A bare \n (not \r\n) cannot be chunk framing: passthrough.
+            if let Some(pos) = self.size_buf.iter().position(|&b| b == b'\n') {
+                if pos == 0 || self.size_buf[pos - 1] != b'\r' {
+                    self.mode = Some(false);
+                    self.out = std::mem::take(&mut self.size_buf);
+                    return std::mem::take(&mut self.out);
+                }
+            }
+            match find_crlf(&self.size_buf, 0) {
+                Some(pos) => match parse_chunk_size(&self.size_buf[..pos]) {
+                    Some(size) => {
+                        self.mode = Some(true);
+                        self.remaining = size;
+                        let rest = self.size_buf[pos + 2..].to_vec();
+                        self.size_buf.clear();
+                        self.process_chunked(&rest);
+                    }
+                    None => {
+                        self.mode = Some(false);
+                        self.out = std::mem::take(&mut self.size_buf);
+                    }
+                },
+                None => {
+                    // A chunk-size line is at most ~16 hex chars; anything
+                    // longer without a CRLF cannot be chunked framing.
+                    if self.size_buf.len() > 64 {
+                        self.mode = Some(false);
+                        self.out = std::mem::take(&mut self.size_buf);
+                    }
+                }
+            }
+            return std::mem::take(&mut self.out);
+        }
+        self.process_chunked(bytes);
+        std::mem::take(&mut self.out)
+    }
+
+    /// Consume `bytes` as chunked framing, appending payload to `self.out`.
+    fn process_chunked(&mut self, bytes: &[u8]) {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if self.done {
+                return;
+            }
+            if self.crlf > 0 {
+                let n = (self.crlf as usize).min(bytes.len() - i);
+                self.crlf -= n as u8;
+                i += n;
+                continue;
+            }
+            if self.remaining > 0 {
+                let n = self.remaining.min(bytes.len() - i);
+                self.out.extend_from_slice(&bytes[i..i + n]);
+                self.remaining -= n;
+                i += n;
+                if self.remaining == 0 {
+                    self.crlf = 2;
+                }
+                continue;
+            }
+            if self.size_buf.is_empty() {
+                match find_crlf(bytes, i) {
+                    Some(pos) => match parse_chunk_size(&bytes[i..pos]) {
+                        Some(0) => {
+                            self.done = true;
+                            return;
+                        }
+                        Some(size) => {
+                            self.remaining = size;
+                            i = pos + 2;
+                        }
+                        None => {
+                            // Corrupt framing: stop decoding and pass the
+                            // rest through verbatim.
+                            self.mode = Some(false);
+                            self.out.extend_from_slice(&bytes[i..]);
+                            return;
+                        }
+                    },
+                    None => {
+                        self.size_buf.extend_from_slice(&bytes[i..]);
+                        return;
+                    }
+                }
+            } else {
+                self.size_buf.extend_from_slice(&bytes[i..]);
+                match find_crlf(&self.size_buf, 0) {
+                    Some(pos) => match parse_chunk_size(&self.size_buf[..pos]) {
+                        Some(0) => {
+                            self.done = true;
+                            return;
+                        }
+                        Some(size) => {
+                            self.remaining = size;
+                            let rest = self.size_buf[pos + 2..].to_vec();
+                            self.size_buf.clear();
+                            self.process_chunked(&rest);
+                            return;
+                        }
+                        None => {
+                            self.mode = Some(false);
+                            self.out.extend_from_slice(&self.size_buf);
+                            self.size_buf.clear();
+                            return;
+                        }
+                    },
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
 /// Feed raw bytes in arbitrary chunk sizes; every call returns the
 /// assistant text deltas extracted since the previous call, in order.
 /// Also accumulates the raw text so error bodies stay recoverable.
@@ -259,6 +442,8 @@ pub struct SseParser {
     line_buf: String,
     /// Every byte received, for error-body recovery on non-200.
     raw: Vec<u8>,
+    /// Deframes chunked transfer encoding (Linux streaming backend).
+    decoder: ChunkDecoder,
 }
 
 impl SseParser {
@@ -274,8 +459,9 @@ impl SseParser {
     /// Feed a chunk; returns (content deltas, thinking deltas) extracted
     /// since the previous call.
     pub fn feed(&mut self, bytes: &[u8]) -> (Vec<String>, Vec<String>) {
-        self.raw.extend_from_slice(bytes);
-        self.buf.extend_from_slice(bytes);
+        let bytes = self.decoder.feed(bytes);
+        self.raw.extend_from_slice(&bytes);
+        self.buf.extend_from_slice(&bytes);
         let mut content = Vec::new();
         let mut thinking = Vec::new();
         loop {
@@ -426,5 +612,85 @@ mod tests {
         assert_eq!(joined, "ab");
         // The raw buffer keeps the whole body for error extraction.
         assert!(p.raw().contains("\"boom\""));
+    }
+
+    #[test]
+    fn chunk_decoder_deframes_at_every_split() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n";
+        let mut framed = format!("{:x}\r\n{}\r\n", payload.len(), payload).into_bytes();
+        framed.extend_from_slice(b"0\r\n\r\n");
+        // One shot.
+        let mut d = ChunkDecoder::default();
+        assert_eq!(d.feed(&framed), payload.as_bytes());
+        // Split at every byte position across two feeds.
+        for split in 0..framed.len() {
+            let mut d = ChunkDecoder::default();
+            let mut out = Vec::new();
+            out.extend_from_slice(&d.feed(&framed[..split]));
+            out.extend_from_slice(&d.feed(&framed[split..]));
+            assert_eq!(out, payload.as_bytes(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn chunk_decoder_multiple_frames_and_trailers_swallowed() {
+        let a = b"hello".to_vec();
+        let b = b", world".to_vec();
+        let mut framed = format!("{:x}\r\n", a.len()).into_bytes();
+        framed.extend_from_slice(&a);
+        framed.extend_from_slice(b"\r\n");
+        framed.extend_from_slice(&format!("{:x}\r\n", b.len()).into_bytes());
+        framed.extend_from_slice(&b);
+        framed.extend_from_slice(b"\r\n0\r\n\r\ntrailer: x\r\n\r\n");
+        let mut d = ChunkDecoder::default();
+        let mut expect = a;
+        expect.extend_from_slice(&b);
+        assert_eq!(d.feed(&framed), expect);
+        assert!(d.feed(b"after-end").is_empty());
+    }
+
+    #[test]
+    fn chunk_decoder_passthrough_plain_stream() {
+        // First feed ends mid-line: undecided, bytes are held.
+        let sse = b"data: {\"x\":1}\n\ndata: [DONE]\n\n";
+        let mut d = ChunkDecoder::default();
+        let first = d.feed(&sse[..7]);
+        assert!(first.is_empty());
+        let mut all = first;
+        all.extend_from_slice(&d.feed(&sse[7..]));
+        assert_eq!(all, sse);
+        // A tiny plain stream (under any hold threshold) still passes through.
+        let mut d = ChunkDecoder::default();
+        assert_eq!(d.feed(b"data: x\n\n"), b"data: x\n\n");
+    }
+
+    #[test]
+    fn chunk_decoder_hex_extension_sizes() {
+        let payload = b"data: x";
+        let mut framed = format!("{:x};foo=1\r\n", payload.len()).into_bytes();
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut d = ChunkDecoder::default();
+        assert_eq!(d.feed(&framed), payload);
+    }
+
+    #[test]
+    fn sse_parser_deframes_chunked_stream() {
+        // The exact failure mode seen in the wild: DeepSeek's SSE arrives
+        // chunked, and the Linux backend forwards the framing bytes inline.
+        // A chunk boundary mid-`data:` line used to drop a delta entirely.
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"goal_input\\\":\\\"...\\\"\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"}\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        let framed = format!("{:x}\r\n{}\r\n0\r\n\r\n", sse.len(), sse);
+        let mut p = SseParser::new();
+        let mut joined = String::new();
+        for i in 0..framed.len() {
+            let (content, _) = p.feed(framed.as_bytes().get(i..=i).unwrap());
+            for delta in content {
+                joined.push_str(&delta);
+            }
+        }
+        assert_eq!(joined, "{\"goal_input\":\"...\"}");
     }
 }

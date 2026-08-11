@@ -65,8 +65,9 @@ struct Bundle {
 /// Both models. `embed`/`rerank` construct a fresh Model per forward (candle
 /// qwen3's KV cache cannot be reset between calls); the tensor map is
 /// refcounted so this is cheap. Bundles are loaded into RwLocks so the
-/// status is visible before loading completes, and the reranker stays out of
-/// RAM (~2.3GB) until the first rerank.
+/// status is visible before loading completes; the embedding loads in
+/// `ensure`, the reranker in `warm_reranker` (startup, ~2.3GB resident) with
+/// the lazy path in `rerank` kept as a fallback.
 pub struct Models {
     embedding: RwLock<Option<Bundle>>,
     reranker: RwLock<Option<Bundle>>,
@@ -90,8 +91,9 @@ impl Models {
 
     /// Blocking: download any missing files (HF_ENDPOINT-aware), load the
     /// embedding model. Progress lands in `status` for the UI; call on a
-    /// worker thread. The reranker loads lazily on first rerank. Failures
-    /// are per-model: status goes Failed but the other model still works.
+    /// worker thread. The reranker is loaded by `warm_reranker` right after
+    /// (see service.rs). Failures are per-model: status goes Failed but the
+    /// other model still works.
     pub fn ensure(&self, app_dir: &Path) {
         let mut failures = Vec::new();
         for &(name, repo) in MODEL_SPECS {
@@ -120,6 +122,16 @@ impl Models {
 
     pub fn embedding_ready(&self) -> bool {
         self.embedding.read().unwrap().is_some()
+    }
+
+    /// Load the reranker bundle without running a forward, moving the ~2.3GB
+    /// load off the first interactive rerank. No-op when already loaded.
+    pub fn warm_reranker(&self) {
+        let mut guard = self.reranker.write().unwrap();
+        if guard.is_none() {
+            let dir = app_base_dir().join("models").join("reranker");
+            *guard = load_bundle(&dir).ok();
+        }
     }
 
     /// Query/文档 embedding: instruction prefix for queries, last-token

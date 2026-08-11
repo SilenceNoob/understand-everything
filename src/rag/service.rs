@@ -69,6 +69,10 @@ impl RagService {
                 // Blocking download/load; status inside `models` is live, so
                 // the UI can show 下载模型…/加载模型… while this runs.
                 models.ensure(&base);
+                // Move the reranker's ~2.3GB load off the first interactive
+                // rerank (a route plan's 20s retrieval window would otherwise
+                // fall back to BM25 while it loads).
+                models.warm_reranker();
                 while let Ok(map_rel) = index_rx.recv() {
                     // A panic (e.g. candle OOM) must not kill the worker or
                     // leave `indexing` stuck true; the index swap only
@@ -176,6 +180,14 @@ impl RagService {
     pub fn bm25_search(&self, query: &str, top_k: usize) -> Vec<RetrievedChunk> {
         let (chunks, bm25) = read_state(&self.shared);
         retrieve(&chunks, &bm25, query, top_k)
+    }
+
+    /// True when the published index belongs to `map_rel` and has chunks;
+    /// hybrid retrieval over an empty index is guaranteed to return no hits,
+    /// so callers can skip the query-embed/rerank round trip entirely.
+    pub fn has_chunks_for(&self, map_rel: &str) -> bool {
+        let s = self.shared.read().unwrap();
+        s.map_rel == map_rel && !s.index.chunks.is_empty()
     }
 }
 

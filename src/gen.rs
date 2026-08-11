@@ -763,10 +763,16 @@ answer 可省略，给出 reference_answer。\n\
     (system, user)
 }
 
+/// The answer marker recorded when the user picks the 我不知道 escape hatch
+/// on a choice question; annotated as such instead of being judged 答对/答错.
+pub const DIAG_UNKNOWN: &str = "我不知道";
+
 /// Render the interview transcript: each round with the question, options,
 /// the user's answer and a 答对/答错 annotation (single/multi judged against
 /// the stored answer; open questions are left for the model to judge against
-/// `reference_answer`).
+/// `reference_answer`). A `DIAG_UNKNOWN` answer is annotated 不知道 (no
+/// letter extraction, never 答错), which both the interviewer and the route
+/// planner treat as 答不出/缺失.
 pub fn format_diag_history(history: &[(DiagQuestion, String)]) -> String {
     let mut out = String::new();
     for (i, (q, user_ans)) in history.iter().enumerate() {
@@ -782,6 +788,12 @@ pub fn format_diag_history(history: &[(DiagQuestion, String)]) -> String {
         }
         out.push_str(&format!("\n用户答案：{user_ans}"));
         match q.kind.as_str() {
+            "single" | "multi" if user_ans == DIAG_UNKNOWN => {
+                out.push_str(&format!(
+                    "（标准答案：{}，不知道）",
+                    q.answer.join(",")
+                ));
+            }
             "single" | "multi" => {
                 let ua: Vec<String> = user_ans
                     .chars()
@@ -907,8 +919,32 @@ fn strip_json_fence(text: &str) -> &str {
 /// to the root; cycles are broken the same way. Type strings are normalized
 /// to "concept"/"knowledge".
 pub fn parse_route_plan(text: &str) -> Result<RoutePlan, String> {
-    let mut plan: RoutePlan =
-        serde_json::from_str(strip_json_fence(text)).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let t = strip_json_fence(text);
+    // Try candidate spans from the last `{` backwards: prose/thinking before
+    // the JSON may itself contain braces, and the JSON's own braces are
+    // balanced, so first-`{`-to-last-`}` can start on the wrong brace.
+    let mut last_err = String::new();
+    let mut plan: Option<RoutePlan> = None;
+    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
+        let cand = &t[i..];
+        let cand = match cand.rfind('}') {
+            Some(e) => &cand[..=e],
+            None => cand,
+        };
+        match serde_json::from_str::<RoutePlan>(cand) {
+            Ok(p) => {
+                plan = Some(p);
+                break;
+            }
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
+    }
+    let Some(mut plan) = plan else {
+        if !last_err.is_empty() {
+            return Err(last_err);
+        }
+        return Err("JSON 解析失败: 未找到 JSON 对象".to_string());
+    };
     if plan.cards.is_empty() {
         return Err("路线为空（没有规划出任何卡片）".to_string());
     }
@@ -1360,6 +1396,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_route_plan_tolerates_prose_and_fences() {
+        let ok = r#"{"goal_input":"i","goal_output":"o","cards":[{"id":"c1","title":"T","type":"concept"}]}"#;
+        assert!(parse_route_plan(ok).is_ok());
+        // prose prefix/suffix
+        let prose = format!("好的，以下是规划：\n{ok}\n希望有帮助。");
+        assert!(parse_route_plan(&prose).is_ok());
+        // fenced
+        let fenced = format!("```json\n{ok}\n```");
+        assert!(parse_route_plan(&fenced).is_ok());
+        // prose containing braces before the JSON (thinking text with `{}`)
+        let bracy = format!("好的，我在思考{{拆解}}依据：\n{ok}\n——以上是思考。");
+        assert_eq!(parse_route_plan(&bracy).unwrap().cards[0].id, "c1");
+        // truncated mid-object must still fail with the parse error
+        assert!(parse_route_plan(r#"好的，{思考}"#).is_err());
+    }
+
+    #[test]
     fn card_type_detects_marker() {
         assert_eq!(card_type("#d 学习目标\nx"), CardType::Concept);
         assert_eq!(card_type("#c 知识类型 联结模型\nx"), CardType::Knowledge);
@@ -1424,6 +1477,23 @@ mod tests {
         assert!(s.contains("探测：苹果判别"), "{s}");
         assert!(s.contains("用户答案：A（标准答案：B，答错）"), "{s}");
         assert!(s.contains("参考解：因为石头不可食用"), "{s}");
+    }
+
+    #[test]
+    fn format_diag_history_marks_unknown() {
+        let q = DiagQuestion {
+            kind: "single".to_string(),
+            question: "石头是苹果吗？".to_string(),
+            options: vec!["A. 是".to_string(), "B. 不是".to_string()],
+            answer: vec!["B".to_string()],
+            target: "苹果判别".to_string(),
+            ..Default::default()
+        };
+        let h = vec![(q, DIAG_UNKNOWN.to_string())];
+        let s = format_diag_history(&h);
+        assert!(s.contains("（标准答案：B，不知道）"), "{s}");
+        assert!(!s.contains("答错"), "{s}");
+        assert!(!s.contains("答对"), "{s}");
     }
 
     #[test]
