@@ -3312,7 +3312,7 @@ impl App {
             self.grade_id,
             &self.ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            2048,
+            358400,
         );
     }
 
@@ -3325,7 +3325,7 @@ impl App {
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
-            quiz_panel.set_status_text(cx, &format!("评分失败：{} {}", response.status_code, detail));
+            quiz_panel.grade_failed(cx, &format!("评分失败：{} {}", response.status_code, detail));
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
@@ -3346,7 +3346,7 @@ impl App {
                     }
                 }
             }
-            Err(e) => quiz_panel.set_status_text(cx, &format!("评分解析失败：{}", e)),
+            Err(e) => quiz_panel.grade_failed(cx, &format!("评分解析失败：{}", e)),
         }
     }
 
@@ -3499,7 +3499,7 @@ impl MatchEvent for App {
         if request_id == self.grade_id && self.grade_id != LiveId::empty() {
             self.grade_id = LiveId::empty();
             self.open_quiz_popup(cx);
-            self.quiz_panel().set_status_text(cx, &format!("评分请求失败：{}", err.message));
+            self.quiz_panel().grade_failed(cx, &format!("评分请求失败：{}", err.message));
             return;
         }
         if request_id == self.chat_id && self.chat_pending {

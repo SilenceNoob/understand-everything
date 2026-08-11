@@ -28,8 +28,10 @@ script_mod! {
     use mod.widgets.*
 
     let OptionBtn = mod.widgets.ButtonFlat{
-        width: Fit
+        width: Fill
         height: Fit
+        flow: Flow.Right{wrap: true}
+        label_walk: Walk{width: Fill, height: Fit}
         padding: Inset{left: 8, right: 8, top: 4, bottom: 4}
         margin: Inset{right: 4}
         draw_bg +: {
@@ -59,7 +61,6 @@ script_mod! {
             color: #e6e9f0
         }
     }
-
     let QResult = mod.widgets.Label{
         width: Fill
         height: Fit
@@ -85,16 +86,28 @@ script_mod! {
         options := mod.widgets.View{
             width: Fill
             height: Fit
-            flow: Right
+            flow: Down
             spacing: 4
-            opt0_off := OptionBtn{ text: "A" }
-            opt0_on := OptionBtnOn{ visible: false, text: "A" }
-            opt1_off := OptionBtn{ text: "B" }
-            opt1_on := OptionBtnOn{ visible: false, text: "B" }
-            opt2_off := OptionBtn{ text: "C" }
-            opt2_on := OptionBtnOn{ visible: false, text: "C" }
-            opt3_off := OptionBtn{ text: "D" }
-            opt3_on := OptionBtnOn{ visible: false, text: "D" }
+            row_ab := mod.widgets.View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 4
+                opt0_off := OptionBtn{ text: "A" }
+                opt0_on := OptionBtnOn{ visible: false, text: "A" }
+                opt1_off := OptionBtn{ text: "B" }
+                opt1_on := OptionBtnOn{ visible: false, text: "B" }
+            }
+            row_cd := mod.widgets.View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 4
+                opt2_off := OptionBtn{ text: "C" }
+                opt2_on := OptionBtnOn{ visible: false, text: "C" }
+                opt3_off := OptionBtn{ text: "D" }
+                opt3_on := OptionBtnOn{ visible: false, text: "D" }
+            }
         }
         result := QResult{}
     }
@@ -115,16 +128,28 @@ script_mod! {
         options := mod.widgets.View{
             width: Fill
             height: Fit
-            flow: Right
+            flow: Down
             spacing: 4
-            opt0_off := OptionBtn{ text: "A" }
-            opt0_on := OptionBtnOn{ visible: false, text: "A" }
-            opt1_off := OptionBtn{ text: "B" }
-            opt1_on := OptionBtnOn{ visible: false, text: "B" }
-            opt2_off := OptionBtn{ text: "C" }
-            opt2_on := OptionBtnOn{ visible: false, text: "C" }
-            opt3_off := OptionBtn{ text: "D" }
-            opt3_on := OptionBtnOn{ visible: false, text: "D" }
+            row_ab := mod.widgets.View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 4
+                opt0_off := OptionBtn{ text: "A" }
+                opt0_on := OptionBtnOn{ visible: false, text: "A" }
+                opt1_off := OptionBtn{ text: "B" }
+                opt1_on := OptionBtnOn{ visible: false, text: "B" }
+            }
+            row_cd := mod.widgets.View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 4
+                opt2_off := OptionBtn{ text: "C" }
+                opt2_on := OptionBtnOn{ visible: false, text: "C" }
+                opt3_off := OptionBtn{ text: "D" }
+                opt3_on := OptionBtnOn{ visible: false, text: "D" }
+            }
         }
         result := QResult{}
     }
@@ -283,6 +308,10 @@ pub struct QuizPanel {
     graded: bool,
     #[rust]
     loading: bool,
+    /// True while the grade request is in flight (submit locked, status shows
+    /// "AI 正在打分…").
+    #[rust]
+    grading: bool,
     #[rust]
     error: Option<String>,
     #[rust]
@@ -434,8 +463,12 @@ impl Widget for QuizPanel {
             cx.widget_action(self.widget_uid(), QuizPanelAction::Close);
         }
         let submit_btn = panel.widget(cx, ids!(footer)).widget(cx, ids!(submit_btn));
-        if submit_btn.as_button().clicked(actions) && self.quiz.is_some() && !self.graded && !self.loading {
+        if submit_btn.as_button().clicked(actions) && self.quiz.is_some() && !self.graded && !self.loading && !self.grading {
             let submission = self.collect_submission(cx);
+            self.grading = true;
+            submit_btn.set_visible(cx, false);
+            self.set_status(cx, "AI 正在打分…");
+            self.redraw(cx);
             cx.widget_action(self.widget_uid(), QuizPanelAction::Submit(submission));
         }
         self.handle_option_clicks(cx, actions);
@@ -643,6 +676,7 @@ impl QuizPanelRef {
             w.quiz = None;
             w.graded = false;
             w.loading = true;
+            w.grading = false;
             w.error = None;
             w.last_score = None;
             w.card_title = title.to_string();
@@ -657,6 +691,7 @@ impl QuizPanelRef {
             w.quiz = None;
             w.graded = false;
             w.loading = false;
+            w.grading = false;
             w.error = Some(msg.to_string());
             w.show_empty(cx);
             w.set_status(cx, msg);
@@ -664,9 +699,13 @@ impl QuizPanelRef {
         }
     }
 
-    pub fn set_status_text(&self, cx: &mut Cx, msg: &str) {
-        if let Some(w) = self.borrow() {
+    /// A grade request failed: unlock submit so the user can retry.
+    pub fn grade_failed(&self, cx: &mut Cx, msg: &str) {
+        if let Some(mut w) = self.borrow_mut() {
+            w.grading = false;
+            w.submit_btn(cx).set_visible(cx, true);
             w.set_status(cx, msg);
+            w.redraw(cx);
         }
     }
 
@@ -675,6 +714,7 @@ impl QuizPanelRef {
             w.quiz = Some(quiz.clone());
             w.graded = false;
             w.loading = false;
+            w.grading = false;
             w.error = None;
             w.last_score = None;
             w.card_title = title.to_string();
@@ -725,6 +765,7 @@ impl QuizPanelRef {
         if let Some(mut w) = self.borrow_mut() {
             let Some(quiz) = w.quiz.clone() else { return };
             w.graded = true;
+            w.grading = false;
             w.set_status(cx, "评分完成");
 
             let mut single_correct = 0usize;
