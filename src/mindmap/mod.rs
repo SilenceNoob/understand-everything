@@ -245,6 +245,16 @@ script_mod! {
                     return sdf.result
                 }
             }
+            // Learning-order badge ("03"), set from the node's per-map order.
+            order_badge := mod.widgets.Label{
+                width: Fit
+                height: Fit
+                visible: false
+                text: ""
+                margin: Inset{right: 2}
+                draw_text.text_style: theme.font_bold{font_size: 11.0}
+                draw_text.color: #8a93a6
+            }
             title_box := mod.widgets.View{
                 width: Fill
                 height: Fit
@@ -305,6 +315,9 @@ script_mod! {
                 markdown := mod.widgets.MarkdownMedia{
                     width: Fill
                     height: Fit
+                    // Body text is selectable (划选生成子卡片); card dragging
+                    // therefore starts from the header only (handle_finger_down).
+                    selectable: true
                 }
             }
             edit_view := mod.widgets.View{
@@ -432,7 +445,40 @@ script_mod! {
             item0 := MenuItem{ label.text: "从 map 中移除" }
             item1 := MenuItem{ label.text: "生成 ▶" }
             item2 := MenuItem{ label.text: "测试" }
-            item3 := MenuItem{ label.text: "生成学习路线" }
+            item3 := MenuItem{ label.text: "设置序号" }
+            item4 := MenuItem{ label.text: "生成学习路线" }
+            item5 := MenuItem{ label.text: "生成子卡片" }
+        }
+        // In-canvas 序号 editor, opened by the context menu item; drawn at
+        // the card's top-left in world coords (group-rename style).
+        order_edit_pop := mod.widgets.RoundedView{
+            width: Fit
+            height: Fit
+            flow: Right
+            spacing: 6
+            padding: Inset{left: 10, right: 10, top: 6, bottom: 6}
+            show_bg: true
+            draw_bg +: {
+                color: #2b3140
+                border_radius: 4.0
+                border_size: 1.0
+                border_color: #ffffff3d
+            }
+            order_edit_label := mod.widgets.Label{
+                width: Fit
+                height: Fit
+                text: "序号"
+                draw_text.text_style.font_size: 12.0
+                draw_text.color: #aab0bc
+            }
+            order_edit_input := mod.widgets.TextInput{
+                width: 64
+                height: Fit
+                is_multiline: false
+                empty_text: "留空清除"
+                draw_text.text_style.font_size: 12.0
+                draw_text.color: #e6e9f0
+            }
         }
         sub_menu := mod.widgets.RoundedView{
             width: (180.0)
@@ -549,6 +595,10 @@ pub struct MindMap {
     /// or off-screen cards shift later indices.
     #[rust]
     cards: Vec<Option<WidgetRef>>,
+    /// Per-card mastery (已见/未见): rel card path -> latest quiz score,
+    /// loaded from progress.json at map load; refreshed by reload_progress.
+    #[rust]
+    progress: HashMap<String, f64>,
     #[rust]
     edges: Vec<DrawEdge>,
     #[rust]
@@ -710,8 +760,18 @@ pub struct MindMap {
     menu_card: Option<usize>,
     #[rust]
     menu_card_path: String,
-    /// Visible menu row count: 4 on the root goal card (生成学习路线),
-    /// 3 everywhere else. Drives geometry and the item3 visibility.
+    /// Selected body text of the menu card at open time ("" = none); drives
+    /// the 生成子卡片 row and the action payload.
+    #[rust]
+    menu_card_selection: String,
+    /// Whether the 生成学习路线 row is shown (root goal card without
+    /// children) / whether the 生成子卡片 row is shown (non-empty selection).
+    #[rust]
+    menu_plan_row: bool,
+    #[rust]
+    menu_subcard_row: bool,
+    /// Visible menu row count: 5 on the root goal card (生成学习路线),
+    /// 4 everywhere else. Drives geometry and the item4 visibility.
     #[rust]
     menu_items: usize,
     /// Title indicators (e.g. "规划中…") set before a card widget existed
@@ -740,7 +800,17 @@ pub struct MindMap {
     card_template: Option<ScriptObjectRef>,
     #[rust]
     group_template: Option<ScriptObjectRef>,
-
+    /// 序号 editor: the card index being edited, its lazily-created widget,
+    /// and the DSL template the widget is cloned from.
+    #[rust]
+    order_editing: Option<usize>,
+    #[rust]
+    order_edit_ref: Option<WidgetRef>,
+    #[rust]
+    order_edit_template: Option<ScriptObjectRef>,
+    /// Keyboard focus for the order input once its widget has been drawn.
+    #[rust]
+    order_focus_pending: bool,
 }
 
 impl WidgetNode for MindMap {
@@ -814,6 +884,8 @@ impl ScriptHook for MindMap {
                                 self.sub_menu_template = Some(template_ref);
                             } else if id == live_id!(drag_ghost) {
                                 self.drag_ghost_template = Some(template_ref);
+                            } else if id == live_id!(order_edit_pop) {
+                                self.order_edit_template = Some(template_ref);
                             }
                         }
                     }
@@ -899,9 +971,17 @@ impl Widget for MindMap {
                     };
                     if local_view.intersects(rect) {
                         if let Some(md) = &mut self.marquee_draw {
+                            md.draw_vars.set_uniform(cx2d, id!(color), &[0.49, 0.55, 0.83, 0.45]);
+                            md.draw_vars.set_uniform(cx2d, id!(fill_alpha), &[0.08]);
+                            md.draw_vars.set_uniform(cx2d, id!(width), &[4.0]);
                             md.draw_abs(cx2d, rect);
                         }
                     }
+                }
+
+                // 序号 editor on top of the cards.
+                if self.order_editing.is_some() {
+                    self.draw_order_edit(cx2d, scope);
                 }
 
                 cx2d.end_pass_sized_turtle();
@@ -952,6 +1032,22 @@ impl Widget for MindMap {
             self.handle_card_menu_events(cx, event, scope);
             return;
         }
+        // 序号 editor keyboard: Enter commits, Esc cancels.
+        if self.order_editing.is_some() {
+            if let Event::Actions(actions) = event {
+                if let Some(w) = &self.order_edit_ref {
+                    let input = w.text_input(cx, ids!(order_edit_input));
+                    if input.escaped(actions) {
+                        self.cancel_order_edit(cx);
+                        return;
+                    }
+                    if input.returned(actions).is_some() {
+                        self.commit_order_edit(cx);
+                        return;
+                    }
+                }
+            }
+        }
         self.handle_zoom_anim(cx, event);
         self.handle_grid_anim(cx, event);
         self.handle_page_burst(cx, event, scope);
@@ -970,6 +1066,9 @@ impl Widget for MindMap {
             }
             for g in self.group_refs.iter().flatten() {
                 g.handle_event(cx, card_event, scope);
+            }
+            if let Some(w) = &self.order_edit_ref {
+                w.handle_event(cx, card_event, scope);
             }
         }
 
@@ -1093,6 +1192,10 @@ impl MindMap {
         if self.editing_group.is_some() && !child_grabbed {
             self.commit_group_edit(cx);
         }
+        // Same for the 序号 editor.
+        if self.order_editing.is_some() && !child_grabbed {
+            self.commit_order_edit(cx);
+        }
         // Color picker popup: a press on a swatch applies the color; any
         // other press closes it. Either way the press is consumed.
         if let Some(gi) = self.color_popup {
@@ -1130,7 +1233,12 @@ impl MindMap {
                         self.selected_groups.clear();
                         self.reanchor_cards(cx);
                     }
-                    if !child_grabbed && self.editing_card.is_none() {
+                    // Card dragging starts from the header only: the body is
+                    // selectable text (划选生成子卡片), so a press there must
+                    // not compete with the TextFlow selection drag.
+                    let r = self.card_rect(i);
+                    let in_header = world.y >= r.pos.y && world.y <= r.pos.y + 44.0;
+                    if !child_grabbed && self.editing_card.is_none() && in_header {
                         // no card-internal widget (scrollbar, link) grabbed the press
                         self.drag_card = Some(i);
                         self.drag_last = world;
@@ -1379,6 +1487,7 @@ impl MindMap {
             self.data = None;
             self.cards.clear();
             self.edges.clear();
+            self.progress.clear();
             self.group_refs.clear();
             self.group_draws.clear();
             self.color_popup = None;
@@ -1388,6 +1497,9 @@ impl MindMap {
             self.marquee = None;
             self.editing_card = None;
             self.editing_group = None;
+            self.order_editing = None;
+            self.order_edit_ref = None;
+            self.order_focus_pending = false;
             self.menu_open = false;
             self.sub_open = false;
             self.menu_card = None;
@@ -1410,6 +1522,7 @@ impl MindMap {
         let saved_view = data.saved_view;
         self.data = Some(data);
         self.edges = edges;
+        self.progress = crate::mindmap::model::load_progress(&base);
         self.highlight = Some(cx.with_vm(|vm| DrawHighlight::script_new_with_default(vm)));
         self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         self.grid_draw = Some(cx.with_vm(|vm| DrawGrid::script_new_with_default(vm)));
@@ -1423,6 +1536,9 @@ impl MindMap {
         self.marquee = None;
         self.editing_card = None;
         self.editing_group = None;
+        self.order_editing = None;
+        self.order_edit_ref = None;
+        self.order_focus_pending = false;
         self.drag_card = None;
         self.drag_group = None;
         self.resize_card = None;
@@ -1478,18 +1594,18 @@ impl MindMap {
     fn draw_cards(&mut self, cx2d: &mut Cx2d, scope: &mut Scope, local_view: Rect) {
         let compact = self.zoom < COMPACT_ZOOM;
         let n = self.data.as_ref().map(|d| d.nodes.len()).unwrap_or(0);
-        // draw_groups may have left a group color in the shared highlight
-        // draw; cards use the default indigo.
-        if let Some(hl) = &mut self.highlight {
-            hl.draw_vars.set_uniform(cx2d, id!(color), &[0.49, 0.55, 0.83, 0.45]);
-        }
         for i in 0..n {
             let r = self.card_rect(i);
             if !local_view.intersects(r) {
                 continue;
             }
+            // 已见/未见 glow, drawn first so a selected card's indigo halo
+            // renders over it. Colors are set per draw below (the highlight
+            // draw is shared with groups and the mastery glow).
+            self.draw_mastery_glow(cx2d, i, r);
             if self.selected.contains(&i) {
                 if let Some(hl) = &mut self.highlight {
+                    hl.draw_vars.set_uniform(cx2d, id!(color), &[0.49, 0.55, 0.83, 0.45]);
                     hl.draw_abs(
                         cx2d,
                         Rect {
@@ -1519,6 +1635,36 @@ impl MindMap {
                     width: Size::Fixed(r.size.x),
                     height: Size::Fixed(r.size.y),
                     ..Walk::default()
+                },
+            );
+        }
+    }
+
+    /// 已见/未见 glow around the card edge, same feathered halo as the
+    /// selection highlight: grey = 未见 (never tested), red = tested below
+    /// PASS_SCORE (判别/联结未过), green = 已见 (score >= PASS_SCORE,
+    /// handleable by 经验预测). Directory nodes (no card file) get no glow.
+    fn draw_mastery_glow(&mut self, cx2d: &mut Cx2d, i: usize, r: Rect) {
+        let Some(data) = &self.data else { return };
+        let Some(node) = data.nodes.get(i) else { return };
+        // progress.json is keyed by rel path; Node.path is base-joined.
+        let base = crate::util::app_base_dir();
+        let Some(rel) = node.path.strip_prefix(&base).ok() else { return };
+        if !node.path.is_file() {
+            return;
+        }
+        let color: [f32; 4] = match self.progress.get(rel.to_str().unwrap_or("")) {
+            Some(s) if *s >= crate::mindmap::model::PASS_SCORE => [0.29, 0.85, 0.5, 0.5],
+            Some(_) => [0.97, 0.44, 0.44, 0.5],
+            None => [0.42, 0.45, 0.52, 0.32],
+        };
+        if let Some(hl) = &mut self.highlight {
+            hl.draw_vars.set_uniform(cx2d, id!(color), &color);
+            hl.draw_abs(
+                cx2d,
+                Rect {
+                    pos: r.pos - dvec2(4.0, 4.0),
+                    size: r.size + dvec2(8.0, 8.0),
                 },
             );
         }
@@ -1861,6 +2007,92 @@ impl MindMap {
         self.redraw(cx);
     }
 
+    /// Open the in-canvas 序号 editor for card `i` (context menu 设置序号).
+    fn start_order_edit(&mut self, cx: &mut Cx, i: usize) {
+        if self.order_editing.is_some() {
+            self.commit_order_edit(cx);
+        }
+        let Some(t) = &self.order_edit_template else { return };
+        let value = t.as_object().into();
+        let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        let order = self
+            .data
+            .as_ref()
+            .and_then(|d| d.nodes.get(i))
+            .and_then(|n| n.order);
+        w.text_input(cx, ids!(order_edit_input))
+            .set_text(cx, &order.map(|n| n.to_string()).unwrap_or_default());
+        self.order_edit_ref = Some(w);
+        self.order_editing = Some(i);
+        self.order_focus_pending = true;
+        self.redraw(cx);
+    }
+
+    /// Apply the open order edit (Enter or any canvas press): a number sets
+    /// the order, empty clears it, invalid text closes without changing.
+    fn commit_order_edit(&mut self, cx: &mut Cx) {
+        let Some(i) = self.order_editing.take() else { return };
+        let Some(w) = self.order_edit_ref.take() else { return };
+        self.order_focus_pending = false;
+        let text = w.text_input(cx, ids!(order_edit_input)).text();
+        let trimmed = text.trim();
+        let new_order = if trimmed.is_empty() {
+            None
+        } else if let Ok(n) = trimmed.parse::<u32>() {
+            Some(n)
+        } else {
+            self.redraw(cx);
+            return;
+        };
+        let changed = self
+            .data
+            .as_ref()
+            .is_some_and(|d| d.nodes[i].order != new_order);
+        if changed {
+            if let Some(data) = &mut self.data {
+                data.nodes[i].order = new_order;
+            }
+            self.save_map();
+            if let Some(Some(card)) = self.cards.get(i).cloned() {
+                let title = card_title(&self.data.as_ref().unwrap().nodes[i]);
+                set_card_texts(cx, &card, &title, new_order);
+            }
+        }
+        self.redraw(cx);
+    }
+
+    fn cancel_order_edit(&mut self, cx: &mut Cx) {
+        if self.order_editing.take().is_some() || self.order_edit_ref.take().is_some() {
+            self.order_focus_pending = false;
+            self.redraw(cx);
+        }
+    }
+
+    /// The 序号 editor popup, drawn at the card's top-left in world coords.
+    /// Focuses its TextInput once the widget has a valid area.
+    fn draw_order_edit(&mut self, cx2d: &mut Cx2d, scope: &mut Scope) {
+        let Some(i) = self.order_editing else { return };
+        let Some(w) = self.order_edit_ref.clone() else { return };
+        let r = self.card_rect(i);
+        let _ = w.draw_walk(
+            cx2d,
+            scope,
+            Walk {
+                abs_pos: Some(r.pos + dvec2(14.0, 5.0)),
+                width: Size::Fit { min: None, max: None },
+                height: Size::Fit { min: None, max: None },
+                ..Walk::default()
+            },
+        );
+        if self.order_focus_pending {
+            let input = w.text_input(cx2d, ids!(order_edit_input));
+            if input.area().is_valid(cx2d) {
+                cx2d.set_key_focus(input.area());
+                self.order_focus_pending = false;
+            }
+        }
+    }
+
     /// the last drawn (highest index) wins — same z-order as `resize_hit`.
 
     fn card_ref(&mut self, cx: &mut Cx, i: usize) -> WidgetRef {
@@ -1874,14 +2106,10 @@ impl MindMap {
         let w = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
         let node = self.data.as_ref().unwrap().nodes[i].clone();
         let name = card_title(&node);
-        w.label(cx, ids!(title)).set_text(cx, &name);
-        w.label(cx, ids!(compact_label)).set_text(cx, &name);
         // A pending title indicator (set before this widget was created)
         // overrides the file-stem title until explicitly cleared.
-        if let Some(ind) = self.pending_titles.get(&node.path).cloned() {
-            w.label(cx, ids!(title)).set_text(cx, &ind);
-            w.label(cx, ids!(compact_label)).set_text(cx, &ind);
-        }
+        let title = self.pending_titles.get(&node.path).cloned().unwrap_or(name);
+        set_card_texts(cx, &w, &title, node.order);
         w.markdown_media(cx, ids!(markdown)).set_text(cx, &node.body);
         if let Some(dir) = node.path.parent() {
             w.markdown_media(cx, ids!(markdown)).set_base_dir(dir.to_path_buf());
@@ -1937,8 +2165,7 @@ impl MindMap {
             }
             let name = card_title(node);
             let body = node.body.clone();
-            card.label(cx, ids!(title)).set_text(cx, &name);
-            card.label(cx, ids!(compact_label)).set_text(cx, &name);
+            set_card_texts(cx, &card, &name, node.order);
             card.markdown_media(cx, ids!(markdown)).set_text(cx, &body);
         }
         if renamed {
@@ -1980,9 +2207,9 @@ impl MindMap {
         let title = indicator
             .map(|s| s.to_string())
             .unwrap_or_else(|| card_title(&self.data.as_ref().unwrap().nodes[i]));
+        let order = self.data.as_ref().unwrap().nodes[i].order;
         if let Some(Some(card)) = self.cards.get(i).cloned() {
-            card.label(cx, ids!(title)).set_text(cx, &title);
-            card.label(cx, ids!(compact_label)).set_text(cx, &title);
+            set_card_texts(cx, &card, &title, order);
         }
     }
 
@@ -2001,6 +2228,41 @@ impl MindMap {
         self.selected = vec![i];
         self.selected_groups.clear();
         self.reanchor_cards(cx);
+        self.redraw(cx);
+    }
+
+    /// Add the card file at `child_rel` as a child of the card at
+    /// `parent_rel` (划选生成子卡片): tree edge + a position to the parent's
+    /// right, below any existing children. Saves and selects the new card.
+    pub fn add_child_card(&mut self, cx: &mut Cx, parent_rel: &str, child_rel: &str) {
+        let base = app_base_dir();
+        let Some(data) = &mut self.data else { return };
+        let Some(pi) = data.nodes.iter().position(|n| n.path == base.join(parent_rel)) else {
+            return;
+        };
+        let path = base.join(child_rel);
+        if data.nodes.iter().any(|n| n.path == path) {
+            return;
+        }
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let child_count = data.nodes[pi].children.len();
+        let parent = &data.nodes[pi];
+        let pos = parent.pos + dvec2(parent.size.x + 120.0, child_count as f64 * (CARD_H + 40.0));
+        let i = data.add_detached(path, body, pos);
+        data.nodes[i].parent = Some(pi);
+        data.nodes[pi].children.push(i);
+        // One new tree edge; card widget slots align lazily via card_ref.
+        self.edges.push(cx.with_vm(|vm| DrawEdge::script_new_with_default(vm)));
+        self.save_map();
+        self.selected = vec![i];
+        self.selected_groups.clear();
+        self.reanchor_cards(cx);
+        self.redraw(cx);
+    }
+
+    /// Reload 已见/未见 progress from progress.json and refresh the badges.
+    pub fn reload_progress(&mut self, cx: &mut Cx) {
+        self.progress = crate::mindmap::model::load_progress(&app_base_dir());
         self.redraw(cx);
     }
 
@@ -2046,13 +2308,22 @@ impl MindMap {
         let view = self.area.rect(cx);
         self.menu_card = Some(card);
         self.menu_card_path = path;
+        // Snapshot the body selection now: the menu press itself won't touch
+        // it (TextFlow only clears on primary press / focus loss), but the
+        // snapshot keeps the 生成子卡片 row and its payload consistent.
+        self.menu_card_selection = self
+            .cards
+            .get(card)
+            .and_then(|c| c.clone())
+            .map(|c| c.markdown_media(cx, ids!(markdown)).selected_text(cx))
+            .unwrap_or_default();
         // 生成学习路线 only for the root goal card, and only while it has no
         // children yet (v1 plans once; a planned map gets no re-plan entry).
-        self.menu_items = if data.root == Some(card) && data.nodes[card].children.is_empty() {
-            4
-        } else {
-            3
-        };
+        // 生成子卡片 only while the card body has a selection. Both rows sit
+        // at the end of the menu; item4 = plan row, item5 = subcard row.
+        self.menu_plan_row = data.root == Some(card) && data.nodes[card].children.is_empty();
+        self.menu_subcard_row = !self.menu_card_selection.trim().is_empty();
+        self.menu_items = 4 + usize::from(self.menu_plan_row) + usize::from(self.menu_subcard_row);
         self.menu_rect = menu_rect(view, abs, self.menu_items);
         self.menu_hover = menu_item_index(self.menu_rect, self.menu_items, abs);
         self.sub_open = false;
@@ -2070,6 +2341,7 @@ impl MindMap {
         self.sub_hover = None;
         self.menu_card = None;
         self.menu_card_path.clear();
+        self.menu_card_selection.clear();
         self.sec_press = None;
         self.redraw(cx);
     }
@@ -2090,6 +2362,9 @@ impl MindMap {
         self.selected_groups.clear();
         self.rect_targets.clear();
         self.editing_card = None;
+        self.order_editing = None;
+        self.order_edit_ref = None;
+        self.order_focus_pending = false;
         self.drag_card = None;
         self.drag_group = None;
         self.resize_card = None;
@@ -2202,9 +2477,10 @@ impl MindMap {
             return;
         }
         if let Some(w) = self.ctx_menu_widget(cx) {
-            // The 生成学习路线 row exists in the template but is only shown
-            // on the root goal card (menu_items == 4).
-            w.view(cx, ids!(item3)).set_visible(cx, self.menu_items == 4);
+            // Conditional rows at the end of the menu: 生成学习路线 on the
+            // root goal card, 生成子卡片 while the body has a selection.
+            w.view(cx, ids!(item4)).set_visible(cx, self.menu_plan_row);
+            w.view(cx, ids!(item5)).set_visible(cx, self.menu_subcard_row);
             let _ = w.draw_walk(
                 cx,
                 scope,
@@ -2301,14 +2577,43 @@ impl MindMap {
                 return;
             }
             if idx == 3 {
-                if !self.menu_card_path.is_empty() {
-                    cx.widget_action(
-                        self.widget_uid(),
-                        MindMapAction::PlanRoute(self.menu_card_path.clone()),
-                    );
+                // 设置序号: open the in-canvas order editor for the card.
+                if let Some(i) = self.menu_card {
+                    self.close_menu(cx);
+                    self.start_order_edit(cx, i);
                 }
-                self.close_menu(cx);
                 return;
+            }
+            // Rows 4+: 生成学习路线 (plan row) then 生成子卡片 (subcard row),
+            // each only present when its flag is set.
+            if idx >= 4 {
+                let mut row = 4usize;
+                if self.menu_plan_row {
+                    if idx == row {
+                        if !self.menu_card_path.is_empty() {
+                            cx.widget_action(
+                                self.widget_uid(),
+                                MindMapAction::PlanRoute(self.menu_card_path.clone()),
+                            );
+                        }
+                        self.close_menu(cx);
+                        return;
+                    }
+                    row += 1;
+                }
+                if self.menu_subcard_row && idx == row {
+                    if !self.menu_card_path.is_empty() {
+                        cx.widget_action(
+                            self.widget_uid(),
+                            MindMapAction::GenSubCard(
+                                self.menu_card_path.clone(),
+                                self.menu_card_selection.clone(),
+                            ),
+                        );
+                    }
+                    self.close_menu(cx);
+                    return;
+                }
             }
         }
         if self.sub_open {
@@ -2348,6 +2653,8 @@ pub enum MindMapAction {
     Quiz(String),
     /// Root goal card: plan the learning route under it.
     PlanRoute(String),
+    /// 划选生成子卡片: (parent card rel path, selected body text).
+    GenSubCard(String, String),
     /// Canvas right-click at the given screen position: open the card picker.
     CanvasMenu(DVec2),
 }
@@ -2388,6 +2695,24 @@ impl MindMapRef {
             }
         }
         None
+    }
+
+    /// Poll the action list for a "生成子卡片" menu click; returns (parent
+    /// card rel path, selected body text).
+    pub fn subcard_clicked(&self, actions: &Actions) -> Option<(String, String)> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::GenSubCard(p, s) = item.cast() {
+                return Some((p, s));
+            }
+        }
+        None
+    }
+
+    /// Add `child_rel` as a child of the card at `parent_rel` on the canvas.
+    pub fn add_child_card(&self, cx: &mut Cx, parent_rel: &str, child_rel: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.add_child_card(cx, parent_rel, child_rel);
+        }
     }
 
     /// Update the in-memory card body and any live widget for the card at `full_path`.
@@ -2452,6 +2777,13 @@ impl MindMapRef {
         }
     }
 
+    /// Refresh the 已见/未见 badges after a quiz was graded.
+    pub fn reload_progress(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.reload_progress(cx);
+        }
+    }
+
     /// Switch the map this widget shows and edits; `map_file` is relative to
     /// the app base dir (e.g. "maps/foo.json"). The previous map is already
     /// saved on every interaction, so it is not flushed here.
@@ -2464,6 +2796,26 @@ impl MindMapRef {
             inner.load_map(cx);
             inner.redraw(cx);
         }
+    }
+}
+
+/// Set a card's header title, compact title and order badge from its display
+/// title and learning-order number. The compact label carries the number as a
+/// "03·" prefix; the badge is hidden when there's no order.
+fn set_card_texts(cx: &mut Cx, card: &WidgetRef, title: &str, order: Option<u32>) {
+    card.label(cx, ids!(title)).set_text(cx, title);
+    let compact = match order {
+        Some(n) => format!("{n:02}·{title}"),
+        None => title.to_string(),
+    };
+    card.label(cx, ids!(compact_label)).set_text(cx, &compact);
+    let badge = card.label(cx, ids!(order_badge));
+    match order {
+        Some(n) => {
+            badge.set_text(cx, &format!("{n:02}"));
+            badge.set_visible(cx, true);
+        }
+        None => badge.set_visible(cx, false),
     }
 }
 

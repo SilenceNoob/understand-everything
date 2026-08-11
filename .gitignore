@@ -2,6 +2,7 @@
 .codegraph/
 .opencode/node_modules/
 /settings.json
+/progress.json
 /refs/
 /models/
 /.rag_cache/

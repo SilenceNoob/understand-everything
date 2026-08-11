@@ -1139,6 +1139,12 @@ pub struct App {
     gen_context: String,
     #[rust]
     gen_title: String,
+    /// In-flight 划选生成子卡片 request.
+    #[rust]
+    subcard_id: LiveId,
+    /// Rel path of the parent card the subcard is generated under.
+    #[rust]
+    subcard_parent: String,
     /// In-flight quiz generation request.
     #[rust]
     quiz_id: LiveId,
@@ -1979,7 +1985,7 @@ impl App {
         let root_rel = if existing.len() == 1 {
             existing[0].clone()
         } else {
-            let Some(rel) = self.create_route_card_file(&map_file, "00", goal) else {
+            let Some(rel) = self.create_route_card_file(&map_file, goal) else {
                 return;
             };
             // The goal itself is the target knowledge (联结模型): it gets
@@ -2028,7 +2034,7 @@ impl App {
 
     /// Create a route card file `cards/<map stem>/<prefix>-<title>.md`,
     /// unique-ified with a numeric suffix when the name is taken.
-    fn create_route_card_file(&self, map_file: &str, prefix: &str, title: &str) -> Option<String> {
+    fn create_route_card_file(&self, map_file: &str, title: &str) -> Option<String> {
         let stem = map_file
             .strip_prefix("maps/")
             .unwrap_or(map_file)
@@ -2040,9 +2046,9 @@ impl App {
         let base = crate::util::app_base_dir();
         for n in 0.. {
             let fname = if n == 0 {
-                format!("{prefix}-{safe}.md")
+                format!("{safe}.md")
             } else {
-                format!("{prefix}-{safe}-{n}.md")
+                format!("{safe}-{n}.md")
             };
             let p = base.join("cards").join(stem).join(&fname);
             if !p.exists() {
@@ -2112,8 +2118,13 @@ impl App {
         // existing library card when its title matches — never overwrite a
         // non-empty body (other maps may reference the file).
         let existing_cards = crate::file_panel::all_card_files(&base);
-        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut cards: Vec<(String, String, String, Option<String>)> = Vec::new();
+        // The root card file is part of the library scan above; pre-marking it
+        // as used keeps a planned card whose title equals the goal from
+        // reusing the root's file (which would spawn an identical duplicate
+        // node connected to the root).
+        let mut used: std::collections::HashSet<String> =
+            [self.route_root.clone()].into_iter().collect();
+        let mut cards: Vec<(String, String, String, Option<String>, Option<u32>)> = Vec::new();
         for (n, &ci) in crate::gen::learning_order(&plan.cards).iter().enumerate() {
             let rc = &plan.cards[ci];
             let rel = match crate::gen::match_card_path(&existing_cards, &rc.title)
@@ -2129,9 +2140,7 @@ impl App {
                     p
                 }
                 None => {
-                    let Some(rel) =
-                        self.create_route_card_file(&map_file, &format!("{:02}", n + 1), &rc.title)
-                    else {
+                    let Some(rel) = self.create_route_card_file(&map_file, &rc.title) else {
                         self.abort_route(cx, format!("创建卡片失败：{}", rc.title));
                         return;
                     };
@@ -2142,7 +2151,15 @@ impl App {
                     rel
                 }
             };
-            cards.push((rc.id.clone(), rc.title.clone(), rel, rc.parent.clone()));
+            // Learning-order number (leaves first); the root goal card stays
+            // unnumbered.
+            cards.push((
+                rc.id.clone(),
+                rc.title.clone(),
+                rel,
+                rc.parent.clone(),
+                Some(n as u32 + 1),
+            ));
         }
         // Goal analysis lands on the root card.
         let root_path = base.join(&self.route_root);
@@ -2153,8 +2170,11 @@ impl App {
         if !plan.goal_output.is_empty() {
             body = crate::gen::upsert_section(&body, "#c 输出空间", &plan.goal_output);
         }
-        if !self.route_diag.is_empty() {
-            body = crate::gen::upsert_section(&body, "#c 用户情况", &self.route_diag);
+        // 用户情况 = the planner's assessment of the user's knowledge state;
+        // the raw interview transcript (questions + answers) is prompt input
+        // only and must not land on the card.
+        if !plan.user_assessment.is_empty() {
+            body = crate::gen::upsert_section(&body, "#c 用户情况", &plan.user_assessment);
         }
         std::fs::write(&root_path, body).ok();
         std::fs::write(
@@ -2348,7 +2368,7 @@ impl App {
     fn handle_card_delete_confirm(&mut self, cx: &mut Cx, actions: &Actions) {
         let popup = live_id!(confirm_popup);
         let child = |path: &[LiveId]| self.popup_child(popup, path);
-        if child(&[live_id!(content), live_id!(panel), live_id!(cancel_btn)])
+        if child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(cancel_btn)])
             .as_button()
             .clicked(actions)
         {
@@ -2356,7 +2376,7 @@ impl App {
             self.popup_widget(popup).as_popup_panel().hide(cx);
             return;
         }
-        if child(&[live_id!(content), live_id!(panel), live_id!(delete_btn)])
+        if child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(delete_btn)])
             .as_button()
             .clicked(actions)
         {
@@ -2838,6 +2858,9 @@ impl App {
         if let Some((path, section)) = mind_map.generate_clicked(actions) {
             self.start_generation(cx, &path, section);
         }
+        if let Some((parent, selected)) = mind_map.subcard_clicked(actions) {
+            self.start_subcard_gen(cx, &parent, &selected);
+        }
         if let Some(path) = mind_map.quiz_clicked(actions) {
             self.start_quiz(cx, &path);
         }
@@ -3073,6 +3096,143 @@ impl App {
         }
     }
 
+    /// 划选生成子卡片, phase 1: the model judges type/title/input/output
+    /// (a small JSON that cannot be truncated). The body is filled in phase 2
+    /// by the existing per-section generation pipeline.
+    fn start_subcard_gen(&mut self, cx: &mut Cx, parent: &str, selected: &str) {
+        if self.subcard_id != LiveId::empty() {
+            return;
+        }
+        let base = crate::util::app_base_dir();
+        let parent_body = std::fs::read_to_string(base.join(parent)).unwrap_or_default();
+        let parent_title = std::path::Path::new(parent)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ctx = self.rag_bm25_context(selected);
+        let (system, user) =
+            crate::gen::subcard_judge_messages(&parent_title, &parent_body, selected, &ctx);
+        self.subcard_parent = parent.to_string();
+        self.push_chat_msg(cx, "assistant", "正在为划选内容判断类型并生成子卡片…");
+        self.ensure_ai_panel_open(cx);
+        self.subcard_id = LiveId::unique();
+        ai::chat_completions(
+            cx,
+            self.subcard_id,
+            &self.ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            358400,
+        );
+    }
+
+    fn handle_subcard_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        self.subcard_id = LiveId::empty();
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            self.push_chat_msg(cx, "assistant", &format!("生成子卡片失败 ({}): {}", response.status_code, detail));
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        let judge = match crate::gen::parse_subcard_judge(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                let preview = ai::response_debug_preview(response);
+                self.push_chat_msg(
+                    cx,
+                    "assistant",
+                    &format!("生成子卡片失败：{e}（{preview}）"),
+                );
+                return;
+            }
+        };
+        let base = crate::util::app_base_dir();
+        let parent_rel = self.subcard_parent.clone();
+        let parent_path = base.join(&parent_rel);
+        let dir = parent_path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cards".to_string());
+        let safe = crate::file_panel::normalize_name(&judge.title, Some(".md"))
+            .unwrap_or_else(|| "未命名.md".to_string());
+        let safe = safe.strip_suffix(".md").unwrap_or(&safe).to_string();
+        // Seed body: the 知识类型/输入输出/输入输出空间 blocks are assembled
+        // here so every subcard carries them; the rest is generated later.
+        let seed = match judge.ctype {
+            crate::gen::CardType::Knowledge => {
+                let mut s = format!(
+                    "#c 知识类型 联结模型\n\n#c 输入输出\n输入：{}\n输出：{}\n",
+                    judge.input.trim(),
+                    judge.output.trim()
+                );
+                if !judge.input_space.trim().is_empty() {
+                    s.push_str(&format!(
+                        "\n#c 输入空间\n{}\n",
+                        judge.input_space.trim()
+                    ));
+                }
+                if !judge.output_space.trim().is_empty() {
+                    s.push_str(&format!(
+                        "\n#c 输出空间\n{}\n",
+                        judge.output_space.trim()
+                    ));
+                }
+                s
+            }
+            crate::gen::CardType::Concept => {
+                let mut s = "#c 知识类型 概念\n".to_string();
+                if !judge.input.trim().is_empty() || !judge.output.trim().is_empty() {
+                    s.push_str(&format!(
+                        "\n#c 输入输出\n输入：{}\n输出：{}\n",
+                        judge.input.trim(),
+                        judge.output.trim()
+                    ));
+                }
+                s
+            }
+        };
+        let mut rel = None;
+        for n in 0.. {
+            let fname = if n == 0 {
+                format!("{safe}.md")
+            } else {
+                format!("{safe}-{n}.md")
+            };
+            let p = base.join(&dir).join(&fname);
+            if !p.exists() {
+                std::fs::create_dir_all(p.parent().unwrap_or(&base)).ok();
+                if std::fs::write(&p, seed.clone()).is_ok() {
+                    rel = Some(format!("{dir}/{fname}"));
+                }
+                break;
+            }
+        }
+        match rel {
+            Some(rel) => {
+                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                mind_map.add_child_card(cx, &parent_rel, &rel);
+                let kind = match judge.ctype {
+                    crate::gen::CardType::Concept => "概念",
+                    crate::gen::CardType::Knowledge => "知识",
+                };
+                self.push_chat_msg(
+                    cx,
+                    "assistant",
+                    &format!(
+                        "已生成{kind}子卡片「{}」，已挂到父卡片下，开始逐板块生成学习材料…",
+                        judge.title
+                    ),
+                );
+                // Phase 2: the per-section pipeline fills the card body
+                // (each section in its own request — immune to truncation).
+                self.start_generation(cx, &rel, crate::gen::GenSection::All);
+            }
+            None => self.push_chat_msg(cx, "assistant", "生成子卡片失败：无法创建卡片文件。"),
+        }
+    }
+
     fn start_quiz(&mut self, cx: &mut Cx, path: &str) {
         let full_path = crate::util::app_base_dir().join(path);
         let body = std::fs::read_to_string(&full_path).unwrap_or_default();
@@ -3170,7 +3330,22 @@ impl App {
         }
         let content = ai::response_content(response).unwrap_or_default();
         match parse_grades(&content) {
-            Ok(g) => quiz_panel.set_grades(cx, &g),
+            Ok(g) => {
+                quiz_panel.set_grades(cx, &g);
+                // Persist the mastery score (已见/未见) and refresh the canvas
+                // badge. The card is keyed by rel path so progress follows it
+                // across maps.
+                if let Some(score) = quiz_panel.last_score() {
+                    if let Some(path) = self.quiz_path.as_deref() {
+                        let base = crate::util::app_base_dir();
+                        let mut progress = crate::mindmap::model::load_progress(&base);
+                        progress.insert(path.to_string(), score);
+                        crate::mindmap::model::save_progress(&base, &progress);
+                        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                        mind_map.reload_progress(cx);
+                    }
+                }
+            }
             Err(e) => quiz_panel.set_status_text(cx, &format!("评分解析失败：{}", e)),
         }
     }
@@ -3259,6 +3434,10 @@ impl MatchEvent for App {
             self.handle_gen_response(cx, response);
             return;
         }
+        if request_id == self.subcard_id && self.subcard_id != LiveId::empty() {
+            self.handle_subcard_response(cx, response);
+            return;
+        }
         if request_id == self.route_id && self.route_id != LiveId::empty() {
             self.handle_route_response(cx, response);
             return;
@@ -3295,6 +3474,11 @@ impl MatchEvent for App {
         if request_id == self.gen_id && self.gen_id != LiveId::empty() {
             self.gen_id = LiveId::empty();
             self.abort_generation(cx, format!("生成请求失败：{}", err.message));
+            return;
+        }
+        if request_id == self.subcard_id && self.subcard_id != LiveId::empty() {
+            self.subcard_id = LiveId::empty();
+            self.push_chat_msg(cx, "assistant", &format!("生成子卡片失败：{}", err.message));
             return;
         }
         if request_id == self.route_id && self.route_id != LiveId::empty() {

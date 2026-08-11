@@ -56,6 +56,10 @@ struct MapNodeFile {
     w: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     h: Option<f64>,
+    /// Learning-order number shown as the card's badge; per-map, not a
+    /// property of the card file. None = no badge (e.g. the root goal card).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -69,6 +73,8 @@ pub struct Node {
     pub pos: DVec2,
     pub size: DVec2,
     pub subtree_h: f64,
+    /// Learning-order number for the card badge (per-map, None = no badge).
+    pub order: Option<u32>,
 }
 
 /// A card group: a titled frame wrapping member cards and/or nested groups.
@@ -149,6 +155,7 @@ impl MindMapData {
                 pos: n.pos,
                 size: n.size,
                 subtree_h: n.subtree_h,
+                order: n.order,
             });
         }
         self.nodes = nodes;
@@ -193,6 +200,7 @@ impl MindMapData {
             pos,
             size: dvec2(CARD_W, CARD_H),
             subtree_h: 0.0,
+            order: None,
         });
         self.recompute_bounds();
         i
@@ -240,6 +248,7 @@ impl MindMapData {
                 pos: DVec2::default(),
                 size: dvec2(CARD_W, CARD_H),
                 subtree_h: 0.0,
+                order: n.order,
             })
             .collect();
         let id_of = |nodes: &[Node], id: &str| nodes.iter().position(|n| n.id == id);
@@ -760,15 +769,38 @@ pub fn new_map_json() -> String {
     serde_json::json!({"nodes":[]}).to_string()
 }
 
+/// Per-card quiz mastery: rel card path -> latest quiz score (0..=1). A card
+/// absent from this map is 未见 (never tested); 已见 = score >= PASS_SCORE.
+/// Stored at the repo root as progress.json (gitignored).
+pub type Progress = std::collections::HashMap<String, f64>;
+
+/// The quiz score at/above which a card counts as 已见 (handleable by
+/// 经验预测 / direct recall). Below it the 判别/联结 model needs work.
+pub const PASS_SCORE: f64 = 0.8;
+
+pub fn load_progress(base: &Path) -> Progress {
+    std::fs::read_to_string(base.join("progress.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_progress(base: &Path, progress: &Progress) {
+    if let Ok(json) = serde_json::to_string_pretty(progress) {
+        let _ = std::fs::write(base.join("progress.json"), json);
+    }
+}
+
+
 /// Build map JSON for a generated learning route: a root node (id "root",
 /// required for non-empty maps to load) plus the planned cards attached by
-/// parent id. `cards` is (id, title, rel_path, parent_id) in DFS order;
+/// parent id. `cards` is (id, title, rel_path, parent_id, order) in DFS order;
 /// unknown/missing parents fall back to the root. Positions are omitted so
 /// the auto-layout arranges the tree.
 pub fn route_map_json(
     root_title: &str,
     root_path: &str,
-    cards: &[(String, String, String, Option<String>)],
+    cards: &[(String, String, String, Option<String>, Option<u32>)],
 ) -> String {
     let mut nodes = vec![MapNodeFile {
         id: "root".to_string(),
@@ -779,6 +811,7 @@ pub fn route_map_json(
         y: None,
         w: None,
         h: None,
+        order: None,
     }];
     let mut index = std::collections::HashMap::new();
     index.insert("root", 0usize);
@@ -793,6 +826,7 @@ pub fn route_map_json(
             y: None,
             w: None,
             h: None,
+            order: c.4,
         });
     }
     let mut child_ids: Vec<Vec<String>> = vec![Vec::new(); nodes.len()];
@@ -918,6 +952,7 @@ pub(crate) fn write_map(base: &Path, data: &MindMapData, pan: DVec2, zoom: f64, 
             y: Some(n.pos.y),
             w: Some(n.size.x),
             h: Some(n.size.y),
+            order: n.order,
         })
         .collect();
     let groups = data
@@ -1076,9 +1111,9 @@ mod tests {
             "学会浮力",
             "cards/route/00-goal.md",
             &[
-                ("c1".into(), "浮力".into(), "cards/route/01-a.md".into(), None),
-                ("c2".into(), "密度".into(), "cards/route/02-b.md".into(), Some("c1".into())),
-                ("c3".into(), "浮沉条件".into(), "cards/route/03-c.md".into(), Some("missing".into())),
+                ("c1".into(), "浮力".into(), "cards/route/01-a.md".into(), None, Some(1)),
+                ("c2".into(), "密度".into(), "cards/route/02-b.md".into(), Some("c1".into()), Some(2)),
+                ("c3".into(), "浮沉条件".into(), "cards/route/03-c.md".into(), Some("missing".into()), Some(3)),
             ],
         );
         std::fs::write(dir.join("maps/x.json"), json).unwrap();
@@ -1086,6 +1121,7 @@ mod tests {
         let root = data.root.expect("has root");
         assert_eq!(data.nodes[root].id, "root");
         assert_eq!(data.nodes[root].title, "学会浮力");
+        assert_eq!(data.nodes[root].order, None);
         // c1 and c3 (missing parent) hang off the root; c2 under c1.
         let c1 = data.nodes.iter().position(|n| n.id == "c1").unwrap();
         let c2 = data.nodes.iter().position(|n| n.id == "c2").unwrap();
@@ -1093,6 +1129,8 @@ mod tests {
         assert_eq!(data.nodes[root].children, vec![c1, c3]);
         assert_eq!(data.nodes[c1].children, vec![c2]);
         assert_eq!(data.nodes[c2].children, Vec::<usize>::new());
+        assert_eq!(data.nodes[c1].order, Some(1));
+        assert_eq!(data.nodes[c3].order, Some(3));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1476,6 +1514,24 @@ mod tests {
     }
 
     #[test]
+    fn progress_roundtrips_via_json() {
+        let dir = std::env::temp_dir().join(format!("ue-progress-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Progress::new();
+        p.insert("cards/a.md".to_string(), 0.86);
+        p.insert("cards/b.md".to_string(), 0.4);
+        save_progress(&dir, &p);
+        let loaded = load_progress(&dir);
+        assert_eq!(loaded.get("cards/a.md"), Some(&0.86));
+        assert_eq!(loaded.get("cards/b.md"), Some(&0.4));
+        assert!(loaded.get("cards/c.md").is_none());
+        // missing file -> empty map, never an error
+        std::fs::remove_file(dir.join("progress.json")).unwrap();
+        assert!(load_progress(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn group_color_persists_and_parses() {
         // parse_hex_color: valid + invalid
         let c = parse_hex_color("#7d8bd4").unwrap();
@@ -1508,3 +1564,4 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+

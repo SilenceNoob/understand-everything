@@ -1037,6 +1037,14 @@ impl MarkdownMediaRef {
         }
     }
 
+    /// The text currently selected in the body ("" when none or not
+    /// selectable). Used by 划选生成子卡片.
+    pub fn selected_text(&self, _cx: &Cx) -> String {
+        self.borrow()
+            .map(|w| w.text_flow.selected_text())
+            .unwrap_or_default()
+    }
+
 }
 
 #[derive(Script, ScriptHook, Widget)]

@@ -293,6 +293,18 @@ pub struct QuizPanel {
     single_selected: [Option<usize>; 3],
     #[rust]
     multi_selected: [Vec<bool>; 2],
+    /// Mastery score (0..=1) of the last graded quiz; None until graded.
+    /// Objective questions (3 single + 2 multi) weigh 0.7, the open answer 0.3.
+    #[rust]
+    last_score: Option<f64>,
+}
+
+/// Mastery score from the graded parts of a quiz: all-correct = 1.0.
+/// Objective questions (3 single + 2 multi) weigh 0.7, the open answer 0.3.
+fn compute_score(single_correct: usize, multi_correct: usize, open_score: Option<i32>) -> f64 {
+    let objective = (single_correct + multi_correct) as f64 / 5.0;
+    let open = open_score.map(|s| (s.clamp(0, 10) as f64) / 10.0).unwrap_or(0.0);
+    0.7 * objective + 0.3 * open
 }
 
 impl WidgetNode for QuizPanel {
@@ -632,6 +644,7 @@ impl QuizPanelRef {
             w.graded = false;
             w.loading = true;
             w.error = None;
+            w.last_score = None;
             w.card_title = title.to_string();
             w.show_empty(cx);
             w.set_status(cx, &format!("{title}: 出题中…"));
@@ -663,6 +676,7 @@ impl QuizPanelRef {
             w.graded = false;
             w.loading = false;
             w.error = None;
+            w.last_score = None;
             w.card_title = title.to_string();
             w.card_body = body.to_string();
             w.single_selected = [None, None, None];
@@ -713,11 +727,13 @@ impl QuizPanelRef {
             w.graded = true;
             w.set_status(cx, "评分完成");
 
+            let mut single_correct = 0usize;
             for qi in 0..3 {
                 let slot = w.single_slot(cx, qi);
                 if let Some(q) = quiz.single.get(qi) {
                     let result = slot.widget(cx, ids!(result));
                     let correct = w.single_selected[qi] == Some(letter_to_index(&q.answer));
+                    single_correct += usize::from(correct);
                     let text = if correct {
                         "✓ 正确".to_string()
                     } else {
@@ -729,6 +745,7 @@ impl QuizPanelRef {
                     result.set_visible(cx, true);
                 }
             }
+            let mut multi_correct = 0usize;
             for qi in 0..2 {
                 let slot = w.multi_slot(cx, qi);
                 if let Some(q) = quiz.multi.get(qi) {
@@ -736,6 +753,7 @@ impl QuizPanelRef {
                     let selected: std::collections::HashSet<usize> = w.multi_selected[qi].iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
                     let correct: std::collections::HashSet<usize> = q.answers.iter().filter_map(|a| letter_to_index_opt(a)).collect();
                     let correct = selected == correct && !selected.is_empty();
+                    multi_correct += usize::from(correct);
                     let text = if correct {
                         "✓ 正确".to_string()
                     } else {
@@ -748,6 +766,8 @@ impl QuizPanelRef {
                     result.set_visible(cx, true);
                 }
             }
+            let open_score = quiz.open.first().zip(grades.first()).map(|(_, g)| g.score.clamp(0, 10));
+            w.last_score = Some(compute_score(single_correct, multi_correct, open_score));
             let open_slot = w.open_slot(cx);
             if let (Some(q), Some(g)) = (quiz.open.first(), grades.first()) {
                 let result = open_slot.widget(cx, ids!(result));
@@ -782,6 +802,11 @@ impl QuizPanelRef {
         }
         None
     }
+
+    /// Mastery score (0..=1) of the last graded quiz, if any.
+    pub fn last_score(&self) -> Option<f64> {
+        self.borrow().and_then(|w| w.last_score)
+    }
 }
 
 fn letter_to_index(s: &str) -> usize {
@@ -806,5 +831,18 @@ mod tests {
         assert_eq!(letter_to_index("c"), 2);
         assert_eq!(letter_to_index_opt("Z"), Some(25));
         assert!(letter_to_index_opt("").is_none());
+    }
+
+    #[test]
+    fn compute_score_weights_objective_over_open() {
+        assert_eq!(compute_score(3, 2, Some(10)), 1.0);
+        assert_eq!(compute_score(0, 0, None), 0.0);
+        assert_eq!(compute_score(3, 2, Some(0)), 0.7);
+        assert_eq!(compute_score(0, 0, Some(10)), 0.3);
+        // halfway objective + halfway open
+        let mid = compute_score(2, 1, Some(5));
+        assert!((mid - 0.57).abs() < 1e-6);
+        // open score clamps at 10
+        assert_eq!(compute_score(0, 0, Some(99)), 0.3);
     }
 }

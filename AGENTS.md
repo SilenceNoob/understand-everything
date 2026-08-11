@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## 设计理念
+
+- 核心设计理念是「渐构学习观」（判别模型/联结模型、下上结构、明确输入输出）——**`docs/设计理念.md` 是本仓库的功能设计与决策依据**，任何功能改动前先读它，并回答其中第 3 节的准则问题。
+
 ## Commands
 
 - Run app: `cargo run` (windowed Makepad app)

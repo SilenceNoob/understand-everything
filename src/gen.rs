@@ -120,6 +120,131 @@ pub fn card_type(body: &str) -> CardType {
     CardType::Concept
 }
 
+/// Messages for the first phase of 划选生成子卡片: the model only judges
+/// whether the selected text is a concept (判别模型) or knowledge (联结模型),
+/// names it, and gives its input/output spaces. The body is generated later
+/// by the per-section pipeline (start_generation), so this response stays
+/// small and cannot be truncated. `context` is the BM25/hybrid excerpt block
+/// (may be empty); `parent_body` is the source card's body.
+pub fn subcard_judge_messages(
+    parent_title: &str,
+    parent_body: &str,
+    selected: &str,
+    context: &str,
+) -> (String, String) {
+    let system = "你是一位学习卡片写作助手。用户在一张学习卡片里划选了一段内容，认为其中包含\
+        他还不理解的概念或知识。请你判断它的类型、给它命名、并概括其输入输出，\
+        卡片正文稍后由另一个助手按标准板块格式生成，你不需要写正文。\n\
+         \n\
+         【类型判断】\n\
+         - 概念（判别模型）：描述「一类事物的判定依据/共有属性」，用于把对象归类（如：所有权、\
+         生命周期、熵）。判别特征：可以用「什么现象属于/不属于它」来检验。\n\
+         - 知识（联结模型）：描述「两类现象之间的映射/规律」，由输入推测输出（如：所有权转移后\
+         原变量失效、热肉须加开水）。判别特征：存在明确的「输入→输出」关系。\n\
+         无法判断时默认按概念处理。\n\
+         \n\
+         【输出格式】\n\
+         必须只输出 JSON 对象，不要 markdown 代码块、不要任何解释或前后缀文字：\n\
+         {\n\
+           \"title\": \"自然名称（不要带序号前缀，不要含 / 、\\\\ 等路径字符）\",\n\
+           \"type\": \"concept\" 或 \"knowledge\"，\n\
+           \"input\": \"输入空间的现象，一句话概括\",\n\
+           \"output\": \"输出空间的结果，一句话概括\",\n\
+           \"input_space\": \"输入空间的详细描述，仅联结模型填写，概念卡留空字符串\",\n\
+           \"output_space\": \"输出空间的详细描述，仅联结模型填写，概念卡留空字符串\"\n\
+         }\n\
+         概念卡（判别模型）的 input/output 按标准形式填写：输入=论域内所有现象（可结合划选内容具体化论域），\
+         输出=此概念/非此概念。联结模型卡：input/output 用一句话概括，input_space 写清哪些现象属于输入空间\
+         （适用对象，含判别特征），output_space 写清输出空间涵盖什么结果。"
+        .to_string();
+    let system = if context.is_empty() {
+        system
+    } else {
+        format!("{context}\n\n{system}")
+    };
+    let user = format!(
+        "【父卡片标题】{parent_title}\n【父卡片正文】\n{parent_body}\n\n\
+         【用户划选的内容】\n{selected}\n\n请判断类型并输出 JSON。"
+    );
+    (system, user)
+}
+
+/// The judged identity of a selected text: title, archetype, and (for
+/// knowledge cards) the input/output space summaries.
+pub struct SubcardJudge {
+    pub title: String,
+    pub ctype: CardType,
+    pub input: String,
+    pub output: String,
+    pub input_space: String,
+    pub output_space: String,
+}
+
+#[derive(Deserialize)]
+struct JudgeResp {
+    title: String,
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    input_space: String,
+    #[serde(default)]
+    output_space: String,
+}
+
+/// Parse the judge response. Tolerates prose around the object: extracts the
+/// first `{` .. last `}` span before parsing.
+pub fn parse_subcard_judge(text: &str) -> Result<SubcardJudge, String> {
+    let t = strip_json_fence(text);
+    // Try candidate spans from the last `{` backwards: prose/thinking before
+    // the JSON may itself contain braces, and the JSON's own braces are
+    // balanced, so first-`{`-to-last-`}` can start on the wrong brace.
+    let mut last_err = String::new();
+    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
+        let cand = &t[i..];
+        let cand = match cand.rfind('}') {
+            Some(e) => &cand[..=e],
+            None => cand,
+        };
+        match serde_json::from_str::<JudgeResp>(cand) {
+            Ok(v) => {
+                last_err.clear();
+                return parse_judge(v);
+            }
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(last_err);
+    }
+    Err("JSON 解析失败: 未找到 JSON 对象".to_string())
+}
+
+fn parse_judge(v: JudgeResp) -> Result<SubcardJudge, String> {
+    let title = v.title.trim().to_string();
+    if title.is_empty() {
+        return Err("标题为空".to_string());
+    }
+    let ctype = if v.r#type.contains("联结") || v.r#type == "knowledge" {
+        CardType::Knowledge
+    } else {
+        CardType::Concept
+    };
+    Ok(SubcardJudge {
+        title,
+        ctype,
+        input: v.input,
+        output: v.output,
+        input_space: v.input_space,
+        output_space: v.output_space,
+    })
+}
+
+
+
 /// Build the (system, user) messages for generating a section of a card.
 /// `context` is the BM25/hybrid excerpt block from `rag::service::format_context`.
 /// Concept cards explain a 判别模型 (intension + 正负例); knowledge cards
@@ -167,7 +292,7 @@ fn generation_system_prompt() -> String {
      【输出格式】\n\
      按以下板块输出（「总结标题」「例子名」「短标题」由你自拟）：\n\
      #d {总结标题}\n\
-     抽象描述：标签行中的总结标题概括本节内容（如「#d 两个层面」），不要照搬卡片文件名。内容开头写「概念可以通过以下特征来定义：」，随后用 * 逐条罗列判别特征（特征名：说明）。这些特征是判断任意对象是否属于此概念的判别依据，全部满足才归为此概念；不要写成散文式定义。\n\
+     标签行中的总结标题概括本节内容（如「#d 两个层面」），不要照搬卡片文件名。内容直接以「概念可以通过以下特征来定义：」开头，随后用 * 逐条罗列判别特征（特征名：说明）。这些特征是判断任意对象是否属于此概念的判别依据，全部满足才归为此概念；不要写成散文式定义，不要输出「抽象描述：」等栏目前缀。\n\
      \n\
      #t {总结标题}\n\
      通俗描述：用大白话和生活化比喻解释这个概念，让外行也能看懂。标签行同样是概括本节内容的总结标题。\n\
@@ -210,9 +335,17 @@ fn knowledge_generation_system_prompt() -> String {
      【输出格式】\n\
      按以下板块输出（「总结标题」「例子名」「短标题」由你自拟）：\n\
      #d {总结标题}\n\
-     抽象描述：内容开头写「输入空间：」，用 * 逐条罗列可判别的输入常量范围（哪些现象适用此知识）；\
-     再写「输出空间：」，用 * 罗列推测出的输出常量范围；最后写「映射关系：」，描述输入到输出的通用规律。\
-     这些是判断「哪些现象能用此知识处理、会得到什么结果」的依据，不要写成散文式讲解。\n\
+     标签行中的总结标题概括本节内容，不要照搬卡片文件名。内容结构：第一行写一句结论式总述（这个知识的映射关系结论），独立成行；\
+     随后每个要点独占一行，行首用「==要点名==」高亮标记（要点名按内容自拟，如 ==输入空间==、==映射规律==、==边界情况==），\
+     要点名后接该要点的内容。要点要覆盖：输入如何映射到输出的通用规律、何时成立、边界情况如何，\
+     让学习者能用它推测未见输入的结果。不要罗列输入/输出空间的完整清单（清单已在「#c 输入输出」板块声明），\
+     不要写成散文式长段，不要输出「抽象描述：」等栏目前缀。\n\
+     格式示例：\n\
+     #d 炖煮水温决定热肉质地：热肉须加开水\n\
+     热肉加开水炖煮时，肉质保持松软；若加冷水，热肉表层骤然遇冷收缩，肉质变硬。\n\
+     ==输入空间== 关键特征是「肉块已受热（煸炒后）正要加水炖煮」这一状态。\n\
+     ==映射规律== 肉越热、水温越低，收缩越剧烈，肉质越硬；水温与肉温接近或更高（开水）时，肉质不收缩、保持软嫩。\n\
+     ==边界情况== 若肉尚未受热（如生肉焯水），则用冷水下锅慢慢升温，不属于此知识适用对象；加水量须没过肉块。\n\
      \n\
      #t {总结标题}\n\
      通俗描述：用大白话和生活化比喻解释这个知识是做什么的、什么时候用，让外行也能看懂。\n\
@@ -352,7 +485,7 @@ pub fn parse_generation_output(text: &str) -> Vec<(String, String)> {
             let rest = &trimmed[tag.len() + 1..];
             if !rest.is_empty() {
                 if let Some((h, lines)) = current.take() {
-                    out.push((h, trim_blank_lines(&lines.join("\n"))));
+                    out.push((h.clone(), strip_label_echo(&h, trim_blank_lines(&lines.join("\n")))));
                 }
                 current = Some((line.trim_start().to_string(), Vec::new()));
                 continue;
@@ -363,9 +496,23 @@ pub fn parse_generation_output(text: &str) -> Vec<(String, String)> {
         }
     }
     if let Some((h, lines)) = current.take() {
-        out.push((h, trim_blank_lines(&lines.join("\n"))));
+        out.push((h.clone(), strip_label_echo(&h, trim_blank_lines(&lines.join("\n")))));
     }
     out
+}
+
+/// Models sometimes echo the format label from the prompt as the section's
+/// first content line ("抽象描述：", "通俗描述："). Strip it so cards don't
+/// carry a stray label line before the real content.
+fn strip_label_echo(header: &str, content: String) -> String {
+    let label = if header.starts_with("#d") {
+        "抽象描述："
+    } else if header.starts_with("#t") {
+        "通俗描述："
+    } else {
+        return content;
+    };
+    content.trim_start().strip_prefix(label).unwrap_or(&content).trim_start().to_string()
 }
 
 fn trim_blank_lines(s: &str) -> String {
@@ -454,6 +601,11 @@ pub struct RoutePlan {
     pub goal_input: String,
     #[serde(default)]
     pub goal_output: String,
+    /// The planner's assessment of the user's grasp of the goal's knowledge
+    /// points (已掌握/薄弱/缺失), written to the root card's 用户情况 section.
+    /// Never the interview questions themselves. Empty when no diagnosis.
+    #[serde(default)]
+    pub user_assessment: String,
     pub cards: Vec<RouteCard>,
 }
 
@@ -498,18 +650,19 @@ pub fn route_plan_messages(goal: &str, context: &str, diagnostics: &str) -> (Str
          \n\
          【输出】\n\
          必须只输出 JSON，不要 markdown 代码块、不要解释：\n\
-         {{\n\
-           \"goal_input\": \"学习目标的输入空间：…\",\n\
-           \"goal_output\": \"学习目标的输出空间：…\",\n\
-           \"cards\": [\n\
-             {{\"id\": \"c1\", \"parent\": null, \"title\": \"输入概念 A\", \"type\": \"concept\", \
+        {\n\
+          \"goal_input\": \"学习目标的输入空间：…\",\n\
+          \"goal_output\": \"学习目标的输出空间：…\",\n\
+          \"user_assessment\": \"根据诊断记录评估用户对本目标相关知识点的掌握情况（哪些已掌握、哪些薄弱、哪些完全缺失），2~4 句话，只写评估，不要引用题目原文；没有诊断记录时输出空字符串\",\n\
+          \"cards\": [\n\
+             {\"id\": \"c1\", \"parent\": null, \"title\": \"输入概念 A\", \"type\": \"concept\", \
          \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}},\n\
-             {{\"id\": \"c2\", \"parent\": null, \"title\": \"输出概念 B\", \"type\": \"concept\", \
+             {\"id\": \"c2\", \"parent\": null, \"title\": \"输出概念 B\", \"type\": \"concept\", \
          \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}},\n\
-             {{\"id\": \"c3\", \"parent\": \"c1\", \"title\": \"A 的更基础前置\", \"type\": \"concept\", \
+             {\"id\": \"c3\", \"parent\": \"c1\", \"title\": \"A 的更基础前置\", \"type\": \"concept\", \
          \"input\": \"…\", \"output\": \"…\", \"reason\": \"…\"}}\n\
            ]\n\
-         }}\n\
+        }\n\
          要求：id 唯一且不能是 \"root\"；parent 必须是已出现的卡片 id 或 null（null = 根卡片之子）；\
          type 只能是 \"concept\" 或 \"knowledge\"；卡片标题是概念/知识的自然名称，不要带序号前缀，\
          也不要包含 / 、\\ 等路径字符；输入输出要具体到能指导后续生成学习材料。"
@@ -1094,6 +1247,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_strips_label_echo_from_d_and_t() {
+        let text = "#d 抽象描述\n抽象描述：\n输入空间：\n* A\n#t 通俗描述\n通俗描述：用大白话\n#e 例子(正例)\n输入：不应被剥\n";
+        let out = parse_generation_output(text);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "#d 抽象描述");
+        assert_eq!(out[0].1, "输入空间：\n* A");
+        assert_eq!(out[1].0, "#t 通俗描述");
+        assert_eq!(out[1].1, "用大白话");
+        // inline echo on the same line is stripped too; #e content is untouched
+        assert_eq!(out[2].1, "输入：不应被剥");
+        // no echo -> content unchanged
+        let clean = parse_generation_output("#d 标题\n概念可以通过以下特征来定义：\nx");
+        assert_eq!(clean[0].1, "概念可以通过以下特征来定义：\nx");
+    }
+
+    #[test]
     fn quiz_ready_detects_missing() {
         let body = "#d 概念名\nx\n#e 面积(正例)\ny\n#c influence_to 前兆\nz";
         assert!(quiz_ready(body).is_err());
@@ -1233,9 +1402,77 @@ mod tests {
     fn route_plan_messages_includes_diagnostics() {
         let (system, user) = route_plan_messages("目标", "", "Q1…答对");
         assert!(system.contains("因材施教"));
+        assert!(system.contains("user_assessment"), "{system}");
         assert!(user.contains("【用户情况】"), "{user}");
         let (_, user2) = route_plan_messages("目标", "", "");
         assert!(!user2.contains("用户情况"));
+    }
+
+    #[test]
+    fn parse_route_plan_assessment_defaults_empty() {
+        let plan = parse_route_plan(r#"{"goal_input":"i","goal_output":"o","cards":[{"id":"c1","title":"T","type":"concept"}]}"#).unwrap();
+        assert_eq!(plan.user_assessment, "");
+        assert_eq!(plan.goal_input, "i");
+    }
+
+    #[test]
+    fn knowledge_prompt_d_specs_highlighted_point_lines() {
+        let (system, _) = generation_messages(GenSection::Desc, "炖煮水温", "", CardType::Knowledge);
+        assert!(system.contains("==映射规律=="), "{system}");
+        assert!(system.contains("==输入空间=="), "{system}");
+        assert!(system.contains("==边界情况=="), "{system}");
+        assert!(system.contains("抽象描述："), "the banned label echo is spelled out to avoid it");
+    }
+
+    #[test]
+    fn parse_subcard_judge_tolerates_prose_and_fences() {
+        let ok = r##"{"title":"所有权转移","type":"concept","input":"","output":""}"##;
+        let j = parse_subcard_judge(ok).unwrap();
+        assert_eq!(j.title, "所有权转移");
+        assert_eq!(j.ctype, CardType::Concept);
+        // prose prefix/suffix around the object
+        let prose = format!("好的，以下是判断结果：\n{ok}\n希望有帮助。");
+        let j = parse_subcard_judge(&prose).unwrap();
+        assert_eq!(j.title, "所有权转移");
+        // fenced
+        let fenced = format!("```json\n{ok}\n```");
+        assert!(parse_subcard_judge(&fenced).is_ok());
+        // knowledge type names: "knowledge" or Chinese "联结模型"
+        let kn = r##"{"title":"热肉须加开水","type":"knowledge","input":"热肉正要加水炖煮","output":"肉质保持软嫩"}"##;
+        let j = parse_subcard_judge(kn).unwrap();
+        assert_eq!(j.ctype, CardType::Knowledge);
+        assert_eq!(j.input, "热肉正要加水炖煮");
+        assert_eq!(j.output, "肉质保持软嫩");
+        assert_eq!(j.input_space, "");
+        assert_eq!(j.output_space, "");
+        let kn2 = r##"{"title":"热肉须加开水","type":"联结模型"}"##;
+        assert_eq!(parse_subcard_judge(kn2).unwrap().ctype, CardType::Knowledge);
+        // knowledge with space descriptions
+        let kn3 = r##"{"title":"热肉须加开水","type":"knowledge","input":"热肉正要加水炖煮","output":"肉质保持软嫩","input_space":"肉块已受热正要加水炖煮的状态","output_space":"肉质是否软嫩"}"##;
+        let j = parse_subcard_judge(kn3).unwrap();
+        assert_eq!(j.input_space, "肉块已受热正要加水炖煮的状态");
+        assert_eq!(j.output_space, "肉质是否软嫩");
+        // errors
+        assert!(parse_subcard_judge(r#"{"title":"","type":"concept"}"#).is_err());
+        assert!(parse_subcard_judge("not json").is_err());
+        // prose containing braces before the JSON (thinking text with `{}`)
+        let bracy = format!("好的，我在思考{{判定}}依据：\n{ok}\n——以上是思考。");
+        assert_eq!(parse_subcard_judge(&bracy).unwrap().title, "所有权转移");
+        // truncated mid-object must still fail with the parse error
+        assert!(parse_subcard_judge(r#"好的，{思考}"#).is_err());
+    }
+
+    #[test]
+    fn subcard_judge_messages_injects_context_and_selection() {
+        let (system, user) = subcard_judge_messages("父卡", "父正文", "划选文字", "参考资料");
+        assert!(system.contains("参考资料"), "{system}");
+        assert!(system.contains("type"), "{system}");
+        assert!(system.contains("input_space"), "{system}");
+        assert!(system.contains("output_space"), "{system}");
+        assert!(user.contains("父正文"), "{user}");
+        assert!(user.contains("划选文字"), "{user}");
+        let (system2, _) = subcard_judge_messages("父卡", "", "x", "");
+        assert!(!system2.contains("参考资料"), "{system2}");
     }
 
     #[test]
