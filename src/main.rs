@@ -700,7 +700,7 @@ script_mod! {
                                                 text_style_bold_italic: theme.font_bold_italic{
                                                     font_size: 13.0
                                                 }
-                                                text_style_fixed: theme.font_code{
+                                                text_style_fixed: mod.widgets.app_code_font{
                                                     font_size: 13.0
                                                 }
                                             }
@@ -811,7 +811,7 @@ script_mod! {
                                                         text_style_bold_italic: theme.font_bold_italic{
                                                             font_size: 12.0
                                                         }
-                                                        text_style_fixed: theme.font_code{
+                                                        text_style_fixed: mod.widgets.app_code_font{
                                                             font_size: 12.0
                                                         }
                                                     }
@@ -839,7 +839,7 @@ script_mod! {
                                                 text_style_bold_italic: theme.font_bold_italic{
                                                     font_size: 13.0
                                                 }
-                                                text_style_fixed: theme.font_code{
+                                                text_style_fixed: mod.widgets.app_code_font{
                                                     font_size: 13.0
                                                 }
                                             }

@@ -11,6 +11,18 @@ script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
 
+    // Code font with CJK + emoji coverage: the theme's font_code only ships a
+    // latin member (LiberationMono), so Chinese inside code blocks/inline code
+    // rendered as .notdef boxes. Bundled fonts live in this crate's resources/.
+    mod.widgets.app_code_font = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            chinese := FontMember{res: crate_resource("self:resources/LXGWWenKaiRegular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("self:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        line_spacing: 1.35
+    }
+
     mod.widgets.MarkdownMediaLinkBase = #(MarkdownMediaLink::register_widget(vm))
 
     mod.widgets.MarkdownMediaBase = #(MarkdownMedia::register_widget(vm))
@@ -149,7 +161,7 @@ script_mod! {
             font_size: theme.font_size_p
         }
 
-        text_style_fixed: theme.font_code{
+        text_style_fixed: mod.widgets.app_code_font{
             font_size: theme.font_size_p
         }
 
