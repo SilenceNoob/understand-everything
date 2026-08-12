@@ -1,11 +1,11 @@
 use makepad_widgets::*;
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD, SlideState};
-use crate::util::{app_base_dir, cached_widget, set_panel_rect};
+use crate::util::{cached_widget, data_dir, set_panel_rect};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -579,17 +579,16 @@ fn draw_rows(
 
 /// Lazily clone a row from the template, set its texts and load its type
 /// icon (folders by expansion state, files by list).
-/// Svg bytes for a row icon, cached per name (4 icons; avoids re-reading the
-/// same file for every row on every rebuild).
-fn icon_bytes(name: &'static str) -> Option<Vec<u8>> {
-    static CACHE: Mutex<Vec<(&'static str, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
-    let mut cache = CACHE.lock().unwrap();
-    if let Some((_, b)) = cache.iter().find(|(n, _)| *n == name) {
-        return b.clone();
-    }
-    let b = std::fs::read(app_base_dir().join("resources").join(name)).ok();
-    cache.push((name, b.clone()));
-    b
+/// Svg bytes for a row icon (compile-time embedded; 4 icons).
+fn icon_bytes(name: &'static str) -> Option<Arc<[u8]>> {
+    let bytes: &'static [u8] = match name {
+        "folder-open.svg" => include_bytes!("../resources/folder-open.svg"),
+        "folder.svg" => include_bytes!("../resources/folder.svg"),
+        "map.svg" => include_bytes!("../resources/map.svg"),
+        "card.svg" => include_bytes!("../resources/card.svg"),
+        _ => return None,
+    };
+    Some(Arc::from(bytes))
 }
 
 fn row_ref(
@@ -611,7 +610,7 @@ fn row_ref(
     if let Some(bytes) = icon_bytes(icon) {
         let _ = w
             .image(cx, ids!(row_icon))
-            .load_svg_from_shared_data(cx, bytes.into());
+            .load_svg_from_shared_data(cx, bytes);
     }
     refs.push(w.clone());
     w
@@ -1336,7 +1335,7 @@ impl FilePanel {
     /// Rebuild the row lists when the pane roots or any expanded subdir
     /// change (cheap metadata stats per draw pass; scanning only on change).
     fn rebuild_rows(&mut self) {
-        let base = app_base_dir();
+        let base = data_dir();
         let maps_mtime = std::fs::metadata(base.join(MAPS_DIR))
             .and_then(|m| m.modified())
             .ok();
@@ -1372,7 +1371,7 @@ impl FilePanel {
     /// Rebuild both row lists unconditionally (expansion toggles and mtime
     /// changes share this).
     fn rebuild_now(&mut self) {
-        let base = app_base_dir();
+        let base = data_dir();
         self.map_rows = flatten(
             &base,
             &scan_dir(&base, MAPS_DIR, Some("json")),
@@ -1681,7 +1680,7 @@ impl FilePanel {
         let Some(name) = normalize_name(&raw, default_ext) else {
             return;
         };
-        let base = app_base_dir();
+        let base = data_dir();
         let dir_name = if dir { format!("{name}/") } else { name.clone() };
         let from = self.row_value(list, i).unwrap_or_default();
         let to = if list == LIST_MAP {

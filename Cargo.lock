@@ -5141,6 +5141,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "dirs",
  "hf-hub",
  "makepad-widgets",
  "pulldown-cmark 0.12.2",

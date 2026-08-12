@@ -11,7 +11,7 @@ pub(crate) use bm25::Bm25Index;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::util::app_base_dir;
+use crate::util::data_dir;
 
 /// Cached index files bigger than this are discarded outright (a corrupt
 /// length prefix would otherwise make bincode allocate absurdly).
@@ -29,7 +29,7 @@ impl RagIndex {
     /// "maps/foo.json" -> "<base>/.rag_cache/foo.bin" (mirrors refs_path).
     fn cache_path(map_rel: &str) -> std::path::PathBuf {
         let rel = map_rel.strip_prefix("maps/").unwrap_or(map_rel);
-        app_base_dir().join(".rag_cache").join(format!("{rel}.bin"))
+        data_dir().join(".rag_cache").join(format!("{rel}.bin"))
     }
 
     pub fn load(map_rel: &str) -> Option<RagIndex> {
@@ -316,6 +316,7 @@ mod tests {
 
     #[test]
     fn bincode_roundtrip() {
+        crate::util::test_data_dir();
         let p = tmp_doc("rt.md", "# H\n\n正文内容\n\n## S\n\n更多内容");
         let sources = vec![(ChunkSource::RefDoc(p.clone()), p.clone())];
         let mut idx = RagIndex::load(MAP_REL).unwrap_or_default();
@@ -337,7 +338,7 @@ mod tests {
     fn bench_models_and_hybrid() {
         use std::time::Instant;
         let models = model::Models::new();
-        models.ensure(&app_base_dir());
+        models.ensure(&data_dir());
         println!("status: {:?}", *models.status.read().unwrap());
         assert!(models.embedding_ready());
 
@@ -356,7 +357,7 @@ mod tests {
         let s = models.rerank("反向传播 神经网络", &short).unwrap();
         println!("rerank(short) → {:.0}ms, score={:.3}", t.elapsed().as_millis(), s);
 
-        let doc_path = app_base_dir().join("docs/Canvas 规则.md");
+        let doc_path = data_dir().join("docs/Canvas 规则.md");
         let mut idx = RagIndex::default();
         idx.sync_sources(&[(ChunkSource::RefDoc(doc_path.clone()), doc_path.clone())]);
         // synthetic bigger doc so the rerank candidate cap is actually hit

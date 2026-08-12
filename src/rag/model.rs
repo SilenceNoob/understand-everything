@@ -6,9 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokenizers::Tokenizer;
 
-use crate::util::app_base_dir;
+use crate::util::data_dir;
 
-/// Model dirs under <app_base_dir>/models/, and their HF repos.
+/// Model dirs under <data_dir>/models/, and their HF repos.
 pub const MODEL_SPECS: &[(&str, &str)] = &[
     ("embedding", "Qwen/Qwen3-Embedding-0.6B"),
     ("reranker", "Qwen/Qwen3-Reranker-0.6B"),
@@ -129,7 +129,7 @@ impl Models {
     pub fn warm_reranker(&self) {
         let mut guard = self.reranker.write().unwrap();
         if guard.is_none() {
-            let dir = app_base_dir().join("models").join("reranker");
+            let dir = data_dir().join("models").join("reranker");
             *guard = load_bundle(&dir).ok();
         }
     }
@@ -176,7 +176,7 @@ impl Models {
     pub fn rerank(&self, query: &str, doc: &str) -> Result<f32, String> {
         let mut guard = self.reranker.write().unwrap();
         if guard.is_none() {
-            let dir = app_base_dir().join("models").join("reranker");
+            let dir = data_dir().join("models").join("reranker");
             *guard = load_bundle(&dir).ok();
         }
         let b = guard.as_ref().ok_or("reranker not ready")?;

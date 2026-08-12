@@ -1,9 +1,11 @@
 use makepad_widgets::*;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD, SlideState};
-use crate::util::{app_base_dir, cached_widget, set_panel_rect};
+use crate::util::{cached_widget, data_dir, set_panel_rect};
 
 const TAB_W: f64 = 14.0;
 const TAB_H: f64 = 48.0;
@@ -66,7 +68,7 @@ struct FileRef {
 /// subdirectories so maps in different dirs never collide).
 fn refs_path(map_rel: &str) -> std::path::PathBuf {
     let rel = map_rel.strip_prefix("maps/").unwrap_or(map_rel);
-    app_base_dir().join("refs").join(rel)
+    data_dir().join("refs").join(rel)
 }
 
 fn load_items(map_rel: &str) -> Vec<RefItem> {
@@ -134,7 +136,7 @@ fn file_excerpt(path: &str) -> Option<String> {
 /// the name is taken (never overwrites). `docs/` is app-private: neither the
 /// card pane (scans `cards/`) nor the map list (scans `maps/`) ever reads it.
 fn converted_path(source: &std::path::Path) -> std::path::PathBuf {
-    let dir = app_base_dir().join("docs");
+    let dir = data_dir().join("docs");
     let stem = source
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -225,12 +227,10 @@ fn row_ref(
     if item.failed {
         desc.set_text_color(cx, Vec4f::from_u32(0xfca5a5ff));
     }
-    let icon_path = app_base_dir().join("resources").join("card.svg");
-    if let Ok(bytes) = std::fs::read(&icon_path) {
-        let _ = w
-            .image(cx, ids!(row_icon))
-            .load_svg_from_shared_data(cx, bytes.into());
-    }
+    let bytes = include_bytes!("../resources/card.svg");
+    let _ = w
+        .image(cx, ids!(row_icon))
+        .load_svg_from_shared_data(cx, Arc::from(bytes.as_slice()));
     refs.push(w.clone());
     w
 }
@@ -599,7 +599,7 @@ impl Widget for RefsPanel {
 /// path so the row still shows which file was rejected). Sources already
 /// inside `docs/` are referenced in place.
 fn stage_document(src: &std::path::Path) -> (String, bool) {
-    if src.starts_with(app_base_dir().join("docs")) {
+    if src.starts_with(data_dir().join("docs")) {
         return (src.to_string_lossy().into_owned(), false);
     }
     let is_md = src.extension().is_some_and(|e| {
@@ -913,7 +913,7 @@ impl RefsPanel {
     /// red as its excerpt.
     fn pick_doc(&mut self, cx: &mut Cx) {
         let path = rfd::FileDialog::new()
-            .set_directory(app_base_dir())
+            .set_directory(data_dir())
             .add_filter("Markdown", &["md", "markdown"])
             .add_filter(
                 "文档",
@@ -998,19 +998,17 @@ mod tests {
 
     #[test]
     fn refs_path_mirrors_map_dirs() {
-        assert_eq!(
-            refs_path("maps/map.json"),
-            app_base_dir().join("refs/map.json")
-        );
+        let d = crate::util::test_data_dir();
+        assert_eq!(refs_path("maps/map.json"), d.join("refs/map.json"));
         assert_eq!(
             refs_path("maps/backup/old.json"),
-            app_base_dir().join("refs/backup/old.json")
+            d.join("refs/backup/old.json")
         );
     }
 
     #[test]
     fn converted_path_unique_ifies_collisions() {
-        let dir = app_base_dir().join("docs");
+        let dir = crate::util::test_data_dir().join("docs");
         std::fs::create_dir_all(&dir).unwrap();
         for n in 0..3 {
             let name = if n == 0 {
@@ -1084,7 +1082,7 @@ mod tests {
         let stem = format!("ue-md-{}", std::process::id());
         let src = std::env::temp_dir().join(format!("{stem}.md"));
         std::fs::write(&src, "# 标题\n内容").unwrap();
-        let out = app_base_dir().join("docs").join(format!("{stem}.md"));
+        let out = crate::util::test_data_dir().join("docs").join(format!("{stem}.md"));
         std::fs::remove_file(&out).ok();
         let (value, failed) = stage_document(&src);
         assert_eq!(value, out.to_string_lossy());
@@ -1099,7 +1097,7 @@ mod tests {
         let stem = format!("ue-csv-{}", std::process::id());
         let src = std::env::temp_dir().join(format!("{stem}.csv"));
         std::fs::write(&src, "name,age\nAlice,30\n").unwrap();
-        let out = app_base_dir().join("docs").join(format!("{stem}.md"));
+        let out = crate::util::test_data_dir().join("docs").join(format!("{stem}.md"));
         std::fs::remove_file(&out).ok();
         let (value, failed) = stage_document(&src);
         assert_eq!(value, out.to_string_lossy());

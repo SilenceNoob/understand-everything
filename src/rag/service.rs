@@ -5,7 +5,7 @@ use std::thread;
 
 use super::model::Models;
 use super::{Bm25Index, Chunk, ChunkSource, RagIndex, RetrievedChunk, retrieve, retrieve_hybrid};
-use crate::util::app_base_dir;
+use crate::util::data_dir;
 
 /// Max excerpts in the injected context (top-5 retrieval).
 const CONTEXT_HITS: usize = 5;
@@ -63,7 +63,7 @@ impl RagService {
             let shared = shared.clone();
             let indexing = indexing.clone();
             thread::spawn(move || {
-                let base = app_base_dir();
+                let base = data_dir();
                 let models = Arc::new(Models::new());
                 let _ = slot.set(models.clone());
                 // Blocking download/load; status inside `models` is live, so

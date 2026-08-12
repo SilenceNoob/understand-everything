@@ -32,6 +32,7 @@ mod quiz_panel;
 mod rag;
 mod refs_panel;
 mod slide_panel;
+mod update;
 mod util;
 
 use crate::file_panel::FilePanelWidgetRefExt;
@@ -211,6 +212,10 @@ script_mod! {
                     text: ""
                     draw_text.text_style.font_size: 14.0
                     draw_text.color: #aab0bc
+                }
+                update_btn := mod.widgets.ButtonFlat{
+                    width: Fit
+                    text: "检查更新"
                 }
             }
             // AI settings form (visible only for the Setting popup).
@@ -1122,6 +1127,23 @@ pub struct App {
     /// Request id of the in-flight test request.
     #[rust]
     test_id: LiveId,
+    /// Update check/download state for the About panel's 检查更新 button.
+    #[rust]
+    update_state: u8, // 0 idle, 1 checking, 2 ready to download, 3 downloading, 4 applied
+    /// Latest release info (set once a check found a newer version).
+    #[rust]
+    update_info: Option<crate::update::UpdateInfo>,
+    /// Request id of the in-flight update check.
+    #[rust]
+    update_id: LiveId,
+    /// Request id of the in-flight update download.
+    #[rust]
+    update_dl_id: LiveId,
+    /// Redirect hops left for the in-flight update download (GitHub asset
+    /// URLs redirect to objects.githubusercontent.com; makepad's http client
+    /// does not follow them itself).
+    #[rust]
+    update_dl_hops: u8,
     /// Chat history as messages, newest last. Bounded by the context window
     /// (see CONTEXT_WINDOW), not by a fixed message count.
     #[rust]
@@ -1511,6 +1533,133 @@ impl App {
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
+        }
+    }
+
+    /// About panel 检查更新 button: start a check, or download the newer
+    /// binary once one was found.
+    fn handle_update_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let btn = self.popup_child(
+            live_id!(about_popup),
+            &[
+                live_id!(content),
+                live_id!(panel),
+                live_id!(body_box),
+                live_id!(update_btn),
+            ],
+        );
+        if !btn.as_button().clicked(actions) {
+            return;
+        }
+        match self.update_state {
+            // Idle or failed after an error: re-run the check.
+            0 | 5 => {
+                self.update_state = 1;
+                self.update_id = LiveId::unique();
+                self.update_body(cx, "检查中…");
+                update::check_update(cx, self.update_id);
+            }
+            // A newer version is known: download and apply it.
+            2 => {
+                let Some(info) = &self.update_info else {
+                    return;
+                };
+                let Some(url) = info.asset_url.clone() else {
+                    self.update_body(cx, "该版本没有当前平台的安装包");
+                    return;
+                };
+                self.update_state = 3;
+                self.update_dl_id = LiveId::unique();
+                self.update_dl_hops = 3;
+                self.update_body(cx, "下载中…（安装包较大，请稍候）");
+                update::download(cx, self.update_dl_id, &url);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_body(&mut self, cx: &mut Cx, msg: &str) {
+        self.popup_child(
+            live_id!(about_popup),
+            &[
+                live_id!(content),
+                live_id!(panel),
+                live_id!(body_box),
+                live_id!(body),
+            ],
+        )
+        .set_text(cx, msg);
+    }
+
+    fn handle_update_check_response(&mut self, cx: &mut Cx, status: u16, body: &str) {
+        if status != 200 {
+            self.update_state = 5;
+            self.update_body(cx, &format!("检查更新失败 ({status})，请检查网络后重试"));
+            return;
+        }
+        match update::parse_latest(body, env!("CARGO_PKG_VERSION")) {
+            Some(info) if info.newer => {
+                let tag = info.tag.clone();
+                self.update_info = Some(info);
+                self.update_state = 2;
+                self.update_body(cx, &format!("发现新版本 {tag}"));
+            }
+            Some(_) => {
+                self.update_state = 0;
+                self.update_body(
+                    cx,
+                    &format!("已是最新版本 v{}", env!("CARGO_PKG_VERSION")),
+                );
+            }
+            None => {
+                self.update_state = 5;
+                self.update_body(cx, "检查更新失败：无法解析响应");
+            }
+        }
+    }
+
+    fn handle_update_download_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        let status = response.status_code;
+        // GitHub asset URLs redirect (302) to objects.githubusercontent.com;
+        // makepad's http client never follows — re-issue the request at the
+        // Location header, up to 3 hops.
+        if matches!(status, 301 | 302 | 303 | 307 | 308) && self.update_dl_hops > 0 {
+            if let Some(url) = response
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .and_then(|(_, v)| v.first().cloned())
+            {
+                self.update_dl_hops -= 1;
+                self.update_body(cx, "下载中…（安装包较大，请稍候）");
+                update::download(cx, self.update_dl_id, &url);
+                return;
+            }
+        }
+        let body = response.body().map(|b| b.to_vec()).unwrap_or_default();
+        if status != 200 || body.is_empty() {
+            self.update_state = 5;
+            self.update_body(cx, &format!("下载失败 ({status})，请重试"));
+            return;
+        }
+        let dir = crate::util::data_dir().join("update");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(update::asset_name());
+        if std::fs::write(&path, body).is_err() {
+            self.update_state = 5;
+            self.update_body(cx, "下载失败：无法写入文件");
+            return;
+        }
+        match update::apply(&path) {
+            Ok(_) => {
+                self.update_state = 4;
+                self.update_body(cx, "更新完成，正在重启…");
+                cx.quit();
+            }
+            Err(e) => {
+                self.update_state = 5;
+                self.update_body(cx, &format!("更新失败：{e}"));
+            }
         }
     }
 
@@ -2166,7 +2315,7 @@ impl App {
             self.show_toast(cx, "请先在 Setting 中配置 API Key 再生成学习路线");
             return;
         }
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         let Some(map_file) = mind_map.current_map_file() else {
             return;
@@ -2246,7 +2395,7 @@ impl App {
         let safe = crate::file_panel::normalize_name(title, Some(".md"))
             .unwrap_or_else(|| "未命名.md".to_string());
         let safe = safe.strip_suffix(".md").unwrap_or(&safe).to_string();
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         for n in 0.. {
             let fname = if n == 0 {
                 format!("{safe}.md")
@@ -2315,7 +2464,7 @@ impl App {
         // already exists, so drop those and re-attach their children to the
         // root (else a "-1" duplicate root gets created).
         crate::gen::drop_goal_duplicates(&mut plan, &self.route_goal);
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         let Some(map_file) = mind_map.current_map_file() else {
             self.abort_route(cx, "路线生成失败：当前地图不存在".to_string());
@@ -2470,7 +2619,7 @@ impl App {
             self.open_map(cx, &map_file);
         }
         // Context menu: create map / dir, delete map, rename.
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
             std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
             self.open_map(cx, &map_file);
@@ -2545,7 +2694,7 @@ impl App {
     /// map that references it.
     fn open_card_delete_confirm(&mut self, cx: &mut Cx, rel: &str) {
         self.pending_delete_card = Some(rel.to_string());
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let name = std::path::Path::new(rel)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -2595,7 +2744,7 @@ impl App {
             let rel = self.pending_delete_card.take();
             self.popup_widget(popup).as_popup_panel().hide(cx);
             let Some(rel) = rel else { return };
-            let base = crate::util::app_base_dir();
+            let base = crate::util::data_dir();
             crate::mindmap::remove_card_node(&base, &rel);
             std::fs::remove_file(base.join(&rel)).ok();
             // Drop the ghost node from the in-memory map (if present) so a
@@ -2700,7 +2849,7 @@ impl App {
         if !is_temp_map(&cur) {
             return;
         }
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         for n in 0.. {
             let target = if n == 0 {
                 format!("maps/{safe}.json")
@@ -2723,7 +2872,7 @@ impl App {
         let current = self.ui.mind_map(cx, ids!(mindmap)).current_map_file();
         if let Some(cur) = current {
             if is_temp_map(&cur) && cur != map_file {
-                std::fs::remove_file(crate::util::app_base_dir().join(&cur)).ok();
+                std::fs::remove_file(crate::util::data_dir().join(&cur)).ok();
             }
         }
         self.switch_map_state(cx, map_file);
@@ -3184,7 +3333,7 @@ impl App {
     /// Open the canvas card picker at `pos` (screen coords): scan cards/,
     /// exclude cards already on the map, and show the popup.
     fn open_card_picker(&mut self, cx: &mut Cx, pos: DVec2) {
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let on_map = self.ui.mind_map(cx, ids!(mindmap)).card_rel_paths();
         let candidates: Vec<String> = crate::file_panel::all_card_files(&base)
             .into_iter()
@@ -3240,7 +3389,7 @@ impl App {
         let stem = crate::file_panel::normalize_name(name, Some(".md"))
             .unwrap_or_else(|| "未命名.md".to_string());
         let stem = stem.strip_suffix(".md").unwrap_or(&stem).to_string();
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         for n in 0.. {
             let fname = if n == 0 {
                 format!("{stem}.md")
@@ -3321,7 +3470,7 @@ impl App {
         let done = self.gen_total.saturating_sub(self.gen_sections.len() + 1);
         let indicator = format!("生成中… ({}/{})", done + 1, self.gen_total);
         self.set_card_title_indicator(cx, &self.gen_path, Some(&indicator));
-        let body = std::fs::read_to_string(crate::util::app_base_dir().join(&self.gen_path))
+        let body = std::fs::read_to_string(crate::util::data_dir().join(&self.gen_path))
             .unwrap_or_default();
         let ctype = crate::gen::card_type(&body);
         let (system, user) = generation_messages(section, &self.gen_title, &self.gen_context, ctype);
@@ -3344,7 +3493,7 @@ impl App {
     fn handle_gen_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
         self.gen_id = LiveId::empty();
         let status = response.status_code;
-        let full_path = crate::util::app_base_dir().join(&self.gen_path);
+        let full_path = crate::util::data_dir().join(&self.gen_path);
         if status != 200 {
             let detail = response
                 .get_string_body()
@@ -3382,7 +3531,7 @@ impl App {
     }
 
     fn set_card_title_indicator(&self, cx: &mut Cx, path: &str, indicator: Option<&str>) {
-        let full_path = crate::util::app_base_dir().join(path);
+        let full_path = crate::util::data_dir().join(path);
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         mind_map.set_card_title_indicator(cx, &full_path, indicator);
     }
@@ -3394,7 +3543,7 @@ impl App {
         if self.subcard_id != LiveId::empty() {
             return;
         }
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let parent_body = std::fs::read_to_string(base.join(parent)).unwrap_or_default();
         let parent_title = std::path::Path::new(parent)
             .file_stem()
@@ -3433,7 +3582,7 @@ impl App {
                 return;
             }
         };
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let parent_rel = self.subcard_parent.clone();
         let parent_path = base.join(&parent_rel);
         let dir = parent_path
@@ -3515,7 +3664,7 @@ impl App {
     }
 
     fn start_quiz(&mut self, cx: &mut Cx, path: &str) {
-        let full_path = crate::util::app_base_dir().join(path);
+        let full_path = crate::util::data_dir().join(path);
         let body = std::fs::read_to_string(&full_path).unwrap_or_default();
         let title = full_path
             .file_stem()
@@ -3618,7 +3767,7 @@ impl App {
                 // across maps.
                 if let Some(score) = quiz_panel.last_score() {
                     if let Some(path) = self.quiz_path.as_deref() {
-                        let base = crate::util::app_base_dir();
+                        let base = crate::util::data_dir();
                         let mut progress = crate::mindmap::model::load_progress(&base);
                         progress.insert(path.to_string(), score);
                         crate::mindmap::model::save_progress(&base, &progress);
@@ -3685,6 +3834,15 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_http_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
+        if request_id == self.update_id && self.update_id != LiveId::empty() {
+            let body = response.get_string_body().unwrap_or_default();
+            self.handle_update_check_response(cx, response.status_code, &body);
+            return;
+        }
+        if request_id == self.update_dl_id && self.update_dl_id != LiveId::empty() {
+            self.handle_update_download_response(cx, response);
+            return;
+        }
         if request_id == self.test_id && self.testing {
             self.testing = false;
             let status = response.status_code;
@@ -3738,6 +3896,16 @@ impl MatchEvent for App {
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
+        if request_id == self.update_id && self.update_id != LiveId::empty() {
+            self.update_state = 5;
+            self.update_body(cx, &format!("检查更新失败：{}", err.message));
+            return;
+        }
+        if request_id == self.update_dl_id && self.update_dl_id != LiveId::empty() {
+            self.update_state = 5;
+            self.update_body(cx, &format!("下载失败：{}", err.message));
+            return;
+        }
         if request_id == self.test_id && self.testing {
             self.testing = false;
             self.popup_child(
@@ -3888,6 +4056,7 @@ impl AppMain for App {
     }
 
     fn after_new_from_script(_vm: &mut ScriptVm, app: &mut Self) {
+        crate::util::migrate_legacy_data();
         app.ai_config = ai::load_config();
     }
 
@@ -3911,7 +4080,7 @@ impl AppMain for App {
             // Every launch: start from a fresh temporary map with the startup
             // page. Old temp maps (from sessions that ended without a goal)
             // are swept first.
-            let base = crate::util::app_base_dir();
+            let base = crate::util::data_dir();
             if !self.map_opened {
                 let maps = base.join("maps");
                 let _ = std::fs::create_dir_all(&maps);
@@ -3952,6 +4121,7 @@ impl AppMain for App {
         if let Event::Actions(actions) = event {
             self.handle_popup_closes(cx, actions);
             self.handle_settings_actions(cx, actions);
+            self.handle_update_actions(cx, actions);
             self.handle_chat_actions(cx, actions);
             self.handle_file_panel_actions(cx, actions);
             self.handle_startup_actions(cx, actions);

@@ -2,7 +2,7 @@ use makepad_widgets::*;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::app_base_dir;
+use crate::util::data_dir;
 
 /// DeepSeek defaults (OpenAI-compatible API; base_url has no /v1 suffix).
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -102,7 +102,7 @@ pub fn jiangou_format_prompt(enabled: &[String]) -> String {
 
 /// Load settings.json; a missing or malformed file yields the defaults.
 pub fn load_config() -> AIConfig {
-    std::fs::read_to_string(app_base_dir().join("settings.json"))
+    std::fs::read_to_string(data_dir().join("settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -110,7 +110,7 @@ pub fn load_config() -> AIConfig {
 
 pub fn save_config(config: &AIConfig) {
     if let Ok(json) = serde_json::to_string_pretty(config) {
-        let _ = std::fs::write(app_base_dir().join("settings.json"), json);
+        let _ = std::fs::write(data_dir().join("settings.json"), json);
     }
 }
 

@@ -16,6 +16,7 @@ candle-transformers = "0.11.0"
 tokenizers = "0.23.1"
 hf-hub = { version = "1.0.0", features = ["blocking"] }
 bincode = "1"
+dirs = "6"
 
 [profile.dev]
 opt-level = 1

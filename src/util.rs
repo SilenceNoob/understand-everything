@@ -14,6 +14,148 @@ pub fn app_base_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// User-data root: `$UE_DATA_DIR` override, else the platform data dir
+/// (Linux `~/.local/share`, macOS `~/Library/Application Support`, Windows
+/// `%LOCALAPPDATA%`), always under `.../understand-everything`.
+pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UE_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::data_local_dir()
+        .map(|d| d.join("understand-everything"))
+        .unwrap_or_else(app_base_dir)
+}
+
+/// One-time migration: move user data sitting next to the binary (legacy
+/// layout) into the platform data dir. Per-item and idempotent — an item is
+/// moved only when the data dir lacks it, so a pre-existing data dir (e.g. a
+/// leftover cache) never blocks the rest.
+pub fn migrate_legacy_data() {
+    let data = data_dir();
+    let base = app_base_dir();
+    migrate_paths(&base, &data);
+}
+
+fn migrate_paths(base: &std::path::Path, data: &std::path::Path) {
+    const DATA_ITEMS: &[&str] = &[
+        "cards",
+        "maps",
+        "refs",
+        "docs",
+        "settings.json",
+        "progress.json",
+        ".rag_cache",
+        "models",
+    ];
+    if base == data {
+        return;
+    }
+    for it in DATA_ITEMS {
+        let src = base.join(it);
+        if src.exists() && !data.join(it).exists() {
+            move_path(&src, &data.join(it));
+        }
+    }
+}
+
+fn move_path(src: &std::path::Path, dst: &std::path::Path) {
+    if std::fs::rename(src, dst).is_ok() {
+        return;
+    }
+    if src.is_file() {
+        if std::fs::copy(src, dst).is_ok() {
+            let _ = std::fs::remove_file(src);
+        }
+    } else if copy_dir(src, dst).is_ok() {
+        let _ = std::fs::remove_dir_all(src);
+    }
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let s = e.path();
+        let d = dst.join(e.file_name());
+        if s.is_dir() {
+            copy_dir(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared isolated data dir for all tests that touch disk: a per-process
+/// temp dir exported as UE_DATA_DIR exactly once (any module calling
+/// `data_dir()` thereafter gets this dir, never the real one).
+#[cfg(test)]
+pub fn test_data_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("ue_test_{}", std::process::id()));
+        std::env::set_var("UE_DATA_DIR", &d);
+        d
+    });
+    dir.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ue_util_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn migrate_moves_legacy_data() {
+        let base = tmp("migrate_base");
+        let data = tmp("migrate_data");
+        std::fs::create_dir_all(base.join("cards/sub")).unwrap();
+        std::fs::create_dir_all(base.join("maps")).unwrap();
+        std::fs::write(base.join("cards/sub/a.md"), "x").unwrap();
+        std::fs::write(base.join("maps/m.json"), "{}").unwrap();
+        std::fs::write(base.join("settings.json"), "{}").unwrap();
+        migrate_paths(&base, &data);
+        assert!(data.join("cards/sub/a.md").exists());
+        assert!(data.join("maps/m.json").exists());
+        assert!(data.join("settings.json").exists());
+        assert!(!base.join("cards").exists());
+        assert!(!base.join("settings.json").exists());
+    }
+
+    #[test]
+    fn migrate_backfills_missing_items_only() {
+        let base = tmp("migrate_base2");
+        let data = tmp("migrate_data2");
+        std::fs::create_dir_all(base.join("maps")).unwrap();
+        std::fs::create_dir_all(base.join("cards")).unwrap();
+        std::fs::write(base.join("maps/a.json"), "{}").unwrap();
+        std::fs::write(base.join("cards/b.md"), "y").unwrap();
+        std::fs::create_dir_all(data.join("maps")).unwrap();
+        std::fs::write(data.join("maps/z.json"), "keep").unwrap();
+        migrate_paths(&base, &data);
+        // Item already in the data dir stays untouched in both places.
+        assert!(base.join("maps/a.json").exists());
+        assert!(data.join("maps/z.json").exists());
+        // Missing item is moved.
+        assert!(data.join("cards/b.md").exists());
+        assert!(!base.join("cards").exists());
+    }
+
+    #[test]
+    fn migrate_same_dir_is_noop() {
+        let dir = tmp("migrate_same");
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        migrate_paths(&dir, &dir);
+        assert!(dir.join("settings.json").exists());
+    }
+}
+
 /// Lazy widget lookup: return the cached ref, or fill `cache` via `f` once
 /// (a failed lookup is never cached, so it retries).
 pub fn cached_widget(cache: &mut Option<WidgetRef>, f: impl FnOnce() -> WidgetRef) -> Option<WidgetRef> {

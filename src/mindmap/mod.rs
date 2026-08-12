@@ -3,7 +3,7 @@ use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use crate::gen::GenSection;
 use crate::markdown_media::MarkdownMediaWidgetRefExt;
 use crate::slide_panel::{menu_item_index, menu_rect, MENU_ITEM_H, MENU_PAD};
-use crate::util::{apply_resize, app_base_dir};
+use crate::util::{apply_resize, data_dir};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1487,7 +1487,7 @@ impl MindMap {
     /// saved on every interaction, so nothing is flushed here. On failure the
     /// canvas is emptied (so a deleted map can't be resurrected by save_map).
     fn load_map(&mut self, cx: &mut Cx) {
-        let base = app_base_dir();
+        let base = data_dir();
         let map_file = self.map_file.clone();
         let Some(data) = MindMapData::load_from(&base, &map_file) else {
             log!("mindmap: failed to load {} in {:?}", map_file, base);
@@ -1655,7 +1655,7 @@ impl MindMap {
         let Some(data) = &self.data else { return };
         let Some(node) = data.nodes.get(i) else { return };
         // progress.json is keyed by rel path; Node.path is base-joined.
-        let base = crate::util::app_base_dir();
+        let base = crate::util::data_dir();
         let Some(rel) = node.path.strip_prefix(&base).ok() else { return };
         if !node.path.is_file() {
             return;
@@ -2166,7 +2166,7 @@ impl MindMap {
             if let Err(e) = std::fs::write(&node.path, &node.body) {
                 log!("mindmap: save {} failed: {e}", node.path.display());
             }
-            if let Some(new_path) = rename_card_file(&app_base_dir(), &node.path, &new_name) {
+            if let Some(new_path) = rename_card_file(&data_dir(), &node.path, &new_name) {
                 renamed = new_path != node.path;
                 node.path = new_path;
             }
@@ -2227,7 +2227,7 @@ impl MindMap {
     /// No-op if the file is already on the map.
     pub fn add_card_at(&mut self, cx: &mut Cx, rel_path: &str) {
         let Some(data) = &mut self.data else { return };
-        let path = app_base_dir().join(rel_path);
+        let path = data_dir().join(rel_path);
         if data.nodes.iter().any(|n| n.path == path) {
             return;
         }
@@ -2244,7 +2244,7 @@ impl MindMap {
     /// `parent_rel` (划选生成子卡片): tree edge + a position to the parent's
     /// right, below any existing children. Saves and selects the new card.
     pub fn add_child_card(&mut self, cx: &mut Cx, parent_rel: &str, child_rel: &str) {
-        let base = app_base_dir();
+        let base = data_dir();
         let Some(data) = &mut self.data else { return };
         let Some(pi) = data.nodes.iter().position(|n| n.path == base.join(parent_rel)) else {
             return;
@@ -2271,7 +2271,7 @@ impl MindMap {
 
     /// Reload 已见/未见 progress from progress.json and refresh the badges.
     pub fn reload_progress(&mut self, cx: &mut Cx) {
-        self.progress = crate::mindmap::model::load_progress(&app_base_dir());
+        self.progress = crate::mindmap::model::load_progress(&data_dir());
         self.redraw(cx);
     }
 
@@ -2292,7 +2292,7 @@ impl MindMap {
     /// the canvas picker's candidate list).
     pub fn card_rel_paths(&self) -> Vec<String> {
         let Some(data) = &self.data else { return Vec::new() };
-        let base = app_base_dir();
+        let base = data_dir();
         data.nodes
             .iter()
             .filter_map(|n| n.path.strip_prefix(&base).ok().map(|p| p.to_string_lossy().into_owned()))
@@ -2303,7 +2303,7 @@ impl MindMap {
         let Some(data) = &self.data else {
             return;
         };
-        write_map(&app_base_dir(), data, self.pan_target, self.zoom_target, &self.map_file);
+        write_map(&data_dir(), data, self.pan_target, self.zoom_target, &self.map_file);
     }
 
     /// Open the card context menu at the right-click screen position.
@@ -2311,7 +2311,7 @@ impl MindMap {
         let Some(data) = &self.data else { return };
         let path = data.nodes[card]
             .path
-            .strip_prefix(&app_base_dir())
+            .strip_prefix(&data_dir())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let view = self.area.rect(cx);
