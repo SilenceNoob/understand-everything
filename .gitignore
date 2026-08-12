@@ -3,6 +3,8 @@
 .opencode/node_modules/
 /settings.json
 /progress.json
+/cards/
+/maps/
 /refs/
 /models/
 /.rag_cache/
