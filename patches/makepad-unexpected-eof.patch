@@ -1,0 +1,64 @@
+diff --git a/platform/network/src/backend/linux/socket_stream.rs b/platform/network/src/backend/linux/socket_stream.rs
+index cd34bd03..081d7308 100644
+--- a/platform/network/src/backend/linux/socket_stream.rs
++++ b/platform/network/src/backend/linux/socket_stream.rs
+@@ -51,6 +51,7 @@ struct SSL_METHOD {
+     fn SSL_ctrl(ssl: *mut SSL, cmd: c_int, larg: c_long, parg: *mut c_void) -> c_long;
+ 
+     fn ERR_get_error() -> c_ulong;
++    fn ERR_peek_error() -> c_ulong;
+     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: usize);
+ }
+ 
+@@ -267,7 +268,18 @@ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                     Err(io_other(format!("SSL_read syscall error: {os_err}")))
+                 }
+             }
+-            _ => Err(io_other(format!("SSL_read failed: {}", last_ssl_error()))),
++            _ => {
++                // OpenSSL 3 surfaces a peer close without close_notify (common
++                // with CDNs, e.g. api.deepseek.com) as
++                // SSL_R_UNEXPECTED_EOF_WHILE_READING (0x0A000126); treat it as
++                // a graceful EOF. Upstream dropped this when the platform tree
++                // was restructured — see patches/makepad-unexpected-eof.patch.
++                if unsafe { ERR_peek_error() } == 0x0A000126 {
++                    Ok(0)
++                } else {
++                    Err(io_other(format!("SSL_read failed: {}", last_ssl_error())))
++                }
++            }
+         }
+     }
+ }
+diff --git a/platform/src/os/linux/socket_stream.rs b/platform/src/os/linux/socket_stream.rs
+index 2e3a7fd8..190c3f6a 100644
+--- a/platform/src/os/linux/socket_stream.rs
++++ b/platform/src/os/linux/socket_stream.rs
+@@ -51,6 +51,7 @@ struct SSL_METHOD {
+     fn SSL_ctrl(ssl: *mut SSL, cmd: c_int, larg: c_long, parg: *mut c_void) -> c_long;
+ 
+     fn ERR_get_error() -> c_ulong;
++    fn ERR_peek_error() -> c_ulong;
+     fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: usize);
+ }
+ 
+@@ -267,7 +268,18 @@ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                     Err(io_other(format!("SSL_read syscall error: {os_err}")))
+                 }
+             }
+-            _ => Err(io_other(format!("SSL_read failed: {}", last_ssl_error()))),
++            _ => {
++                // OpenSSL 3 surfaces a peer close without close_notify (common
++                // with CDNs, e.g. api.deepseek.com) as
++                // SSL_R_UNEXPECTED_EOF_WHILE_READING (0x0A000126); treat it as
++                // a graceful EOF. Upstream dropped this when the platform tree
++                // was restructured — see patches/makepad-unexpected-eof.patch.
++                if unsafe { ERR_peek_error() } == 0x0A000126 {
++                    Ok(0)
++                } else {
++                    Err(io_other(format!("SSL_read failed: {}", last_ssl_error())))
++                }
++            }
+         }
+     }
+ }
