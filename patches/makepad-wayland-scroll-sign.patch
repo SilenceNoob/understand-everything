@@ -1,0 +1,71 @@
+diff --git a/platform/src/os/linux/wayland/wayland_state.rs b/platform/src/os/linux/wayland/wayland_state.rs
+index 31934705..49bc1f69 100644
+--- a/platform/src/os/linux/wayland/wayland_state.rs
++++ b/platform/src/os/linux/wayland/wayland_state.rs
+@@ -1341,22 +1341,23 @@ fn event(
+                     }
+                 }
+             }
+-            // Wayland axis values use motion-event coordinates: positive
+-            // vertical = downward on screen = content slides down = viewport
+-            // moves UP. Makepad's internal convention is positive = viewport
+-            // moves DOWN (matching X11 button mapping and macOS after its
+-            // negation of scrollingDeltaY). Negate to align conventions,
+-            // same as winit does for the same reason.
++            // Wayland axis values are motion-event coordinates: positive
++            // vertical = downward on screen = content later = viewport moves
++            // DOWN — which is already makepad's internal convention (matching
++            // X11's button-4/5 mapping and macOS after its negation of
++            // scrollingDeltaY). Pass through unnegated; winit negates because
++            // its convention is the opposite, and copying that negation here
++            // inverted every wheel/touchpad scroll on Wayland.
+             wl_pointer::Event::Axis {
+                 time: _,
+                 axis,
+                 value,
+             } => match axis {
+                 WEnum::Value(wl_pointer::Axis::VerticalScroll) => {
+-                    state.scroll_accumulator.y -= value;
++                    state.scroll_accumulator.y += value;
+                 }
+                 WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+-                    state.scroll_accumulator.x -= value;
++                    state.scroll_accumulator.x += value;
+                 }
+                 _ => {}
+             },
+@@ -1431,25 +1432,26 @@ fn event(
+                 // frame's Scroll event goes out with `ScrollPhase::Ended`.
+                 state.scroll_stopped = true;
+             }
+-            // Wheel detent counts, negated to match the Axis sign convention above.
+-            // AxisDiscrete is only sent by compositors below seat v8; v8+ compositors
+-            // send AxisValue120 instead (120 units per detent, fractional detents
+-            // allowed for high-resolution wheels), so the two never double-count.
++            // Wheel detent counts, same (unnegated) sign convention as the Axis
++            // handler above. AxisDiscrete is only sent by compositors below seat
++            // v8; v8+ compositors send AxisValue120 instead (120 units per
++            // detent, fractional detents allowed for high-resolution wheels), so
++            // the two never double-count.
+             wl_pointer::Event::AxisDiscrete { axis, discrete } => match axis {
+                 WEnum::Value(wl_pointer::Axis::VerticalScroll) => {
+-                    state.scroll_detents.y -= discrete as f64;
++                    state.scroll_detents.y += discrete as f64;
+                 }
+                 WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+-                    state.scroll_detents.x -= discrete as f64;
++                    state.scroll_detents.x += discrete as f64;
+                 }
+                 _ => {}
+             },
+             wl_pointer::Event::AxisValue120 { axis, value120 } => match axis {
+                 WEnum::Value(wl_pointer::Axis::VerticalScroll) => {
+-                    state.scroll_detents.y -= value120 as f64 / 120.0;
++                    state.scroll_detents.y += value120 as f64 / 120.0;
+                 }
+                 WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+-                    state.scroll_detents.x -= value120 as f64 / 120.0;
++                    state.scroll_detents.x += value120 as f64 / 120.0;
+                 }
+                 _ => {}
+             },
