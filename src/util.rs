@@ -26,6 +26,66 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(app_base_dir)
 }
 
+/// Directory the app's fonts/icons ship in (NOT compiled into the binary;
+/// DSL resources load from here at runtime). Resolution order: `$UE_RESOURCES_DIR`
+/// override, `resources/` next to the executable (release layout: exe +
+/// resources/ shipped together), `CARGO_MANIFEST_DIR/resources` (dev under
+/// `cargo run`), then the current directory.
+pub fn resources_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UE_RESOURCES_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("resources");
+            if p.is_dir() {
+                return p;
+            }
+        }
+    }
+    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        return PathBuf::from(dir).join("resources");
+    }
+    std::env::current_dir()
+        .map(|d| d.join("resources"))
+        .unwrap_or_else(|_| PathBuf::from("resources"))
+}
+
+/// Absolute path of one resource file in `resources_dir()` (what the DSL's
+/// `file_resource(#(...))` needs).
+pub fn resource_path(name: &str) -> String {
+    resources_dir().join(name).to_string_lossy().into_owned()
+}
+
+/// Re-point every registered script resource at our shipped resources/ dir.
+///
+/// Widgets' theme/component defaults resolve `crate_resource("self:...")`
+/// FontMembers at registration time to the BUILD machine's absolute path
+/// (`~/.cargo/git/checkouts/...`), which breaks on any other machine — the
+/// renderer reads fonts by mmap'ing `abs_path` (Cx::get_resource_font_bytes),
+/// so rewriting the path to our local copy fixes every font/icon regardless
+/// of where its member was created. Resources whose basename is absent from
+/// `resources_dir()` (widgets-only files like NewCMMath, back.svg) are left
+/// untouched — harmless, nothing renders through them here.
+pub fn relocate_resources(cx: &mut Cx) {
+    let dir = resources_dir();
+    let mut resources = cx.script_data.resources.resources.borrow_mut();
+    for res in resources.iter_mut() {
+        let name = res.abs_path.rsplit(['/', '\\']).next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let local = dir.join(name);
+        if !local.is_file() {
+            continue;
+        }
+        let local = local.to_string_lossy().into_owned();
+        if res.abs_path != local {
+            res.abs_path = local;
+        }
+    }
+}
+
 /// One-time migration: move user data sitting next to the binary (legacy
 /// layout) into the platform data dir. Per-item and idempotent — an item is
 /// moved only when the data dir lacks it, so a pre-existing data dir (e.g. a
@@ -153,6 +213,14 @@ mod tests {
         std::fs::write(dir.join("settings.json"), "{}").unwrap();
         migrate_paths(&dir, &dir);
         assert!(dir.join("settings.json").exists());
+    }
+
+    #[test]
+    fn resources_dir_honors_override() {
+        let dir = tmp("resources_override");
+        std::env::set_var("UE_RESOURCES_DIR", &dir);
+        assert_eq!(resources_dir(), dir);
+        assert_eq!(resource_path("x.ttf"), dir.join("x.ttf").to_string_lossy());
     }
 }
 

@@ -383,7 +383,7 @@ script_mod! {
                     }
                     start_send_btn := SendBtn{
                         draw_icon +: {
-                            svg: crate_resource("self:resources/send.svg")
+                            svg: file_resource(#(crate::util::resource_path("send.svg")))
                             color: #aab0bc
                         }
                         icon_walk: Walk{width: 16, height: 16}
@@ -652,7 +652,7 @@ script_mod! {
                                 }
                                 new_chat_btn := NewChatBtn{
                                     draw_icon +: {
-                                        svg: crate_resource("self:resources/plus.svg")
+                                        svg: file_resource(#(crate::util::resource_path("plus.svg")))
                                         color: #aab0bc
                                     }
                                     icon_walk: Walk{width: 14, height: 14}
@@ -724,7 +724,7 @@ script_mod! {
                                                 border_size: uniform(0.0)
                                             }
                                             draw_icon +: {
-                                                svg: crate_resource("self:resources/copy.svg")
+                                                svg: file_resource(#(crate::util::resource_path("copy.svg")))
                                                 color: #8a91a0
                                             }
                                         }
@@ -743,7 +743,7 @@ script_mod! {
                                                 border_size: uniform(0.0)
                                             }
                                             draw_icon +: {
-                                                svg: crate_resource("self:resources/check.svg")
+                                                svg: file_resource(#(crate::util::resource_path("check.svg")))
                                                 color: #4ade80
                                             }
                                         }
@@ -863,7 +863,7 @@ script_mod! {
                                                 border_size: uniform(0.0)
                                             }
                                             draw_icon +: {
-                                                svg: crate_resource("self:resources/copy.svg")
+                                                svg: file_resource(#(crate::util::resource_path("copy.svg")))
                                                 color: #8a91a0
                                             }
                                         }
@@ -882,7 +882,7 @@ script_mod! {
                                                 border_size: uniform(0.0)
                                             }
                                             draw_icon +: {
-                                                svg: crate_resource("self:resources/check.svg")
+                                                svg: file_resource(#(crate::util::resource_path("check.svg")))
                                                 color: #4ade80
                                             }
                                         }
@@ -905,7 +905,7 @@ script_mod! {
                                 }
                                 send_btn := SendBtn{
                                     draw_icon +: {
-                                        svg: crate_resource("self:resources/send.svg")
+                                        svg: file_resource(#(crate::util::resource_path("send.svg")))
                                         color: #aab0bc
                                     }
                                     icon_walk: Walk{width: 16, height: 16}
@@ -913,7 +913,7 @@ script_mod! {
                                 stop_btn := SendBtn{
                                     visible: false
                                     draw_icon +: {
-                                        svg: crate_resource("self:resources/stop.svg")
+                                        svg: file_resource(#(crate::util::resource_path("stop.svg")))
                                         color: #aab0bc
                                     }
                                     icon_walk: Walk{width: 16, height: 16}
@@ -4055,9 +4055,12 @@ impl AppMain for App {
         self::script_mod(vm)
     }
 
-    fn after_new_from_script(_vm: &mut ScriptVm, app: &mut Self) {
+    fn after_new_from_script(vm: &mut ScriptVm, app: &mut Self) {
         crate::util::migrate_legacy_data();
         app.ai_config = ai::load_config();
+        if let Some(cx) = vm.host.downcast_mut::<Cx>() {
+            crate::util::relocate_resources(cx);
+        }
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {

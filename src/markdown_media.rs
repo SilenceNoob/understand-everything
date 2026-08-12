@@ -13,12 +13,13 @@ script_mod! {
 
     // Code font with CJK + emoji coverage: the theme's font_code only ships a
     // latin member (LiberationMono), so Chinese inside code blocks/inline code
-    // rendered as .notdef boxes. Bundled fonts live in this crate's resources/.
+    // rendered as .notdef boxes. Fonts load at runtime from the shipped
+    // resources/ dir (see util::resources_dir), never from the binary.
     mod.widgets.app_code_font = TextStyle{
         font_family: FontFamily{
-            latin := FontMember{res: crate_resource("self:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
-            chinese := FontMember{res: crate_resource("self:resources/LXGWWenKaiRegular.ttf") asc: 0.0 desc: 0.0}
-            emoji := FontMember{res: crate_resource("self:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+            latin := FontMember{res: file_resource(#(crate::util::resource_path("LiberationMono-Regular.ttf"))) asc: 0.0 desc: 0.0}
+            chinese := FontMember{res: file_resource(#(crate::util::resource_path("LXGWWenKaiRegular.ttf"))) asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: file_resource(#(crate::util::resource_path("NotoColorEmoji.ttf"))) asc: 0.0 desc: 0.0}
         }
         line_spacing: 1.35
     }
@@ -229,7 +230,7 @@ script_mod! {
             icon := mod.widgets.Icon{
                 icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
-                    svg: crate_resource("self:resources/book.svg")
+                    svg: file_resource(#(crate::util::resource_path("book.svg")))
                     color: #93c5fd
                 }
             }
@@ -257,7 +258,7 @@ script_mod! {
             icon := mod.widgets.Icon{
                 icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
-                    svg: crate_resource("self:resources/pill-t.svg")
+                    svg: file_resource(#(crate::util::resource_path("pill-t.svg")))
                     color: #fde047
                 }
             }
@@ -285,7 +286,7 @@ script_mod! {
             icon := mod.widgets.Icon{
                 icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
-                    svg: crate_resource("self:resources/pill-e.svg")
+                    svg: file_resource(#(crate::util::resource_path("pill-e.svg")))
                     color: #fca5a5
                 }
             }
@@ -313,7 +314,7 @@ script_mod! {
             icon := mod.widgets.Icon{
                 icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
-                    svg: crate_resource("self:resources/pill-n.svg")
+                    svg: file_resource(#(crate::util::resource_path("pill-n.svg")))
                     color: #cbd5e1
                 }
             }
@@ -341,7 +342,7 @@ script_mod! {
             icon := mod.widgets.Icon{
                 icon_walk: Walk{width: 7, height: 7}
                 draw_icon +: {
-                    svg: crate_resource("self:resources/about.svg")
+                    svg: file_resource(#(crate::util::resource_path("about.svg")))
                     color: #a7f3d0
                 }
             }

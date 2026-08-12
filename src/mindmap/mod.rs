@@ -277,7 +277,7 @@ script_mod! {
             }
             edit_btn := CardIconButton{
                 draw_icon +: {
-                    svg: crate_resource("self:resources/pen.svg")
+                    svg: file_resource(#(crate::util::resource_path("pen.svg")))
                     color: #e6e9f0
                 }
                 icon_walk: Walk{width: 9, height: 9}
@@ -285,7 +285,7 @@ script_mod! {
             done_btn := CardIconButton{
                 visible: false
                 draw_icon +: {
-                    svg: crate_resource("self:resources/book.svg")
+                    svg: file_resource(#(crate::util::resource_path("book.svg")))
                     color: #e6e9f0
                 }
                 icon_walk: Walk{width: 9, height: 9}
@@ -439,7 +439,7 @@ script_mod! {
             color: #ffffff40
         }
         draw_grp_icon +: {
-            svg: crate_resource("self:resources/palette.svg")
+            svg: file_resource(#(crate::util::resource_path("palette.svg")))
         }
         draw_menu_hl +: {
             color: #ffffff1a

@@ -40,19 +40,19 @@ script_mod! {
         // labels drawn scaled over the buttons while the cursor is near.
         // The button widgets below stay untouched (clicks, hover, layout).
         draw_icon_setting +: {
-            svg: crate_resource("self:resources/setting.svg")
+            svg: file_resource(#(crate::util::resource_path("setting.svg")))
             color: #aab0bc
         }
         draw_icon_about +: {
-            svg: crate_resource("self:resources/about.svg")
+            svg: file_resource(#(crate::util::resource_path("about.svg")))
             color: #aab0bc
         }
         draw_icon_debug +: {
-            svg: crate_resource("self:resources/debug.svg")
+            svg: file_resource(#(crate::util::resource_path("debug.svg")))
             color: #aab0bc
         }
         draw_icon_ai +: {
-            svg: crate_resource("self:resources/ai.svg")
+            svg: file_resource(#(crate::util::resource_path("ai.svg")))
             color: #aab0bc
         }
         draw_label_setting +: {
