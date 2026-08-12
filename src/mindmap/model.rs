@@ -890,21 +890,29 @@ pub(crate) fn rename_card_file(base: &Path, old: &Path, new_name: &str) -> Optio
     let from_rel = old.strip_prefix(base).ok()?;
     let to_rel = new_path.strip_prefix(base).ok()?;
     rewrite_node_paths(base, &from_rel.to_string_lossy(), &to_rel.to_string_lossy());
+    rewrite_progress_paths(base, &from_rel.to_string_lossy(), &to_rel.to_string_lossy());
     Some(new_path)
 }
 
-/// Rewrite node `path` references in every map under maps/ so a renamed
-/// card/dir keeps its content wired up. Files match exactly; dirs (trailing
-/// "/") match by prefix. Only touched maps are written back.
+/// Rewrite a rel path for a rename: files match exactly, dirs (trailing "/")
+/// match by prefix. Returns None when `rel` is not affected.
+fn rewrite_rel(from_rel: &str, to_rel: &str, rel: &str) -> Option<String> {
+    if from_rel.ends_with('/') {
+        rel.strip_prefix(from_rel)
+            .map(|rest| format!("{to_rel}{rest}"))
+    } else if rel == from_rel {
+        Some(to_rel.to_string())
+    } else {
+        None
+    }
+}
+
+/// Rewrite node `path` references in every map under maps/ (recursively, so
+/// maps in subdirectories are covered too) so a renamed card/dir keeps its
+/// content wired up. Only touched maps are written back.
 pub(crate) fn rewrite_node_paths(base: &Path, from_rel: &str, to_rel: &str) {
-    let Some(entries) = std::fs::read_dir(base.join("maps")).ok() else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().is_none_or(|x| x != "json") {
-            continue;
-        }
+    for map_rel in map_jsons(base) {
+        let p = base.join(&map_rel);
         let Ok(json) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -913,13 +921,8 @@ pub(crate) fn rewrite_node_paths(base: &Path, from_rel: &str, to_rel: &str) {
         };
         let mut changed = false;
         for n in &mut map.nodes {
-            if from_rel.ends_with('/') {
-                if let Some(rest) = n.path.strip_prefix(from_rel) {
-                    n.path = format!("{to_rel}{rest}");
-                    changed = true;
-                }
-            } else if n.path == from_rel {
-                n.path = to_rel.to_string();
+            if let Some(new_path) = rewrite_rel(from_rel, to_rel, &n.path) {
+                n.path = new_path;
                 changed = true;
             }
         }
@@ -928,6 +931,34 @@ pub(crate) fn rewrite_node_paths(base: &Path, from_rel: &str, to_rel: &str) {
                 std::fs::write(&p, out).ok();
             }
         }
+    }
+}
+
+/// Rewrite progress.json keys (rel card paths -> quiz scores) for a renamed
+/// card/dir, so 已见/未见 mastery survives renames. No-op without a file.
+pub(crate) fn rewrite_progress_paths(base: &Path, from_rel: &str, to_rel: &str) {
+    let path = base.join("progress.json");
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(progress) = serde_json::from_str::<Progress>(&json) else {
+        return;
+    };
+    let mut rewritten = Progress::new();
+    let mut changed = false;
+    for (key, score) in progress {
+        match rewrite_rel(from_rel, to_rel, &key) {
+            Some(new_key) => {
+                rewritten.insert(new_key, score);
+                changed = true;
+            }
+            None => {
+                rewritten.insert(key, score);
+            }
+        }
+    }
+    if changed {
+        save_progress(base, &rewritten);
     }
 }
 
@@ -1159,22 +1190,59 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("maps/untouched.json"), map("Three", "content/b.md")).unwrap();
+        // a map in a subdirectory is covered too (recursive scan)
+        std::fs::create_dir_all(dir.join("maps/nested")).unwrap();
+        std::fs::write(
+            dir.join("maps/nested/deep.json"),
+            map("Four", "content/docs/a.md"),
+        )
+        .unwrap();
         // file rename rewrites exact matches in every map
         rewrite_node_paths(&dir, "content/docs/a.md", "content/docs/b.md");
-        for f in ["maps/map.json", "maps/other.json"] {
+        for f in ["maps/map.json", "maps/other.json", "maps/nested/deep.json"] {
             let json = std::fs::read_to_string(dir.join(f)).unwrap();
             assert!(json.contains("content/docs/b.md"), "{f}: {json}");
             assert!(!json.contains("content/docs/a.md"), "{f}: {json}");
         }
         // dir rename rewrites by prefix
         rewrite_node_paths(&dir, "content/docs/", "content/renamed/");
-        for f in ["maps/map.json", "maps/other.json"] {
+        for f in ["maps/map.json", "maps/other.json", "maps/nested/deep.json"] {
             let json = std::fs::read_to_string(dir.join(f)).unwrap();
             assert!(json.contains("content/renamed/b.md"), "{f}: {json}");
         }
         // non-referencing map is untouched
         let json = std::fs::read_to_string(dir.join("maps/untouched.json")).unwrap();
         assert!(json.contains("content/b.md"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewrite_progress_paths_rewrites_keys() {
+        let dir = std::env::temp_dir().join(format!("ue-progress-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Progress::new();
+        p.insert("cards/docs/a.md".to_string(), 0.9);
+        p.insert("cards/docs/b.md".to_string(), 0.4);
+        p.insert("cards/other.md".to_string(), 0.7);
+        save_progress(&dir, &p);
+        // dir rename rewrites matching keys by prefix, others survive
+        rewrite_progress_paths(&dir, "cards/docs/", "cards/renamed/");
+        let loaded = load_progress(&dir);
+        assert_eq!(loaded.get("cards/renamed/a.md"), Some(&0.9));
+        assert_eq!(loaded.get("cards/renamed/b.md"), Some(&0.4));
+        assert_eq!(loaded.get("cards/other.md"), Some(&0.7));
+        assert!(loaded.get("cards/docs/a.md").is_none());
+        // file rename rewrites the exact key
+        rewrite_progress_paths(&dir, "cards/renamed/a.md", "cards/renamed/top.md");
+        let loaded = load_progress(&dir);
+        assert_eq!(loaded.get("cards/renamed/top.md"), Some(&0.9));
+        assert_eq!(loaded.get("cards/renamed/b.md"), Some(&0.4));
+        // unrelated rename leaves everything untouched
+        rewrite_progress_paths(&dir, "cards/nope/", "cards/x/");
+        assert_eq!(load_progress(&dir).len(), 3);
+        // missing file is a no-op
+        std::fs::remove_file(dir.join("progress.json")).unwrap();
+        rewrite_progress_paths(&dir, "cards/docs/", "cards/y/");
         std::fs::remove_dir_all(&dir).ok();
     }
 

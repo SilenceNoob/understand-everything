@@ -770,6 +770,10 @@ pub struct MindMap {
     menu_plan_row: bool,
     #[rust]
     menu_subcard_row: bool,
+    /// True while the App is planning a learning route: hides the
+    /// 生成学习路线 row to prevent re-entry mid-plan.
+    #[rust]
+    route_planning: bool,
     /// Visible menu row count: 5 on the root goal card (生成学习路线),
     /// 4 everywhere else. Drives geometry and the item4 visibility.
     #[rust]
@@ -2170,6 +2174,8 @@ impl MindMap {
         }
         if renamed {
             self.save_map();
+            // The rename rewrote progress.json keys on disk; follow in memory.
+            self.reload_progress(cx);
         }
         self.redraw(cx);
     }
@@ -2319,9 +2325,12 @@ impl MindMap {
             .unwrap_or_default();
         // 生成学习路线 only for the root goal card, and only while it has no
         // children yet (v1 plans once; a planned map gets no re-plan entry).
-        // 生成子卡片 only while the card body has a selection. Both rows sit
-        // at the end of the menu; item4 = plan row, item5 = subcard row.
-        self.menu_plan_row = data.root == Some(card) && data.nodes[card].children.is_empty();
+        // Hidden too while a route plan is in flight. 生成子卡片 only while
+        // the card body has a selection. Both rows sit at the end of the menu;
+        // item4 = plan row, item5 = subcard row.
+        self.menu_plan_row = data.root == Some(card)
+            && data.nodes[card].children.is_empty()
+            && !self.route_planning;
         self.menu_subcard_row = !self.menu_card_selection.trim().is_empty();
         self.menu_items = 4 + usize::from(self.menu_plan_row) + usize::from(self.menu_subcard_row);
         self.menu_rect = menu_rect(view, abs, self.menu_items);
@@ -2726,6 +2735,18 @@ impl MindMapRef {
     pub fn set_card_title_indicator(&self, cx: &mut Cx, full_path: &std::path::Path, indicator: Option<&str>) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_card_title_indicator(cx, full_path, indicator);
+        }
+    }
+
+    /// Mark whether a learning-route plan is in flight; while true the card
+    /// context menu hides the 生成学习路线 row (set by the App at plan start
+    /// and cleared on completion/abort).
+    pub fn set_route_planning(&self, cx: &mut Cx, on: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.route_planning != on {
+                inner.route_planning = on;
+                inner.redraw(cx);
+            }
         }
     }
 

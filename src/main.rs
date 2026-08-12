@@ -2178,6 +2178,8 @@ impl App {
         self.route_root = root_rel.clone();
         self.route_diag = diagnostics.to_string();
         self.route_retried = false;
+        // Hide the 生成学习路线 menu row while the plan is in flight.
+        self.ui.mind_map(cx, ids!(mindmap)).set_route_planning(cx, true);
         // Visible progress: the root card title flips to 规划中….
         self.set_card_title_indicator(cx, &root_rel, Some("规划中…"));
         let fallback = self.rag_bm25_context(goal);
@@ -2260,6 +2262,7 @@ impl App {
     fn abort_route(&mut self, cx: &mut Cx, msg: String) {
         self.route_wait = None;
         self.route_id = LiveId::empty();
+        self.ui.mind_map(cx, ids!(mindmap)).set_route_planning(cx, false);
         if !self.route_root.is_empty() {
             self.set_card_title_indicator(cx, &self.route_root, None);
         }
@@ -2380,6 +2383,7 @@ impl App {
             plan.cards.iter().filter(|c| c.card_type == "concept").count(),
             plan.cards.iter().filter(|c| c.card_type == "knowledge").count(),
         );
+        self.ui.mind_map(cx, ids!(mindmap)).set_route_planning(cx, false);
         self.show_toast(cx, &summary);
     }
 
@@ -2487,13 +2491,19 @@ impl App {
         }
         if let Some((from, to)) = self.ui.file_panel(cx, ids!(file_panel)).rename_file(actions) {
             if std::fs::rename(base.join(&from), base.join(&to)).is_ok() {
-                // Renaming a card/dir breaks map references; rewrite them.
+                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+                // Renaming a card/dir breaks map references and progress
+                // keys; rewrite both and reload the current map so its
+                // in-memory node paths follow (else the next save_map()
+                // writes the stale paths back).
                 if from.starts_with("cards/") {
                     crate::mindmap::rewrite_node_paths(&base, &from, &to);
+                    crate::mindmap::rewrite_progress_paths(&base, &from, &to);
+                    mind_map.reload_map(cx);
+                    mind_map.reload_progress(cx);
                 }
                 // Renaming the current map: keep showing it under the new
                 // name (content is unchanged, the saved view survives).
-                let mind_map = self.ui.mind_map(cx, ids!(mindmap));
                 if mind_map.current_map_file().as_deref() == Some(from.as_str()) {
                     self.open_map(cx, &to);
                 }
