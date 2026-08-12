@@ -2457,8 +2457,6 @@ impl App {
         if let Some(map_file) = self.ui.file_panel(cx, ids!(file_panel)).create_map(actions) {
             std::fs::write(base.join(&map_file), crate::mindmap::new_map_json()).ok();
             self.open_map(cx, &map_file);
-            // A fresh map starts from the welcome page: ask what to learn.
-            self.show_startup(cx);
         }
         if let Some(dir) = self.ui.file_panel(cx, ids!(file_panel)).create_dir(actions) {
             std::fs::create_dir(base.join(&dir)).ok();
@@ -2474,6 +2472,7 @@ impl App {
                     // Drop ghost cards from the in-memory map so a later
                     // save can't resurrect the references.
                     mind_map.reload_map(cx);
+                    self.sync_startup(cx);
                 }
                 // The current map may live inside the deleted dir.
                 if mind_map
@@ -2580,6 +2579,7 @@ impl App {
             // later save can't resurrect it; RAG and the file panel follow
             // via their own mtime/fingerprint watchers.
             self.ui.mind_map(cx, ids!(mindmap)).reload_map(cx);
+            self.sync_startup(cx);
         }
     }
 
@@ -2653,6 +2653,17 @@ impl App {
         }
         self.map_opened = true;
         self.sync_title(cx);
+        self.sync_startup(cx);
+    }
+
+    /// Show the startup page iff the current map has no root card; close it
+    /// otherwise.
+    fn sync_startup(&mut self, cx: &mut Cx) {
+        if self.ui.mind_map(cx, ids!(mindmap)).has_root() {
+            self.close_startup(cx);
+        } else {
+            self.show_startup(cx);
+        }
     }
 
     fn sync_title(&mut self, cx: &mut Cx) {
@@ -3825,7 +3836,6 @@ impl AppMain for App {
                 let _ = std::fs::create_dir_all(base.join("maps"));
                 std::fs::write(base.join(&map), mindmap::new_map_json()).ok();
                 self.open_map(cx, &map);
-                self.show_startup(cx);
             }
         }
         if let Some(timer) = self.rag_timer {

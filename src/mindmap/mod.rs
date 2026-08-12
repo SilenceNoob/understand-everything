@@ -2767,6 +2767,18 @@ impl MindMapRef {
         self.borrow().map(|w| w.card_rel_paths()).unwrap_or_default()
     }
 
+    /// Whether the current map has a live root card (node present, body file
+    /// intact). A map whose root card body was deleted is treated as rootless.
+    pub fn has_root(&self) -> bool {
+        self.borrow()
+            .map(|w| {
+                w.data.as_ref().is_some_and(|d| {
+                    d.root.is_some_and(|i| d.nodes.get(i).is_some_and(|n| n.path.exists()))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Reload the current map from disk (no same-path early return); used
     /// after external edits like card-dir deletion, so ghost cards don't get
     /// written back on the next save.
