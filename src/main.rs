@@ -43,8 +43,31 @@ script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
 
-    let NewChatBtn = mod.widgets.ButtonFlatIcon{
-        padding: Inset{left: 3, right: 3, top: 3, bottom: 3}
+    // Feature-task notifications (route/subcard/generation results): a
+    // corner toast that never touches the AI-panel conversation.
+    let ToastContent = mod.widgets.RoundedView{
+        width: 380
+        height: Fit
+        flow: Down
+        padding: Inset{left: 14, right: 14, top: 10, bottom: 10}
+        margin: Inset{right: 16, top: 16}
+        show_bg: true
+        draw_bg +: {
+            color: #1f2430f2
+            border_radius: 8.0
+            border_size: 1.0
+            border_color: #ffffff14
+        }
+        label := mod.widgets.Label{
+            width: Fill
+            height: Fit
+            text: ""
+            draw_text.text_style: theme.font_regular{font_size: 12.0}
+            draw_text.color: #e6e9f0
+        }
+    }
+
+    let NewChatBtn = mod.widgets.ButtonFlatIcon{        padding: Inset{left: 3, right: 3, top: 3, bottom: 3}
         margin: 0
         draw_bg +: {
             color: #1f2430
@@ -989,6 +1012,9 @@ script_mod! {
                     }
                     file_panel := mod.widgets.FilePanel{}
                     refs_panel := mod.widgets.RefsPanel{}
+                    toast := mod.widgets.PopupNotification{
+                        content := ToastContent{}
+                    }
                 }
             }
         }
@@ -1069,6 +1095,9 @@ const RAG_RESYNC_SECS: u64 = 5;
 /// CJK-weighted tokens, not yet known at the context gauge.
 const RAG_CONTEXT_SLACK: usize = 1100;
 
+/// How long a feature toast stays visible before auto-closing.
+const TOAST_DURATION: Duration = Duration::from_secs(5);
+
 /// Lazy lookup of a child of the ai_panel content by name; a failed lookup
 /// is never cached, so it retries.
 fn cached_ai_child(cx: &Cx, ui: &WidgetRef, cache: &mut Option<WidgetRef>, id: LiveId) -> WidgetRef {
@@ -1123,8 +1152,6 @@ pub struct App {
     #[rust]
     route_buf: String,
     #[rust]
-    route_think: String,
-    #[rust]
     route_parser: SseParser,
     /// True after one automatic retry of an unparseable route plan response
     /// (thinking models occasionally emit malformed JSON).
@@ -1152,6 +1179,9 @@ pub struct App {
     /// Drives status label refresh, periodic re-sync and retrieval polling.
     #[rust]
     rag_timer: Option<Timer>,
+    /// Auto-close time of the feature toast (None = toast hidden).
+    #[rust]
+    toast_until: Option<Instant>,
     /// Deferred chat send waiting on the background retrieval.
     #[rust]
     rag_wait: Option<RagWait>,
@@ -1287,8 +1317,7 @@ impl App {
     }
 
     /// Descendant of a popup by live-child path (content → panel → …).
-    fn popup_child(&self, popup_id: LiveId, path: &[LiveId]) -> WidgetRef {
-        let mut cur = self.popup_widget(popup_id);
+    fn popup_child(&self, popup_id: LiveId, path: &[LiveId]) -> WidgetRef {        let mut cur = self.popup_widget(popup_id);
         for &seg in path {
             cur = child_by_name(&cur, seg);
             if cur.is_empty() {
@@ -1296,6 +1325,26 @@ impl App {
             }
         }
         cur
+    }
+
+    /// The corner toast widget (feature-task notifications), via the body's
+    /// live children like the popups.
+    fn toast_widget(&self) -> WidgetRef {
+        let main_window = child_by_name(&self.ui, live_id!(main_window));
+        let body = child_by_name(&main_window, live_id!(body));
+        child_by_name(&body, live_id!(toast))
+    }
+
+    /// Show a 5-second corner toast; replaces any toast still showing.
+    fn show_toast(&mut self, cx: &mut Cx, msg: &str) {
+        let toast = self.toast_widget();
+        let content = child_by_name(&toast, live_id!(content));
+        let label = child_by_name(&content, live_id!(label));
+        if !label.is_empty() {
+            label.set_text(cx, msg);
+        }
+        toast.as_popup_notification().open(cx);
+        self.toast_until = Some(Instant::now() + TOAST_DURATION);
     }
 
     /// Setting/About popup close buttons.
@@ -1700,8 +1749,7 @@ impl App {
         }
         if self.ai_config.api_key.trim().is_empty() {
             self.close_startup(cx);
-            self.push_chat_msg(cx, "assistant", "请先在 Setting 中配置 API Key 再生成学习路线");
-            self.ensure_ai_panel_open(cx);
+            self.show_toast(cx, "请先在 Setting 中配置 API Key 再生成学习路线");
             return;
         }
         self.reset_diag();
@@ -2094,8 +2142,7 @@ impl App {
             return;
         }
         if self.ai_config.api_key.trim().is_empty() {
-            self.push_chat_msg(cx, "assistant", "请先在 Setting 中配置 API Key 再生成学习路线");
-            self.ensure_ai_panel_open(cx);
+            self.show_toast(cx, "请先在 Setting 中配置 API Key 再生成学习路线");
             return;
         }
         let base = crate::util::app_base_dir();
@@ -2105,12 +2152,7 @@ impl App {
         };
         let existing = mind_map.card_rel_paths();
         if existing.len() > 1 {
-            self.push_chat_msg(
-                cx,
-                "assistant",
-                "当前地图已有学习路线卡片，暂不支持重新规划。",
-            );
-            self.ensure_ai_panel_open(cx);
+            self.show_toast(cx, "当前地图已有学习路线卡片，暂不支持重新规划。");
             return;
         }
         // Root card: reuse the existing one (menu path) or create it fresh.
@@ -2136,16 +2178,8 @@ impl App {
         self.route_root = root_rel.clone();
         self.route_diag = diagnostics.to_string();
         self.route_retried = false;
+        // Visible progress: the root card title flips to 规划中….
         self.set_card_title_indicator(cx, &root_rel, Some("规划中…"));
-        // Visible progress: the root card title flips to 规划中… and the AI
-        // panel opens with a status line (it also hosts the success/failure
-        // messages later, so the whole flow is one conversation).
-        self.push_chat_msg(
-            cx,
-            "assistant",
-            &format!("正在为「{goal}」规划学习路线（诊断 + 路线生成约需 1 分钟）…"),
-        );
-        self.ensure_ai_panel_open(cx);
         let fallback = self.rag_bm25_context(goal);
         let upgradeable = self.rag.as_ref().is_some_and(|r| {
             r.models().is_some_and(|m| m.embedding_ready()) && r.has_chunks_for(&map_file)
@@ -2210,7 +2244,6 @@ impl App {
     fn send_route_request(&mut self, cx: &mut Cx, goal: &str, diagnostics: &str, context: &str) {
         self.route_id = LiveId::unique();
         self.route_buf.clear();
-        self.route_think.clear();
         self.route_parser = ai::SseParser::new();
         self.route_context = context.to_string();
         let (system, user) = crate::gen::route_plan_messages(goal, context, diagnostics);
@@ -2223,54 +2256,19 @@ impl App {
         );
     }
 
-    /// Live progress for route planning: a transient chat_extra assistant
-    /// bubble updated per stream chunk, removed when the request ends. The
-    /// thinking phase streams reasoning_content only, so show thinking chars
-    /// until content starts (else the bubble sits at 0 字 for tens of seconds).
-    fn update_route_progress(&mut self, cx: &mut Cx) {
-        let text = if self.route_buf.is_empty() {
-            format!(
-                "正在规划学习路线…思考中（已生成 {} 字思考）",
-                self.route_think.chars().count()
-            )
-        } else {
-            format!(
-                "正在规划学习路线…生成中（已接收 {} 字）",
-                self.route_buf.chars().count()
-            )
-        };
-        if let Some((_, c)) = self
-            .chat_extra
-            .iter_mut()
-            .rev()
-            .find(|(_, c)| c.starts_with("正在规划学习路线"))
-        {
-            *c = text;
-        } else {
-            self.chat_extra.push(("assistant".to_string(), text));
-        }
-        self.render_msgs(cx);
-    }
-
-    fn clear_route_progress(&mut self) {
-        self.chat_extra.retain(|(_, c)| !c.starts_with("正在规划学习路线"));
-    }
-
-    /// Abort route planning and surface `msg` in the AI panel.
+    /// Abort route planning and surface `msg` as a toast.
     fn abort_route(&mut self, cx: &mut Cx, msg: String) {
         self.route_wait = None;
         self.route_id = LiveId::empty();
         if !self.route_root.is_empty() {
             self.set_card_title_indicator(cx, &self.route_root, None);
         }
-        self.push_chat_msg(cx, "assistant", &msg);
-        self.ensure_ai_panel_open(cx);
+        self.show_toast(cx, &msg);
     }
 
     /// Materialize a parsed route plan: write the card files, rebuild the map
-    /// tree under the root goal card, and reload the canvas. `think` is the
-    /// streamed reasoning chain, attached to the success message when present.
-    fn apply_route_plan(&mut self, cx: &mut Cx, content: String, think: String) {
+    /// tree under the root goal card, and reload the canvas.
+    fn apply_route_plan(&mut self, cx: &mut Cx, content: String) {
         let mut plan = match crate::gen::parse_route_plan(&content) {
             Ok(p) => p,
             Err(e) => {
@@ -2377,18 +2375,12 @@ impl App {
             rag.set_map(&map_file);
         }
         let summary = format!(
-            "学习路线已生成：{} 张卡片（概念卡 {} 张，知识卡 {} 张）。\n\
-             每张卡片右键「生成」学习材料、「测试」验证掌握程度；根卡片记录了学习目标的输入输出。",
+            "学习路线已生成：{} 张卡片（概念卡 {} 张，知识卡 {} 张）。",
             plan.cards.len(),
             plan.cards.iter().filter(|c| c.card_type == "concept").count(),
             plan.cards.iter().filter(|c| c.card_type == "knowledge").count(),
         );
-        if think.is_empty() {
-            self.push_chat_msg(cx, "assistant", &summary);
-        } else {
-            self.push_chat_msg_thinking(cx, &summary, &think);
-        }
-        self.ensure_ai_panel_open(cx);
+        self.show_toast(cx, &summary);
     }
 
     /// Poll deferred route-plan retrieval and promote it to a real request.
@@ -3236,12 +3228,11 @@ impl App {
         );
     }
 
-    /// Abort the current generation queue and surface `msg` in the AI panel.
+    /// Abort the current generation queue and surface `msg` as a toast.
     fn abort_generation(&mut self, cx: &mut Cx, msg: String) {
         self.gen_sections.clear();
         self.set_card_title_indicator(cx, &self.gen_path, None);
-        self.push_chat_msg(cx, "assistant", &msg);
-        self.ensure_ai_panel_open(cx);
+        self.show_toast(cx, &msg);
     }
 
     fn handle_gen_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
@@ -3290,13 +3281,6 @@ impl App {
         mind_map.set_card_title_indicator(cx, &full_path, indicator);
     }
 
-    fn ensure_ai_panel_open(&mut self, cx: &mut Cx) {
-        let panel = self.ui.float_panel(cx, ids!(ai_panel));
-        if !panel.opened() {
-            self.toggle_ai_panel(cx);
-        }
-    }
-
     /// 划选生成子卡片, phase 1: the model judges type/title/input/output
     /// (a small JSON that cannot be truncated). The body is filled in phase 2
     /// by the existing per-section generation pipeline.
@@ -3314,8 +3298,6 @@ impl App {
         let (system, user) =
             crate::gen::subcard_judge_messages(&parent_title, &parent_body, selected, &ctx);
         self.subcard_parent = parent.to_string();
-        self.push_chat_msg(cx, "assistant", "正在为划选内容判断类型并生成子卡片…");
-        self.ensure_ai_panel_open(cx);
         self.subcard_id = LiveId::unique();
         ai::chat_completions(
             cx,
@@ -3333,7 +3315,7 @@ impl App {
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
-            self.push_chat_msg(cx, "assistant", &format!("生成子卡片失败 ({}): {}", response.status_code, detail));
+            self.show_toast(cx, &format!("生成子卡片失败 ({}): {}", response.status_code, detail));
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
@@ -3341,11 +3323,7 @@ impl App {
             Ok(v) => v,
             Err(e) => {
                 let preview = ai::response_debug_preview(response);
-                self.push_chat_msg(
-                    cx,
-                    "assistant",
-                    &format!("生成子卡片失败：{e}（{preview}）"),
-                );
+                self.show_toast(cx, &format!("生成子卡片失败：{e}（{preview}）"));
                 return;
             }
         };
@@ -3418,19 +3396,15 @@ impl App {
                     crate::gen::CardType::Concept => "概念",
                     crate::gen::CardType::Knowledge => "知识",
                 };
-                self.push_chat_msg(
+                self.show_toast(
                     cx,
-                    "assistant",
-                    &format!(
-                        "已生成{kind}子卡片「{}」，已挂到父卡片下，开始逐板块生成学习材料…",
-                        judge.title
-                    ),
+                    &format!("已生成{kind}子卡片「{}」，已挂到父卡片下，开始逐板块生成学习材料…", judge.title),
                 );
                 // Phase 2: the per-section pipeline fills the card body
                 // (each section in its own request — immune to truncation).
                 self.start_generation(cx, &rel, crate::gen::GenSection::All);
             }
-            None => self.push_chat_msg(cx, "assistant", "生成子卡片失败：无法创建卡片文件。"),
+            None => self.show_toast(cx, "生成子卡片失败：无法创建卡片文件。"),
         }
     }
 
@@ -3675,13 +3649,11 @@ impl MatchEvent for App {
         }
         if request_id == self.subcard_id && self.subcard_id != LiveId::empty() {
             self.subcard_id = LiveId::empty();
-            self.push_chat_msg(cx, "assistant", &format!("生成子卡片失败：{}", err.message));
+            self.show_toast(cx, &format!("生成子卡片失败：{}", err.message));
             return;
         }
         if request_id == self.route_id && self.route_id != LiveId::empty() {
             self.route_buf.clear();
-            self.route_think.clear();
-            self.clear_route_progress();
             self.abort_route(cx, format!("路线规划请求失败：{}", err.message));
             return;
         }
@@ -3713,14 +3685,10 @@ impl MatchEvent for App {
     fn handle_http_stream(&mut self, cx: &mut Cx, request_id: LiveId, data: &HttpResponse) {
         if request_id == self.route_id && self.route_id != LiveId::empty() {
             if let Some(bytes) = data.body() {
-                let (content, thinking) = self.route_parser.feed(bytes);
+                let (content, _thinking) = self.route_parser.feed(bytes);
                 for delta in content {
                     self.route_buf.push_str(&delta);
                 }
-                for delta in thinking {
-                    self.route_think.push_str(&delta);
-                }
-                self.update_route_progress(cx);
             }
             return;
         }
@@ -3741,16 +3709,14 @@ impl MatchEvent for App {
 
     fn handle_http_stream_complete(&mut self, cx: &mut Cx, request_id: LiveId, data: &HttpResponse) {
         if request_id == self.route_id && self.route_id != LiveId::empty() {
-            self.clear_route_progress();
             self.route_id = LiveId::empty();
             // macOS 的 makepad 流式后端把 status_code 硬编码为 0，成功流按
             // "status 0 + [DONE]" 判定（同 chat 的处理）。
             let ok = data.status_code == 200
                 || (data.status_code == 0 && self.route_parser.raw().contains("[DONE]"));
             let buf = std::mem::take(&mut self.route_buf);
-            let think = std::mem::take(&mut self.route_think);
             if ok {
-                self.apply_route_plan(cx, buf, think);
+                self.apply_route_plan(cx, buf);
             } else {
                 // Non-200 stream: the body was raw JSON (not SSE), recovered
                 // from the parser's raw buffer.
@@ -3841,6 +3807,11 @@ impl AppMain for App {
         if let Some(timer) = self.rag_timer {
             if timer.is_event(event).is_some() {
                 self.handle_rag_tick(cx);
+                // Auto-close an expired feature toast (same 0.25s tick).
+                if self.toast_until.is_some_and(|t| Instant::now() >= t) {
+                    self.toast_until = None;
+                    self.toast_widget().as_popup_notification().close(cx);
+                }
             }
         }
         self.match_event(cx, event);
