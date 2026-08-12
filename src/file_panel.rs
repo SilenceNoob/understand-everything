@@ -381,8 +381,9 @@ fn scan_dir(base: &std::path::Path, rel: &str, ext: Option<&str>) -> Vec<String>
         .map(|it| {
             it.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.path().is_dir()
-                        || ext.is_none_or(|x| e.path().extension().is_some_and(|e| e == x))
+                    !e.file_name().to_string_lossy().starts_with('.')
+                        && (e.path().is_dir()
+                            || ext.is_none_or(|x| e.path().extension().is_some_and(|e| e == x)))
                 })
                 .map(|e| {
                     let child = e.path();
@@ -434,6 +435,9 @@ pub(crate) fn all_map_files(base: &std::path::Path) -> Vec<String> {
     while let Some(dir) = stack.pop() {
         if let Ok(it) = std::fs::read_dir(base.join(&dir)) {
             for e in it.flatten() {
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 let rel = e
                     .path()
                     .strip_prefix(base)

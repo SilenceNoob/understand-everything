@@ -1270,10 +1270,22 @@ pub struct App {
     /// In-flight quiz grading request.
     #[rust]
     grade_id: LiveId,
+    /// In-flight map-naming request (startup goal input; the temp map is
+    /// renamed to the AI's answer when it lands).
+    #[rust]
+    map_name_id: LiveId,
+    /// The goal the pending naming request was fired for (fallback name).
+    #[rust]
+    map_name_goal: String,
     /// Card awaiting delete confirmation (rel path), set while the confirm
     /// popup is open.
     #[rust]
     pending_delete_card: Option<String>,
+}
+
+/// True for the launch placeholder map (maps/.startup-*.json).
+fn is_temp_map(map_file: &str) -> bool {
+    map_file.starts_with("maps/.startup-")
 }
 
 /// Format a token count compactly: 860, 2.4K, 1M.
@@ -1754,6 +1766,15 @@ impl App {
         }
         self.reset_diag();
         self.diag_goal = goal.trim().to_string();
+        // The user has committed to a goal: the launch temp map stops being
+        // temporary. Ask the model for a name; the temp file is renamed when
+        // the reply lands (goal text as fallback).
+        if is_temp_map(&self.ui.mind_map(cx, ids!(mindmap)).current_map_file().unwrap_or_default()) {
+            self.map_name_goal = self.diag_goal.clone();
+            self.map_name_id = LiveId::unique();
+            let (system, user) = crate::gen::map_name_messages(&self.diag_goal);
+            ai::chat_completions(cx, self.map_name_id, &self.ai_config, &[("system".to_string(), system), ("user".to_string(), user)], 30);
+        }
         // Prefetch the route-plan retrieval now: the query is just the goal,
         // so by the time the interview ends the result is ready and the
         // route request fires immediately. Only when the current map's index
@@ -2642,7 +2663,79 @@ impl App {
         cfg
     }
 
+    /// The naming request landed: rename the launch temp map to the model's
+    /// name (goal text on failure/error — the map must become permanent the
+    /// moment the user committed to a goal).
+    fn handle_map_name_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+        let ai_name = if response.status_code == 200 {
+            ai::response_content(response).map(|s| s.trim().to_string())
+        } else {
+            None
+        };
+        self.apply_map_name(cx, ai_name);
+    }
+
+    fn handle_map_name_error(&mut self, cx: &mut Cx) {
+        self.apply_map_name(cx, None);
+    }
+
+    /// Rename the current temp map to `ai_name` (or a goal-derived fallback),
+    /// unless the user already switched away (the temp file is then gone).
+    fn apply_map_name(&mut self, cx: &mut Cx, ai_name: Option<String>) {
+        self.map_name_id = LiveId::empty();
+        let goal = std::mem::take(&mut self.map_name_goal);
+        let raw = match ai_name.filter(|s| !s.trim().is_empty()) {
+            Some(s) => s,
+            None => goal.chars().take(20).collect::<String>(),
+        };
+        let safe = crate::file_panel::normalize_name(&raw, None)
+            .map(|s| s.split('.').next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+        if safe.is_empty() {
+            return;
+        }
+        let Some(cur) = self.ui.mind_map(cx, ids!(mindmap)).current_map_file() else {
+            return;
+        };
+        if !is_temp_map(&cur) {
+            return;
+        }
+        let base = crate::util::app_base_dir();
+        for n in 0.. {
+            let target = if n == 0 {
+                format!("maps/{safe}.json")
+            } else {
+                format!("maps/{safe}-{n}.json")
+            };
+            if !base.join(&target).exists() {
+                if std::fs::rename(base.join(&cur), base.join(&target)).is_ok() {
+                    self.switch_map_state(cx, &target);
+                    self.sync_title(cx);
+                }
+                return;
+            }
+        }
+    }
+
     fn open_map(&mut self, cx: &mut Cx, map_file: &str) {
+        // The launch temp map dies the moment the user switches away; the
+        // startup goal input renames it into a permanent map instead.
+        let current = self.ui.mind_map(cx, ids!(mindmap)).current_map_file();
+        if let Some(cur) = current {
+            if is_temp_map(&cur) && cur != map_file {
+                std::fs::remove_file(crate::util::app_base_dir().join(&cur)).ok();
+            }
+        }
+        self.switch_map_state(cx, map_file);
+        self.map_opened = true;
+        self.sync_title(cx);
+        self.sync_startup(cx);
+    }
+
+    /// Point the mindmap, file/refs panels and RAG at `map_file` without
+    /// open_map's side effects (the rename path must not re-sync the startup
+    /// popup, which would reset an in-flight diagnostic back to the goal).
+    fn switch_map_state(&mut self, cx: &mut Cx, map_file: &str) {
         self.ui.mind_map(cx, ids!(mindmap)).switch_map(cx, map_file);
         self.ui
             .file_panel(cx, ids!(file_panel))
@@ -2653,9 +2746,6 @@ impl App {
         if let Some(rag) = &self.rag {
             rag.set_map(map_file);
         }
-        self.map_opened = true;
-        self.sync_title(cx);
-        self.sync_startup(cx);
     }
 
     /// Show the startup page iff the current map has no root card; close it
@@ -2673,7 +2763,13 @@ impl App {
             self.ui
                 .mind_map(cx, ids!(mindmap))
                 .current_map_file()
-                .map(|f| file_panel::display_name(&f))
+                .map(|f| {
+                    if is_temp_map(&f) {
+                        String::new()
+                    } else {
+                        file_panel::display_name(&f)
+                    }
+                })
                 .unwrap_or_else(|| "Understand Everything".to_string())
         } else {
             "Understand Everything".to_string()
@@ -3635,6 +3731,10 @@ impl MatchEvent for App {
             self.handle_grade_response(cx, response);
             return;
         }
+        if request_id == self.map_name_id && self.map_name_id != LiveId::empty() {
+            self.handle_map_name_response(cx, response);
+            return;
+        }
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
@@ -3682,6 +3782,10 @@ impl MatchEvent for App {
             self.grade_id = LiveId::empty();
             self.open_quiz_popup(cx);
             self.quiz_panel().grade_failed(cx, &format!("评分请求失败：{}", err.message));
+            return;
+        }
+        if request_id == self.map_name_id && self.map_name_id != LiveId::empty() {
+            self.handle_map_name_error(cx);
             return;
         }
         if request_id == self.chat_id && self.chat_pending {
@@ -3804,14 +3908,34 @@ impl AppMain for App {
                     }
                 }
             }
-            // First launch with no maps: create the default map for the user
-            // and open the welcome page.
+            // Every launch: start from a fresh temporary map with the startup
+            // page. Old temp maps (from sessions that ended without a goal)
+            // are swept first.
             let base = crate::util::app_base_dir();
+            if !self.map_opened {
+                let maps = base.join("maps");
+                let _ = std::fs::create_dir_all(&maps);
+                if let Ok(it) = std::fs::read_dir(&maps) {
+                    for e in it.flatten() {
+                        let name = e.file_name();
+                        if name.to_string_lossy().starts_with(".startup-") {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let temp = format!("maps/.startup-{stamp}.json");
+                std::fs::write(base.join(&temp), mindmap::new_map_json()).ok();
+                self.open_map(cx, &temp);
+            }
+            // First launch with no maps: also keep a real map around so the
+            // no-maps-left fallback (next_map) has something to open.
             if crate::file_panel::all_map_files(&base).is_empty() {
                 let map = mindmap::MindMapData::DEFAULT_MAP.to_string();
-                let _ = std::fs::create_dir_all(base.join("maps"));
                 std::fs::write(base.join(&map), mindmap::new_map_json()).ok();
-                self.open_map(cx, &map);
             }
         }
         if let Some(timer) = self.rag_timer {

@@ -679,6 +679,17 @@ pub fn route_plan_messages(goal: &str, context: &str, diagnostics: &str) -> (Str
     (system, user)
 }
 
+/// Build the messages that name a brand-new map from the user's learning
+/// goal. The model must reply with a short filename only (no extension, no
+/// path separators); the caller sanitizes and unique-ifies it.
+pub fn map_name_messages(goal: &str) -> (String, String) {
+    let system = "你是一个命名助手。根据学习目标给出一个简短、贴切的中文文件名（2~8 个字，不含扩展名，\
+        不含 / \\ 等路径分隔符和标点）。只输出名字本身，不要任何解释、引号或换行。"
+        .to_string();
+    let user = format!("学习目标：{goal}\n\n请给出这个学习路线的文件名：");
+    (system, user)
+}
+
 /// One round of the adaptive diagnostic interview: a question probing one
 /// concept's 判别模型 or one knowledge's 联结模型.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
