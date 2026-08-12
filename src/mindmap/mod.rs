@@ -318,6 +318,9 @@ script_mod! {
                     // Body text is selectable (划选生成子卡片); card dragging
                     // therefore starts from the header only (handle_finger_down).
                     selectable: true
+                    // Symmetric left/right breathing room; top/bottom keep
+                    // the type-default 3px.
+                    padding: Inset{left: 12, right: 12, top: 3, bottom: 3}
                 }
             }
             edit_view := mod.widgets.View{
