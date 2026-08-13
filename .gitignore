@@ -9,3 +9,7 @@
 /models/
 /.rag_cache/
 /docs/
+.reasonix/
+.package-lock.json
+.package.json
+reasonix.toml
