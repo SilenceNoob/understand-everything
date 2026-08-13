@@ -32,7 +32,6 @@ mod quiz_panel;
 mod rag;
 mod refs_panel;
 mod slide_panel;
-mod update;
 mod util;
 
 use crate::file_panel::FilePanelWidgetRefExt;
@@ -184,9 +183,15 @@ script_mod! {
                 #000000cc
             }
         }
-        panel := mod.widgets.RoundedView{
-            width: 420
-            height: Fit
+        panel := PanelInner{}
+    }
+
+    // Shared popup panel chrome (title/body_box/settings_form/close), sized
+    // per instance: Setting keeps the default 420, About overrides to a wide
+    // 760×480 rectangle.
+    let PanelInner = mod.widgets.RoundedView{
+        width: 420
+        height: Fit
             flow: Down
             padding: 20
             spacing: 12
@@ -212,10 +217,6 @@ script_mod! {
                     text: ""
                     draw_text.text_style.font_size: 14.0
                     draw_text.color: #aab0bc
-                }
-                update_btn := mod.widgets.ButtonFlat{
-                    width: Fit
-                    text: "检查更新"
                 }
             }
             // AI settings form (visible only for the Setting popup).
@@ -318,6 +319,22 @@ script_mod! {
                 width: Fit
                 text: "关闭"
             }
+        }
+
+    // About 专用内容：横置大矩形（760×480），节点 id 与共享模板一致
+    // （content/panel/title、body_box/body）。
+    let AboutPopupContent = mod.widgets.View{
+        width: Fill
+        height: Fill
+        flow: Overlay
+        align: Align{x: 0.5, y: 0.5}
+        draw_bg +: {
+            pixel: fn(){
+                #000000cc
+            }
+        }
+        panel := PanelInner{
+            width: 760
         }
     }
 
@@ -529,7 +546,7 @@ script_mod! {
                         content := PopupPanelContent{}
                     }
                     about_popup := mod.widgets.PopupPanel{
-                        content := PopupPanelContent{}
+                        content := AboutPopupContent{}
                     }
                     startup_popup := mod.widgets.PopupPanel{
                         content := StartupPageContent{}
@@ -1127,23 +1144,6 @@ pub struct App {
     /// Request id of the in-flight test request.
     #[rust]
     test_id: LiveId,
-    /// Update check/download state for the About panel's 检查更新 button.
-    #[rust]
-    update_state: u8, // 0 idle, 1 checking, 2 ready to download, 3 downloading, 4 applied
-    /// Latest release info (set once a check found a newer version).
-    #[rust]
-    update_info: Option<crate::update::UpdateInfo>,
-    /// Request id of the in-flight update check.
-    #[rust]
-    update_id: LiveId,
-    /// Request id of the in-flight update download.
-    #[rust]
-    update_dl_id: LiveId,
-    /// Redirect hops left for the in-flight update download (GitHub asset
-    /// URLs redirect to objects.githubusercontent.com; makepad's http client
-    /// does not follow them itself).
-    #[rust]
-    update_dl_hops: u8,
     /// Chat history as messages, newest last. Bounded by the context window
     /// (see CONTEXT_WINDOW), not by a fixed message count.
     #[rust]
@@ -1504,7 +1504,7 @@ impl App {
                 .set_text(
                     cx,
                     &format!(
-                        "Understand Everything v{}\n把知识库渲染成可缩放的思维导图。",
+                        "Understand Everything v{}\n基于「渐构」学习观（参考 modevol.com《渐构：世界模型》）设计的桌面学习工具：把知识建构为判别模型（概念卡）与联结模型（知识卡），在可缩放思维导图上展开——路线规划先判别后联结、按模型类型出题测验、明确输入输出空间、已见/未见掌握状态标注。Rust + Makepad。",
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
@@ -1537,133 +1537,6 @@ impl App {
             self.popup_widget(live_id!(setting_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(about_popup)).as_popup_panel().hide(cx);
             self.popup_widget(live_id!(startup_popup)).as_popup_panel().hide(cx);
-        }
-    }
-
-    /// About panel 检查更新 button: start a check, or download the newer
-    /// binary once one was found.
-    fn handle_update_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        let btn = self.popup_child(
-            live_id!(about_popup),
-            &[
-                live_id!(content),
-                live_id!(panel),
-                live_id!(body_box),
-                live_id!(update_btn),
-            ],
-        );
-        if !btn.as_button().clicked(actions) {
-            return;
-        }
-        match self.update_state {
-            // Idle or failed after an error: re-run the check.
-            0 | 5 => {
-                self.update_state = 1;
-                self.update_id = LiveId::unique();
-                self.update_body(cx, "检查中…");
-                update::check_update(cx, self.update_id);
-            }
-            // A newer version is known: download and apply it.
-            2 => {
-                let Some(info) = &self.update_info else {
-                    return;
-                };
-                let Some(url) = info.asset_url.clone() else {
-                    self.update_body(cx, "该版本没有当前平台的安装包");
-                    return;
-                };
-                self.update_state = 3;
-                self.update_dl_id = LiveId::unique();
-                self.update_dl_hops = 3;
-                self.update_body(cx, "下载中…（安装包较大，请稍候）");
-                update::download(cx, self.update_dl_id, &url);
-            }
-            _ => {}
-        }
-    }
-
-    fn update_body(&mut self, cx: &mut Cx, msg: &str) {
-        self.popup_child(
-            live_id!(about_popup),
-            &[
-                live_id!(content),
-                live_id!(panel),
-                live_id!(body_box),
-                live_id!(body),
-            ],
-        )
-        .set_text(cx, msg);
-    }
-
-    fn handle_update_check_response(&mut self, cx: &mut Cx, status: u16, body: &str) {
-        if status != 200 {
-            self.update_state = 5;
-            self.update_body(cx, &format!("检查更新失败 ({status})，请检查网络后重试"));
-            return;
-        }
-        match update::parse_latest(body, env!("CARGO_PKG_VERSION")) {
-            Some(info) if info.newer => {
-                let tag = info.tag.clone();
-                self.update_info = Some(info);
-                self.update_state = 2;
-                self.update_body(cx, &format!("发现新版本 {tag}"));
-            }
-            Some(_) => {
-                self.update_state = 0;
-                self.update_body(
-                    cx,
-                    &format!("已是最新版本 v{}", env!("CARGO_PKG_VERSION")),
-                );
-            }
-            None => {
-                self.update_state = 5;
-                self.update_body(cx, "检查更新失败：无法解析响应");
-            }
-        }
-    }
-
-    fn handle_update_download_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
-        let status = response.status_code;
-        // GitHub asset URLs redirect (302) to objects.githubusercontent.com;
-        // makepad's http client never follows — re-issue the request at the
-        // Location header, up to 3 hops.
-        if matches!(status, 301 | 302 | 303 | 307 | 308) && self.update_dl_hops > 0 {
-            if let Some(url) = response
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                .and_then(|(_, v)| v.first().cloned())
-            {
-                self.update_dl_hops -= 1;
-                self.update_body(cx, "下载中…（安装包较大，请稍候）");
-                update::download(cx, self.update_dl_id, &url);
-                return;
-            }
-        }
-        let body = response.body().map(|b| b.to_vec()).unwrap_or_default();
-        if status != 200 || body.is_empty() {
-            self.update_state = 5;
-            self.update_body(cx, &format!("下载失败 ({status})，请重试"));
-            return;
-        }
-        let dir = crate::util::data_dir().join("update");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(update::asset_name());
-        if std::fs::write(&path, body).is_err() {
-            self.update_state = 5;
-            self.update_body(cx, "下载失败：无法写入文件");
-            return;
-        }
-        match update::apply(&path) {
-            Ok(_) => {
-                self.update_state = 4;
-                self.update_body(cx, "更新完成，正在重启…");
-                cx.quit();
-            }
-            Err(e) => {
-                self.update_state = 5;
-                self.update_body(cx, &format!("更新失败：{e}"));
-            }
         }
     }
 
@@ -3859,15 +3732,6 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_http_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
-        if request_id == self.update_id && self.update_id != LiveId::empty() {
-            let body = response.get_string_body().unwrap_or_default();
-            self.handle_update_check_response(cx, response.status_code, &body);
-            return;
-        }
-        if request_id == self.update_dl_id && self.update_dl_id != LiveId::empty() {
-            self.handle_update_download_response(cx, response);
-            return;
-        }
         if request_id == self.test_id && self.testing {
             self.testing = false;
             let status = response.status_code;
@@ -3921,16 +3785,6 @@ impl MatchEvent for App {
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
-        if request_id == self.update_id && self.update_id != LiveId::empty() {
-            self.update_state = 5;
-            self.update_body(cx, &format!("检查更新失败：{}", err.message));
-            return;
-        }
-        if request_id == self.update_dl_id && self.update_dl_id != LiveId::empty() {
-            self.update_state = 5;
-            self.update_body(cx, &format!("下载失败：{}", err.message));
-            return;
-        }
         if request_id == self.test_id && self.testing {
             self.testing = false;
             self.popup_child(
@@ -4149,7 +4003,6 @@ impl AppMain for App {
         if let Event::Actions(actions) = event {
             self.handle_popup_closes(cx, actions);
             self.handle_settings_actions(cx, actions);
-            self.handle_update_actions(cx, actions);
             self.handle_chat_actions(cx, actions);
             self.handle_file_panel_actions(cx, actions);
             self.handle_startup_actions(cx, actions);

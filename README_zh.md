@@ -24,10 +24,6 @@ cargo run
 
 旧版放在程序目录旁的数据会在首次启动时自动迁移过去。
 
-## 更新
-
-About 面板点击「检查更新」即可从 GitHub Releases 自动下载并替换自身。发布约定：tag = `v{版本号}`（与 `Cargo.toml` 一致），asset = `understand-everything-{linux|macos|windows}-{x86_64|aarch64}`。
-
 ## 许可证
 
 [GPL-3.0](LICENSE)

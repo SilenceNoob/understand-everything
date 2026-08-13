@@ -24,10 +24,6 @@ User data (cards, maps, references, settings, RAG cache, models) lives in the pl
 
 Legacy data sitting next to the binary is migrated there on first launch.
 
-## Updates
-
-Click "检查更新" in the About panel to download and self-replace from GitHub Releases. Release convention: tag = `v{version}` (matching `Cargo.toml`), asset = `understand-everything-{linux|macos|windows}-{x86_64|aarch64}`.
-
 ## License
 
 [GPL-3.0](LICENSE)
