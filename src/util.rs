@@ -245,6 +245,10 @@ static PANEL_RECTS: Mutex<Vec<(u64, Rect)>> = Mutex::new(Vec::new());
 /// vertically; the freed strips pass pointer events through to the canvas.
 pub const SIDE_PANEL_H_FRAC: f64 = 0.95;
 
+/// Gap (px) kept between a side panel (or its collapsed tab) and the window
+/// edge, so open/collapsed panels float slightly off the border.
+pub const SIDE_PANEL_GAP: f64 = 8.0;
+
 /// Register (or, with `None`, unregister) a panel's window-coord rect.
 pub fn set_panel_rect(uid: u64, rect: Option<Rect>) {
     let mut rects = PANEL_RECTS.lock().unwrap();

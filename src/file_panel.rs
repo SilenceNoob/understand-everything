@@ -1812,17 +1812,21 @@ struct PanelGeo {
 /// panel width.
 fn panel_geometry(slide: f64, split: f64, panel_w: f64, window: DVec2, body_y: f64) -> PanelGeo {
     let body_h = (window.y - body_y).max(0.0);
-    // 85% of the body height, centered vertically.
+    // 95% of the body height, centered vertically.
     let panel_h = body_h * crate::util::SIDE_PANEL_H_FRAC;
     let y_off = (body_h - panel_h) * 0.5;
-    let offset_x = -panel_w * (1.0 - slide);
+    // GAP keeps the open panel off the window edge; the interpolation
+    // (GAP+panel_w)*slide - panel_w puts the collapsed panel fully outside
+    // (right edge flush with x=0) so no sliver shows while the tab stays
+    // parked at the gap.
+    let offset_x = (crate::util::SIDE_PANEL_GAP + panel_w) * slide - panel_w;
     let panel = Rect {
         pos: dvec2(offset_x, body_y + y_off),
         size: dvec2(panel_w, panel_h),
     };
     // Tab protrudes fully outside the panel, flush against its right edge;
-    // when collapsed it pins to the left edge (x = 0).
-    let tab_x = (panel.pos.x + panel.size.x).max(0.0);
+    // when collapsed it pins to the gap from the left edge (x = GAP).
+    let tab_x = (panel.pos.x + panel.size.x).max(crate::util::SIDE_PANEL_GAP);
     let tab = Rect {
         pos: dvec2(tab_x, panel.pos.y + panel.size.y * 0.5 - TAB_H * 0.5),
         size: dvec2(TAB_W, TAB_H),
@@ -1874,25 +1878,27 @@ mod test {
         let window = dvec2(1440.0, 900.0);
         let h = 866.0 * crate::util::SIDE_PANEL_H_FRAC;
         let y = 34.0 + (866.0 - h) * 0.5;
-        // open: panel is 85% of the body height, centered; the tab straddles
-        // the panel's right edge (centering keeps it at the body center)
+        // open: panel is 95% of the body height, centered, 8px off the left
+        // edge; the tab straddles the panel's right edge (centering keeps it
+        // at the body center)
         let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
-        assert_eq!(geo.panel, Rect { pos: dvec2(0.0, y), size: dvec2(260.0, h) });
-        assert_eq!(geo.tab, Rect { pos: dvec2(260.0, 443.0), size: dvec2(14.0, 48.0) });
-        // collapsed: panel fully off-screen left, tab pinned to the left edge
+        assert_eq!(geo.panel, Rect { pos: dvec2(8.0, y), size: dvec2(260.0, h) });
+        assert_eq!(geo.tab, Rect { pos: dvec2(268.0, 443.0), size: dvec2(14.0, 48.0) });
+        // collapsed: panel fully off-screen (right edge at x=0), tab parked
+        // 8px off the edge
         let geo = panel_geometry(0.0, 0.5, 260.0, window, 34.0);
         assert_eq!(geo.panel, Rect { pos: dvec2(-260.0, y), size: dvec2(260.0, h) });
-        assert_eq!(geo.tab, Rect { pos: dvec2(0.0, 443.0), size: dvec2(14.0, 48.0) });
+        assert_eq!(geo.tab, Rect { pos: dvec2(8.0, 443.0), size: dvec2(14.0, 48.0) });
         // half-open: tab tracks the panel edge
         let geo = panel_geometry(0.5, 0.5, 260.0, window, 34.0);
-        assert_eq!(geo.panel.pos.x, -130.0);
+        assert_eq!(geo.panel.pos.x, -126.0);
         // window resize shrinks the panel height
         let geo = panel_geometry(1.0, 0.5, 260.0, dvec2(800.0, 600.0), 34.0);
         assert_eq!(geo.panel.size.y, 566.0 * crate::util::SIDE_PANEL_H_FRAC);
         // custom width moves the right edge and the tab with it
         let geo = panel_geometry(1.0, 0.5, 360.0, window, 34.0);
         assert_eq!(geo.panel.size.x, 360.0);
-        assert_eq!(geo.tab.pos.x, 360.0);
+        assert_eq!(geo.tab.pos.x, 368.0);
     }
 
     #[test]
@@ -1901,7 +1907,7 @@ mod test {
         let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
         let panel = geo.panel;
         // strip (12px grab + 3px margins) centered on the divider line
-        assert_eq!(geo.splitter, Rect { pos: dvec2(0.0, 458.0), size: dvec2(260.0, 18.0) });
+        assert_eq!(geo.splitter, Rect { pos: dvec2(8.0, 458.0), size: dvec2(260.0, 18.0) });
         // dragging the strip center keeps the ratio
         let center = geo.splitter.pos.y + geo.splitter.size.y * 0.5;
         assert!((split_from_y(center, panel, 60.0) - 0.5).abs() < 1e-9);
@@ -1924,7 +1930,7 @@ mod test {
         let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
         assert_eq!(
             geo.edge,
-            Rect { pos: dvec2(252.0, 34.0 + (866.0 - h) * 0.5), size: dvec2(12.0, h) }
+            Rect { pos: dvec2(260.0, 34.0 + (866.0 - h) * 0.5), size: dvec2(12.0, h) }
         );
         // width follows the cursor (right edge at abs x), clamped to 140..520
         let panel = geo.panel;

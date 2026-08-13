@@ -644,16 +644,26 @@ impl RefsPanel {
         let panel_h = body_h * crate::util::SIDE_PANEL_H_FRAC;
         let y_off = (body_h - panel_h) * 0.5;
         let panel = Rect {
-            pos: dvec2(self.window_size.x - self.panel_w * self.slide.progress, body_y + y_off),
+            pos: dvec2(
+                self.window_size.x - (crate::util::SIDE_PANEL_GAP + self.panel_w) * self.slide.progress,
+                body_y + y_off,
+            ),
             size: dvec2(self.panel_w, panel_h),
         };
         self.panel_rect = panel;
+        // Tab hangs off the panel's left edge; when collapsed (panel fully
+        // off-screen, left edge at window.x) it parks 8px off the right edge
+        // instead of following the panel off-screen.
+        let tab_x = (panel.pos.x - TAB_W).min(self.window_size.x - crate::util::SIDE_PANEL_GAP - TAB_W);
         self.tab_rect = Rect {
-            pos: dvec2(panel.pos.x - TAB_W, panel.pos.y + panel.size.y * 0.5 - TAB_H * 0.5),
+            pos: dvec2(tab_x, panel.pos.y + panel.size.y * 0.5 - TAB_H * 0.5),
             size: dvec2(TAB_W, TAB_H),
         };
+        // Width-grab edge: push fully outside the window while collapsed so
+        // no sliver shows next to the border.
+        let edge_x = (panel.pos.x - (EDGE_W - EDGE_INSET)).max(self.window_size.x);
         self.edge_rect = Rect {
-            pos: dvec2(panel.pos.x - (EDGE_W - EDGE_INSET), panel.pos.y),
+            pos: dvec2(edge_x, panel.pos.y),
             size: dvec2(EDGE_W, panel.size.y),
         };
         set_panel_rect(self.uid.0, Some(panel));
@@ -897,9 +907,9 @@ impl RefsPanel {
     }
 
     /// Panel width from the cursor x (the left edge follows the cursor),
-    /// clamped to [min, max].
+    /// clamped to [min, max]; the window-edge gap is excluded.
     fn apply_width(&mut self, cx: &mut Cx, abs_x: f64) {
-        let w = (self.window_size.x - abs_x).clamp(PANEL_W_MIN, PANEL_W_MAX);
+        let w = (self.window_size.x - crate::util::SIDE_PANEL_GAP - abs_x).clamp(PANEL_W_MIN, PANEL_W_MAX);
         if (w - self.panel_w).abs() > f64::EPSILON {
             self.panel_w = w;
             self.redraw(cx);
