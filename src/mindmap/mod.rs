@@ -275,6 +275,18 @@ script_mod! {
                     empty_text: ""
                 }
             }
+            // Card archetype badge ("联结模型"/"判别模型"), right-aligned
+            // next to the edit button; set from the body's `#c 知识类型`
+            // marker (hidden from the rendered body by render_body).
+            type_badge := mod.widgets.Label{
+                width: Fit
+                height: Fit
+                visible: false
+                text: ""
+                margin: Inset{right: 2}
+                draw_text.text_style: theme.font_bold{font_size: 10.0}
+                draw_text.color: #8a93a6
+            }
             edit_btn := CardIconButton{
                 draw_icon +: {
                     svg: file_resource(#(crate::util::resource_path("pen.svg")))
@@ -2062,7 +2074,13 @@ impl MindMap {
             self.save_map();
             if let Some(Some(card)) = self.cards.get(i).cloned() {
                 let title = card_title(&self.data.as_ref().unwrap().nodes[i]);
-                set_card_texts(cx, &card, &title, new_order);
+                set_card_texts(
+                    cx,
+                    &card,
+                    &title,
+                    new_order,
+                    crate::gen::card_type(&self.data.as_ref().unwrap().nodes[i].body),
+                );
             }
         }
         self.redraw(cx);
@@ -2116,8 +2134,8 @@ impl MindMap {
         // A pending title indicator (set before this widget was created)
         // overrides the file-stem title until explicitly cleared.
         let title = self.pending_titles.get(&node.path).cloned().unwrap_or(name);
-        set_card_texts(cx, &w, &title, node.order);
-        w.markdown_media(cx, ids!(markdown)).set_text(cx, &node.body);
+        set_card_texts(cx, &w, &title, node.order, crate::gen::card_type(&node.body));
+        w.markdown_media(cx, ids!(markdown)).set_text(cx, &render_body(&node.body));
         if let Some(dir) = node.path.parent() {
             w.markdown_media(cx, ids!(markdown)).set_base_dir(dir.to_path_buf());
         }
@@ -2172,8 +2190,8 @@ impl MindMap {
             }
             let name = card_title(node);
             let body = node.body.clone();
-            set_card_texts(cx, &card, &name, node.order);
-            card.markdown_media(cx, ids!(markdown)).set_text(cx, &body);
+            set_card_texts(cx, &card, &name, node.order, crate::gen::card_type(&node.body));
+            card.markdown_media(cx, ids!(markdown)).set_text(cx, &render_body(&body));
         }
         if renamed {
             self.save_map();
@@ -2191,7 +2209,7 @@ impl MindMap {
         };
         self.data.as_mut().unwrap().nodes[i].body = body.clone();
         if let Some(Some(card)) = self.cards.get(i).cloned() {
-            card.markdown_media(cx, ids!(markdown)).set_text(cx, &body);
+            card.markdown_media(cx, ids!(markdown)).set_text(cx, &render_body(&body));
         }
     }
 
@@ -2217,8 +2235,9 @@ impl MindMap {
             .map(|s| s.to_string())
             .unwrap_or_else(|| card_title(&self.data.as_ref().unwrap().nodes[i]));
         let order = self.data.as_ref().unwrap().nodes[i].order;
+        let ctype = crate::gen::card_type(&self.data.as_ref().unwrap().nodes[i].body);
         if let Some(Some(card)) = self.cards.get(i).cloned() {
-            set_card_texts(cx, &card, &title, order);
+            set_card_texts(cx, &card, &title, order, ctype);
         }
     }
 
@@ -2838,7 +2857,33 @@ impl MindMapRef {
 /// Set a card's header title, compact title and order badge from its display
 /// title and learning-order number. The compact label carries the number as a
 /// "03·" prefix; the badge is hidden when there's no order.
-fn set_card_texts(cx: &mut Cx, card: &WidgetRef, title: &str, order: Option<u32>) {
+/// The body shown in the card: the `#c 知识类型` archetype marker is
+/// metadata (now surfaced as the header badge), so those lines are skipped.
+/// The file itself keeps the marker — `card_type` and generation logic read
+/// it from `body`.
+fn render_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        if line.trim_start().starts_with("#c 知识类型") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    // The marker usually sits at the top of the body; dropping it leaves a
+    // leading blank line that would push the content down — trim that too.
+    while out.starts_with('\n') {
+        out.drain(..1);
+    }
+    out
+}
+
+/// Set a card's header texts: title, compact label, learning-order badge,
+/// and the archetype badge (联结模型/判别模型) derived from `ctype`.
+fn set_card_texts(cx: &mut Cx, card: &WidgetRef, title: &str, order: Option<u32>, ctype: crate::gen::CardType) {
     card.label(cx, ids!(title)).set_text(cx, title);
     let compact = match order {
         Some(n) => format!("{n:02}·{title}"),
@@ -2852,6 +2897,36 @@ fn set_card_texts(cx: &mut Cx, card: &WidgetRef, title: &str, order: Option<u32>
             badge.set_visible(cx, true);
         }
         None => badge.set_visible(cx, false),
+    }
+    let tbadge = card.label(cx, ids!(type_badge));
+    let (text, color) = match ctype {
+        crate::gen::CardType::Knowledge => ("联结模型", 0x7aa2f7ff),
+        crate::gen::CardType::Concept => ("判别模型", 0x8a93a6ff),
+    };
+    tbadge.set_text(cx, text);
+    tbadge.set_text_color(cx, Vec4f::from_u32(color));
+    tbadge.set_visible(cx, true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_body;
+
+    #[test]
+    fn render_body_skips_ctype_marker_only() {
+        let body = "#c 知识类型 联结模型\n\n#d 学习目标\n内容\n#c 作用 用途\n";
+        let out = render_body(body);
+        assert_eq!(out, "#d 学习目标\n内容\n#c 作用 用途");
+        // 概念 marker, 行首带空格, 出现在中间：同样跳过。
+        let body2 = "先导内容\n  #c 知识类型 概念\n后续内容\n";
+        assert_eq!(render_body(body2), "先导内容\n后续内容");
+    }
+
+    #[test]
+    fn render_body_keeps_body_without_marker() {
+        let body = "#d 抽象描述\n特征\n";
+        assert_eq!(render_body(body), "#d 抽象描述\n特征");
+        assert_eq!(render_body(""), "");
     }
 }
 

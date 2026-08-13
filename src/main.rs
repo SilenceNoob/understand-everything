@@ -1175,6 +1175,10 @@ pub struct App {
     route_buf: String,
     #[rust]
     route_parser: SseParser,
+    /// route_buf length the progress toast last showed; drives throttled
+    /// toast updates ("已生成 N 字") while the route stream is in flight.
+    #[rust]
+    route_toast_len: usize,
     /// True after one automatic retry of an unparseable route plan response
     /// (thinking models occasionally emit malformed JSON).
     #[rust]
@@ -2370,6 +2374,7 @@ impl App {
                 fallback,
                 started: p.started,
             });
+            self.show_toast(cx, "正在检索参考资料…");
         } else if upgradeable {
             let rx = self.rag.as_ref().unwrap().retrieve(goal);
             self.route_wait = Some(RouteWait {
@@ -2379,6 +2384,7 @@ impl App {
                 fallback,
                 started: Instant::now(),
             });
+            self.show_toast(cx, "正在检索参考资料…");
         } else {
             self.send_route_request(cx, goal, diagnostics, &fallback);
         }
@@ -2415,6 +2421,7 @@ impl App {
     /// Fire the route-plan request (streaming; parsed when the stream ends).
     fn send_route_request(&mut self, cx: &mut Cx, goal: &str, diagnostics: &str, context: &str) {
         self.route_id = LiveId::unique();
+        self.show_toast(cx, "正在生成学习路线…");
         self.route_buf.clear();
         self.route_parser = ai::SseParser::new();
         self.route_context = context.to_string();
@@ -2583,6 +2590,23 @@ impl App {
         let diag = wait.diag.clone();
         self.route_wait = None;
         self.send_route_request(cx, &goal, &diag, &ctx);
+    }
+
+    /// Throttled progress toast while the route stream is in flight: refresh
+    /// the text only when the accumulated buffer grew, so the 5s auto-close
+    /// timer keeps resetting and the toast stays visible until the plan ends
+    /// (finish/abort replace it via their own show_toast calls).
+    fn handle_route_progress_toast(&mut self, cx: &mut Cx) {
+        if self.route_id == LiveId::empty() {
+            self.route_toast_len = 0;
+            return;
+        }
+        let len = self.route_buf.len();
+        if len == self.route_toast_len {
+            return;
+        }
+        self.route_toast_len = len;
+        self.show_toast(cx, &format!("正在生成学习路线…（已生成 {} 字）", len));
     }
 
     fn close_startup(&mut self, cx: &mut Cx) {
@@ -3213,6 +3237,7 @@ impl App {
         }
         self.handle_gen_rag_tick(cx);
         self.handle_route_rag_tick(cx);
+        self.handle_route_progress_toast(cx);
         let Some(wait) = &mut self.rag_wait else {
             return;
         };
