@@ -1,0 +1,31 @@
+diff --git a/platform/src/os/linux/wayland/wayland_app.rs b/platform/src/os/linux/wayland/wayland_app.rs
+index b12e12aa..4ff04c06 100644
+--- a/platform/src/os/linux/wayland/wayland_app.rs
++++ b/platform/src/os/linux/wayland/wayland_app.rs
+@@ -90,8 +90,24 @@ pub fn event_loop(&mut self) {
+     }
+     fn event_loop_poll(&mut self) {
+         if let Err(err) = self.event_queue.flush() {
+-            crate::warning!("Wayland flush failed: {}", err);
+-            self.terminate_event_loop();
++            // Same transient-failure policy as the Wait branch above: a
++            // WouldBlock only means the socket send buffer is full — the
++            // messages stay queued in the backend and are retried on the
++            // next loop iteration, so only a dead connection is fatal.
++            // Treating it as fatal here made momentary send congestion
++            // during a paint burst silently terminate the app.
++            let transient = matches!(
++                &err,
++                wayland_client::backend::WaylandError::Io(io)
++                    if io.kind() == std::io::ErrorKind::WouldBlock
++            );
++            if !transient {
++                crate::warning!("Wayland flush failed: {}", err);
++                self.terminate_event_loop();
++                return;
++            }
++            // Skip the rest of this poll cycle so the retained backlog can
++            // drain; the next iteration retries the flush.
+             return;
+         }
+         if let Some(guard) = self.event_queue.prepare_read() {

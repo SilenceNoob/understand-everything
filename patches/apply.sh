@@ -70,6 +70,7 @@ apply_patch() {
 
 apply_patch makepad-unexpected-eof.patch
 apply_patch makepad-wayland-scroll-sign.patch
+apply_patch makepad-wayland-flush-eagain.patch
 
 echo "完成。改了 makepad 源码后记得重新编译受影响 crate："
 echo "  cargo clean -p makepad-network -p makepad-platform"
