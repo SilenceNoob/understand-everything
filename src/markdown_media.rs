@@ -471,6 +471,10 @@ impl MarkdownMedia {
         // column index within its row. Both are reset when a new table starts.
         let mut table_alignments: Vec<Alignment> = Vec::new();
         let mut table_cell_index: usize = 0;
+        // True while inside a fenced/indented code block rendered directly by
+        // TextFlow (the non-CodeView path). `==...==` and pill scanning must
+        // stay off for these runs; their contents are code, not card prose.
+        let mut in_fenced_code = false;
 
         // Parse once per body version; later frames reuse the owned event
         // list (still re-dispatched every frame — the canvas redraws all
@@ -627,6 +631,11 @@ impl MarkdownMedia {
                     let _ = title;
                 }
                 MdEvent::Start(Tag::CodeBlock(kind)) => {
+                    // Code (fenced, indented, runsplash, or widget-rendered)
+                    // is opaque to the custom `==`/pill inline markers. Close
+                    // anything left pending before the block so markers on
+                    // either side never pair across code or get reordered.
+                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                     if !is_first_block {
                         tf.new_line_collapsed_with_spacing(cx, self.pre_code_spacing);
                     }
@@ -640,6 +649,7 @@ impl MarkdownMedia {
                         self.in_code_block = true;
                         self.code_block_string.clear();
                     } else {
+                        in_fenced_code = true;
                         const FIXED_FONT_SIZE_SCALE: f64 = 0.85;
                         tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
                         tf.combine_spaces.push(false);
@@ -679,6 +689,7 @@ impl MarkdownMedia {
                         // (its area will be queried at event time, not draw time)
                         tf.push_widget_text_for_selection(code_view_ref, &self.code_block_string);
                     } else {
+                        in_fenced_code = false;
                         tf.font_sizes.pop();
                         tf.fixed.pop();
                         tf.combine_spaces.pop();
@@ -687,6 +698,10 @@ impl MarkdownMedia {
                 }
                 // Inline code
                 MdEvent::Code(text) => {
+                    // Inline code is likewise opaque: `==` inside backticks is
+                    // code, and a mark opened before the code span must not
+                    // close after it (which would reorder the highlight).
+                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
                     const FIXED_FONT_SIZE_SCALE: f64 = 0.85;
                     tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
                     tf.fixed.push();
@@ -743,6 +758,11 @@ impl MarkdownMedia {
                         self.splash_block_string.push_str(text);
                     } else if self.in_code_block {
                         self.code_block_string.push_str(text);
+                    } else if in_fenced_code {
+                        // Raw code-block text; never feed it to scan_marks /
+                        // scan_pills, otherwise `==` in ``` blocks would be
+                        // rendered as card highlight markers.
+                        tf.draw_text(cx, text);
                     } else {
                         let text = text.trim_end_matches("\n");
                         let mut in_mark = self.mark.is_some();
