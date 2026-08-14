@@ -359,7 +359,10 @@ impl MindMap {
         {
             let world = self.screen_to_world(fe.abs);
             if self.zoom < COMPACT_ZOOM || self.hit_card(world).is_none() {
-                let factor = (1.0 + fe.scroll.y * 0.002).clamp(0.8, 1.25);
+                // Makepad's scroll convention is positive y = scroll
+                // down/backward. Invert it so wheel up/forward (negative y)
+                // zooms in and wheel down/backward zooms out.
+                let factor = (1.0 - fe.scroll.y * 0.002).clamp(0.8, 1.25);
                 let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
                 if (new_zoom - self.zoom).abs() > f64::EPSILON {
                     let w = self.screen_to_world(fe.abs);
