@@ -4,8 +4,10 @@ use std::time::Instant;
 
 use crate::ai::{self};
 use crate::app::{rag_bm25_context, set_card_title_indicator, show_toast, RAG_RETRIEVE_TIMEOUT};
+use crate::create_card_popup::CreateCardPopupWidgetRefExt;
 use crate::gen::*;
 use crate::mindmap::MindMapWidgetRefExt;
+use crate::popup_panel::PopupPanelWidgetRefExt;
 use crate::rag;
 use crate::App;
 
@@ -42,6 +44,15 @@ pub(crate) struct SubcardTask {
     selected: String,
 }
 
+/// One create-card request (archetype chosen by the user, topic typed).
+pub(crate) struct CreateTask {
+    id: LiveId,
+    ctype: crate::gen::NewCardType,
+    /// Whether the AI should auto-attach the card to a related card (false =
+    /// always standalone, no wiring).
+    auto_attach: bool,
+}
+
 /// Card-generation state + logic, extracted from App. Unlike the single-slot
 /// controller this replaced, generation is keyed per card: any number of cards
 /// can generate at once (each card still queues its own sections serially),
@@ -55,6 +66,8 @@ pub(crate) struct GenController {
     pub(crate) gen_tasks: Vec<GenTask>,
     /// Subcard judgement requests in flight (deduped per parent + selection).
     pub(crate) subcards: Vec<SubcardTask>,
+    /// Create-card requests in flight (parallel, like subcards).
+    pub(crate) creates: Vec<CreateTask>,
 }
 impl GenController {
     /// Whether a generation queue (running or awaiting retrieval) targets path.
@@ -71,6 +84,11 @@ impl GenController {
     /// Whether id belongs to a subcard-judgement request in flight.
     pub(crate) fn is_subcard_request(&self, id: LiveId) -> bool {
         self.subcards.iter().any(|t| t.id == id)
+    }
+
+    /// Whether id belongs to a create-card request in flight.
+    pub(crate) fn is_create_request(&self, id: LiveId) -> bool {
+        self.creates.iter().any(|t| t.id == id)
     }
 
     pub(crate) fn start_generation(
@@ -433,6 +451,215 @@ impl GenController {
             None => show_toast(&self.ui, toast_until, cx, "生成子卡片失败：无法创建卡片文件。"),
         }
     }
+
+    /// 创建卡片 (create-card dialog): fire one judge request that names the
+    /// card, summarizes its input/output, and (when `auto_attach`) picks the
+    /// most related existing card as parent. `ctype` is user-chosen and
+    /// forced. The popup stays open with a busy status until the response
+    /// lands.
+    pub(crate) fn start_card_creation(
+        &mut self,
+        cx: &mut Cx,
+        ctype: crate::gen::NewCardType,
+        topic: &str,
+        auto_attach: bool,
+        rag: Option<&rag::service::RagService>,
+        ai_config: &crate::ai::AIConfig,
+    ) {
+        // Parent selection is only relevant when auto-attach is on; without
+        // the card list the model has nothing to attach to (parent = null).
+        let map_context = if auto_attach {
+            let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+            let infos = mind_map.card_infos();
+            infos
+                .iter()
+                .map(|(t, c)| {
+                    let kind = match c {
+                        crate::gen::CardType::Concept => "判别模型",
+                        crate::gen::CardType::Knowledge => "联结模型",
+                    };
+                    format!("「{t}」（{kind}）")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        let ctx = rag_bm25_context(rag, topic);
+        let (system, user) = crate::gen::create_card_messages(topic, ctype, &map_context, &ctx);
+        let id = LiveId::unique();
+        self.creates.push(CreateTask {
+            id,
+            ctype,
+            auto_attach,
+        });
+        ai::chat_completions(
+            cx,
+            id,
+            ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            358400,
+        );
+    }
+
+    /// A create-card request failed at the transport level: unlock the popup
+    /// and toast.
+    pub(crate) fn create_request_failed(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        msg: String,
+        toast_until: &mut Option<Instant>,
+    ) {
+        if let Some(idx) = self.creates.iter().position(|t| t.id == request_id) {
+            self.creates.remove(idx);
+            crate::create_card_popup::create_content(&self.ui)
+                .as_create_card_popup()
+                .set_status(cx, &msg, false);
+            show_toast(&self.ui, toast_until, cx, &msg);
+        }
+    }
+
+    /// A create-card judge response: write the seed body file (基础内容, same
+    /// shape as route cards), attach it under the suggested parent (or as an
+    /// independent root card when unrelated), close the popup, and toast.
+    pub(crate) fn handle_create_response(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        response: &HttpResponse,
+        rag: Option<&rag::service::RagService>,
+        toast_until: &mut Option<Instant>,
+    ) {
+        let Some(idx) = self.creates.iter().position(|t| t.id == request_id) else {
+            return;
+        };
+        let ctype = self.creates[idx].ctype;
+        let auto_attach = self.creates[idx].auto_attach;
+        self.creates.remove(idx);
+        let content_widget = crate::create_card_popup::create_content(&self.ui);
+        let popup = content_widget.as_create_card_popup();
+        let fail = |ui: &WidgetRef, popup: &crate::create_card_popup::CreateCardPopupRef, cx: &mut Cx, msg: &str, toast_until: &mut Option<Instant>| {
+            popup.set_status(cx, msg, false);
+            show_toast(ui, toast_until, cx, msg);
+        };
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            fail(&self.ui, &popup, cx, &format!("生成失败 ({})：{}", response.status_code, detail), toast_until);
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        let plan = match crate::gen::parse_create_card(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                let preview = ai::response_debug_preview(response);
+                fail(&self.ui, &popup, cx, &format!("生成失败：{e}（{preview}）"), toast_until);
+                return;
+            }
+        };
+        // Seed body: the 知识类型/输入输出(+空间) blocks, like route cards —
+        // 基础内容 only; per-section generation is the user's follow-up.
+        let seed = match ctype {
+            crate::gen::NewCardType::Knowledge => {
+                let mut s = format!(
+                    "#c 知识类型 联结模型\n\n#c 输入输出\n输入：{}\n输出：{}\n",
+                    plan.input.trim(),
+                    plan.output.trim()
+                );
+                if !plan.input_space.trim().is_empty() {
+                    s.push_str(&format!("\n#c 输入空间\n{}\n", plan.input_space.trim()));
+                }
+                if !plan.output_space.trim().is_empty() {
+                    s.push_str(&format!("\n#c 输出空间\n{}\n", plan.output_space.trim()));
+                }
+                s
+            }
+            crate::gen::NewCardType::Concept => {
+                let mut s = "#c 知识类型 概念\n".to_string();
+                if !plan.input.trim().is_empty() || !plan.output.trim().is_empty() {
+                    s.push_str(&format!(
+                        "\n#c 输入输出\n输入：{}\n输出：{}\n",
+                        plan.input.trim(),
+                        plan.output.trim()
+                    ));
+                }
+                s
+            }
+        };
+        // File under cards/<map stem>/ (grouped like route cards), unique-ified.
+        let base = crate::util::data_dir();
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        let map_file = mind_map.current_map_file().unwrap_or_default();
+        let stem = map_file
+            .strip_prefix("maps/")
+            .unwrap_or(&map_file)
+            .strip_suffix(".json")
+            .unwrap_or(&map_file);
+        let safe = crate::file_panel::normalize_name(&plan.title, Some(".md"))
+            .unwrap_or_else(|| "未命名.md".to_string());
+        let safe = safe.strip_suffix(".md").unwrap_or(&safe).to_string();
+        let mut rel = None;
+        for n in 0.. {
+            let fname = if n == 0 {
+                format!("{safe}.md")
+            } else {
+                format!("{safe}-{n}.md")
+            };
+            let p = base.join("cards").join(stem).join(&fname);
+            if !p.exists() {
+                std::fs::create_dir_all(p.parent().unwrap_or(&base)).ok();
+                if std::fs::write(&p, seed).is_ok() {
+                    rel = Some(format!("cards/{stem}/{fname}"));
+                }
+                break;
+            }
+        }
+        let Some(rel) = rel else {
+            fail(&self.ui, &popup, cx, "生成失败：无法创建卡片文件。", toast_until);
+            return;
+        };
+        // Attach: auto-attach on → a parent-title hit attaches the card as a
+        // child, otherwise it lands as an independent root card at the
+        // right-click spot (parent-less 联结模型 roots then offer
+        // 生成学习路线 in their context menu). Auto-attach off → always
+        // standalone, never wired.
+        let parent_rel = if auto_attach {
+            plan.parent
+                .as_deref()
+                .and_then(|t| mind_map.rel_path_by_title(t))
+                .filter(|p| !p.is_empty())
+        } else {
+            None
+        };
+        let kind = ctype.short();
+        match parent_rel {
+            Some(parent_rel) => {
+                mind_map.add_child_card(cx, &parent_rel, &rel);
+                show_toast(
+                    &self.ui,
+                    toast_until,
+                    cx,
+                    &format!("已生成{kind}卡「{}」，已挂到「{}」下。", plan.title, plan.parent.as_deref().unwrap_or("")),
+                );
+            }
+            None => {
+                mind_map.add_card_at(cx, &rel);
+                let msg = if auto_attach {
+                    format!("已生成{kind}卡「{}」，与现有内容无关，已作为独立根卡片。", plan.title)
+                } else {
+                    format!("已生成{kind}卡「{}」，未自动连线，已作为独立根卡片。", plan.title)
+                };
+                show_toast(&self.ui, toast_until, cx, &msg);
+            }
+        }
+        crate::create_card_popup::create_popup(&self.ui).as_popup_panel().hide(cx);
+        if let Some(rag) = rag {
+            rag.set_map(&mind_map.current_map_file().unwrap_or_default());
+        }
+    }
 }
 impl GenController {
     /// Poll deferred card-generation retrievals and promote the ready ones to
@@ -499,6 +726,11 @@ impl App {
     pub(crate) fn handle_subcard_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
         self.gen
             .handle_subcard_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
+    }
+
+    pub(crate) fn handle_create_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
+        self.gen
+            .handle_create_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until);
     }
 
     pub(crate) fn handle_gen_rag_tick(&mut self, cx: &mut Cx) {

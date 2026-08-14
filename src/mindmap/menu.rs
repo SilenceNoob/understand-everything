@@ -26,14 +26,19 @@ impl MindMap {
             .and_then(|c| c.clone())
             .map(|c| c.markdown_media(cx, ids!(markdown)).selected_text(cx))
             .unwrap_or_default();
-        // 生成学习路线 only for the root goal card, and only while it has no
-        // children yet (v1 plans once; a planned map gets no re-plan entry).
-        // Hidden too while a route plan is in flight. 生成子卡片 only while
+        // 生成学习路线 only for plan-capable root cards: the card must be a
+        // parent-less leaf (an independent root card) that is not mid-plan,
+        // and must either be the primary root (legacy root goal card) or a
+        // 联结模型 card (the goal of a learning route). 生成子卡片 only while
         // the card body has a selection. Both rows sit at the end of the menu;
         // item4 = plan row, item5 = subcard row.
-        self.menu_plan_row = data.root == Some(card)
+        let is_primary_root = data.root == Some(card);
+        let is_knowledge =
+            crate::gen::card_type(&data.nodes[card].body) == crate::gen::CardType::Knowledge;
+        self.menu_plan_row = data.nodes[card].parent.is_none()
             && data.nodes[card].children.is_empty()
-            && !self.route_planning;
+            && !self.route_planning
+            && (is_primary_root || is_knowledge);
         self.menu_subcard_row = !self.menu_card_selection.trim().is_empty();
         self.menu_items = 4 + usize::from(self.menu_plan_row) + usize::from(self.menu_subcard_row);
         self.menu_rect = menu_rect(view, abs, self.menu_items);
@@ -265,11 +270,10 @@ impl MindMap {
     pub(crate) fn on_menu_click(&mut self, cx: &mut Cx, abs: DVec2) {
         if let Some(idx) = menu_item_index(self.menu_rect, self.menu_items, abs) {
             if idx == 0 {
+                // remove_card refuses route roots (parent-less nodes with
+                // children); independent root leaves and regular cards go.
                 if let Some(i) = self.menu_card {
-                    let root = self.data.as_ref().and_then(|d| d.root);
-                    if root != Some(i) {
-                        self.remove_card(cx, i);
-                    }
+                    self.remove_card(cx, i);
                 }
                 self.close_menu(cx);
                 return;

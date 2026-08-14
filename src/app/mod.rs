@@ -5,6 +5,7 @@ use crate::mindmap::MindMapWidgetRefExt;
 use std::time::{Duration, Instant};
 
 pub mod chat;
+pub mod create_card;
 pub mod diag;
 pub mod files;
 pub mod generation;

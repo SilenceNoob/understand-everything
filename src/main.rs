@@ -12,6 +12,7 @@ mod ai;
 mod bottom_bar;
 mod card_picker;
 mod chat_list;
+mod create_card_popup;
 mod file_panel;
 mod float_panel;
 mod gen;
@@ -549,6 +550,9 @@ script_mod! {
                     }
                     picker_popup := mod.widgets.PopupPanel{
                         content := mod.widgets.CardPicker{}
+                    }
+                    create_card_popup := mod.widgets.PopupPanel{
+                        content := mod.widgets.CreateCardPopup{}
                     }
                     confirm_popup := mod.widgets.PopupPanel{
                         content := mod.widgets.View{
@@ -1110,6 +1114,7 @@ impl AppMain for App {
         crate::refs_panel::script_mod(vm);
         crate::quiz_panel::script_mod(vm);
         crate::card_picker::script_mod(vm);
+        crate::create_card_popup::script_mod(vm);
         self::script_mod(vm)
     }
 
@@ -1195,6 +1200,7 @@ impl AppMain for App {
             self.handle_mindmap_actions(cx, actions);
             self.handle_quiz_panel_actions(cx, actions);
             self.handle_picker_actions(cx, actions);
+            self.handle_create_card_actions(cx, actions);
             self.handle_card_delete_confirm(cx, actions);
             self.handle_card_drop(cx, actions);
         }

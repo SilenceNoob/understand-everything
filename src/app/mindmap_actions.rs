@@ -30,7 +30,7 @@ impl App {
                 .map(|s| crate::gen::strip_order_prefix(&s).to_string())
                 .unwrap_or_default();
             if !goal.is_empty() {
-                self.begin_diag(cx, &goal);
+                self.begin_diag(cx, &goal, &path);
             }
         }
         if let Some(pos) = mind_map.canvas_menu_clicked(actions) {
@@ -64,12 +64,14 @@ impl App {
             live_id!(startup_popup),
             live_id!(quiz_popup),
             live_id!(confirm_popup),
+            live_id!(create_card_popup),
         ] {
             self.popup_widget(id).as_popup_panel().hide(cx);
         }
     }
 
-    /// CardPicker popup: apply the choice (add existing / create new card).
+    /// CardPicker popup: apply the choice (add existing card / open the
+    /// create-card dialog with the search text prefilled as the topic).
     pub(crate) fn handle_picker_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let picker = self.picker();
         if picker.close_clicked(actions) {
@@ -82,34 +84,16 @@ impl App {
         self.popup_widget(live_id!(picker_popup)).as_popup_panel().hide(cx);
         let rel = match choice {
             PickChoice::Card(rel) => Some(rel),
-            PickChoice::Create(name) => self.create_card_file(&name),
+            // AI creation: type + topic dialog (content generated, then
+            // auto-attached to the map).
+            PickChoice::Create(name) => {
+                self.open_create_card_popup(cx, &name);
+                None
+            }
             PickChoice::None => None,
         };
         if let Some(rel) = rel {
             self.ui.mind_map(cx, ids!(mindmap)).add_card_at(cx, &rel);
         }
-    }
-
-    /// Create an empty card file in the default `cards/` dir from the search
-    /// text (default "未命名" when empty); unique-ified with a numeric suffix
-    /// when the name is taken. Returns the rel path.
-    pub(crate) fn create_card_file(&self, name: &str) -> Option<String> {
-        let stem = crate::file_panel::normalize_name(name, Some(".md"))
-            .unwrap_or_else(|| "未命名.md".to_string());
-        let stem = stem.strip_suffix(".md").unwrap_or(&stem).to_string();
-        let base = crate::util::data_dir();
-        for n in 0.. {
-            let fname = if n == 0 {
-                format!("{stem}.md")
-            } else {
-                format!("{stem}-{n}.md")
-            };
-            let p = base.join("cards").join(&fname);
-            if !p.exists() {
-                std::fs::write(&p, "").ok()?;
-                return Some(format!("cards/{fname}"));
-            }
-        }
-        None
     }
 }

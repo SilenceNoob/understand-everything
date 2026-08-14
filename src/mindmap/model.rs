@@ -105,12 +105,15 @@ impl MindMapData {
     pub const DEFAULT_MAP: &'static str = "maps/map.json";
 
     /// Remove node `i` from the tree, re-attaching its children to its parent.
-    /// Returns false if `i` is the root or out of bounds.
+    /// Returns false when `i` is out of bounds, or when it is a parent-less
+    /// node with children (a learning-route root — removing it would orphan
+    /// the whole route). Parent-less leaves (independent root cards) are
+    /// removable.
     pub fn remove_node(&mut self, i: usize) -> bool {
         if i >= self.nodes.len() {
             return false;
         }
-        if self.root == Some(i) {
+        if self.nodes[i].parent.is_none() && !self.nodes[i].children.is_empty() {
             return false;
         }
         let parent = self.nodes[i].parent;
@@ -159,7 +162,7 @@ impl MindMapData {
             });
         }
         self.nodes = nodes;
-        self.root = self.nodes.iter().position(|n| n.id == "root");
+        self.root = self.nodes.iter().position(|n| n.parent.is_none());
 
         for g in &mut self.groups {
             g.cards = g.cards.iter().filter_map(|&c| map[c]).collect();
@@ -204,6 +207,46 @@ impl MindMapData {
         });
         self.recompute_bounds();
         i
+    }
+
+    /// Attach a generated learning route to root node `root`: one node per
+    /// `cards` entry (planned id, title, rel path, parent planned id, learning
+    /// order), bodies read from disk. Planned ids only drive parent wiring —
+    /// the nodes get fresh ids; unknown parents fall back to `root`. Returns
+    /// the new node indices in `cards` order (skipped duplicates stay
+    /// unrepresented). Pure data-level op: callers position the new nodes and
+    /// refresh widgets/edges.
+    pub fn attach_route_nodes(
+        &mut self,
+        root: usize,
+        base: &Path,
+        cards: &[(String, String, String, Option<String>, Option<u32>)],
+    ) -> Vec<usize> {
+        let mut index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut added: Vec<usize> = Vec::with_capacity(cards.len());
+        for c in cards {
+            let path = base.join(&c.2);
+            if self.nodes.iter().any(|n| n.path == path) {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let i = self.add_detached(path, body, dvec2(0.0, 0.0));
+            self.nodes[i].order = c.4;
+            index.insert(c.0.clone(), i);
+            added.push(i);
+        }
+        for c in cards {
+            let Some(&ci) = index.get(&c.0) else { continue };
+            let pi = c
+                .3
+                .as_deref()
+                .and_then(|p| index.get(p).copied())
+                .unwrap_or(root);
+            self.nodes[ci].parent = Some(pi);
+            self.nodes[pi].children.push(ci);
+        }
+        added
     }
 
     /// Recompute `max_w`/`max_h` from current node/group geometry.
@@ -252,12 +295,6 @@ impl MindMapData {
             })
             .collect();
         let id_of = |nodes: &[Node], id: &str| nodes.iter().position(|n| n.id == id);
-        let root = id_of(&nodes, "root");
-        // Empty maps are valid (zero nodes); a non-empty map without a root
-        // is malformed and fails to load, as before.
-        if root.is_none() && !nodes.is_empty() {
-            return None;
-        }
         for i in 0..nodes_json.len() {
             if let Some(children) = &nodes_json[i].children {
                 for cid in children {
@@ -267,6 +304,17 @@ impl MindMapData {
                 }
             }
         }
+        // Empty maps are valid (zero nodes). A non-empty map must contain at
+        // least one parent-less node (a forest root); if every node has a
+        // parent the links form a cycle and the file is malformed.
+        if !nodes.is_empty() && nodes.iter().all(|n| n.parent.is_some()) {
+            return None;
+        }
+        // Primary root = the first parent-less node in node order. It drives
+        // the auto layout and the startup-page check; further parent-less
+        // nodes are independent root cards (extra learning-route goals).
+        // The legacy "root" node id is just the primary root's id.
+        let root = nodes.iter().position(|n| n.parent.is_none());
         // Resolve groups: member ids -> indices. Empty groups and groups
         // unreachable from any root group (cycles, dangling references) are
         // dropped; the survivors form a forest.
@@ -1629,6 +1677,145 @@ mod tests {
         write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/map.json");
         let again = MindMapData::load_from(&dir, "maps/map.json").unwrap();
         assert_eq!(again.groups[0].color.as_deref(), Some("#ff0000"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forest_map_loads_multiple_parentless_roots() {
+        let dir = std::env::temp_dir().join(format!("ue-forest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["a.md", "b.md", "c.md", "d.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        // Two trees: root(r1)->a->b and r2->c, plus a detached leaf d.
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"r1","title":"R1","path":"a.md","children":["k1"]},
+                {"id":"k1","title":"K1","path":"b.md","children":["k2"]},
+                {"id":"k2","title":"K2","path":"c.md","children":null},
+                {"id":"r2","title":"R2","path":"d.md","children":null}
+            ]}"#,
+        )
+        .unwrap();
+        let data = MindMapData::load_from(&dir, "maps/map.json").expect("forest loads");
+        assert_eq!(data.nodes.len(), 4);
+        // Primary root = first parent-less node (r1).
+        let r1 = data.nodes.iter().position(|n| n.id == "r1").unwrap();
+        let r2 = data.nodes.iter().position(|n| n.id == "r2").unwrap();
+        assert_eq!(data.root, Some(r1));
+        assert_eq!(data.nodes[r1].parent, None);
+        assert_eq!(data.nodes[r2].parent, None);
+        // write/reload keeps the forest (r2 stays a parent-less root).
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/map.json");
+        let again = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let r2 = again.nodes.iter().position(|n| n.id == "r2").unwrap();
+        assert_eq!(again.nodes[r2].parent, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cycle_map_fails_to_load() {
+        let dir = std::env::temp_dir().join(format!("ue-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::write(dir.join("a.md"), "x").unwrap();
+        // Every node has a parent (a cycle): malformed.
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"a","title":"A","path":"a.md","children":["b"]},
+                {"id":"b","title":"B","path":"a.md","children":["a"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(MindMapData::load_from(&dir, "maps/map.json").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_node_guards_route_roots() {
+        let dir = std::env::temp_dir().join(format!("ue-remove-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        for f in ["r.md", "a.md", "b.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"root","title":"R","path":"r.md","children":["a"]},
+                {"id":"a","title":"A","path":"a.md","children":null},
+                {"id":"b","title":"B","path":"b.md","children":null}
+            ]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let root = data.root.unwrap();
+        // Parent-less node WITH children (route root) is protected.
+        assert!(!data.remove_node(root));
+        // Independent parent-less leaf is removable.
+        let b = data.nodes.iter().position(|n| n.id == "b").unwrap();
+        assert!(data.remove_node(b));
+        // A tree child with its own children re-attaches them to the parent.
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"root","title":"R","path":"r.md","children":["a"]},
+                {"id":"a","title":"A","path":"a.md","children":["c"]},
+                {"id":"c","title":"C","path":"b.md","children":null}
+            ]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let a = data.nodes.iter().position(|n| n.id == "a").unwrap();
+        let root = data.root.unwrap();
+        assert!(data.remove_node(a));
+        assert_eq!(data.nodes[root].children, vec![a]);
+        assert_eq!(data.nodes[a].parent, Some(root));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attach_route_nodes_wires_parents_orders_and_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("ue-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        for f in ["r.md", "01.md", "02.md", "03.md"] {
+            std::fs::write(dir.join("cards").join(f), "body").unwrap();
+        }
+        let mut data = MindMapData {
+            nodes: Vec::new(),
+            groups: Vec::new(),
+            root: None,
+            max_w: 0.0,
+            max_h: 0.0,
+            saved_view: None,
+        };
+        let ri = data.add_detached(dir.join("cards/r.md"), "root".into(), dvec2(0.0, 0.0));
+        let cards = [
+            ("c1".into(), "一".into(), "cards/01.md".into(), None, Some(1u32)),
+            ("c2".into(), "二".into(), "cards/02.md".into(), Some("c1".into()), Some(2)),
+            ("c3".into(), "三".into(), "cards/03.md".into(), Some("missing".into()), Some(3)),
+        ];
+        let added = data.attach_route_nodes(ri, &dir, &cards);
+        assert_eq!(added.len(), 3);
+        let c1 = added[0];
+        let c2 = added[1];
+        let c3 = added[2];
+        assert_eq!(data.nodes[c1].parent, Some(ri));
+        assert_eq!(data.nodes[c2].parent, Some(c1));
+        // Unknown planned parent falls back to the route root.
+        assert_eq!(data.nodes[c3].parent, Some(ri));
+        assert_eq!(data.nodes[ri].children, vec![c1, c3]);
+        assert_eq!(data.nodes[c1].children, vec![c2]);
+        assert_eq!(data.nodes[c1].order, Some(1));
+        assert_eq!(data.nodes[c2].order, Some(2));
+        assert_eq!(data.nodes[c3].order, Some(3));
+        // Duplicate card path is skipped.
+        let again = data.attach_route_nodes(ri, &dir, &cards[..1]);
+        assert!(again.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -296,6 +296,86 @@ impl MindMap {
             .collect()
     }
 
+    /// Display title (file stem) + archetype of every card on the map, in
+    /// node order. The parent-selection context for AI card creation.
+    pub(crate) fn card_infos(&self) -> Vec<(String, crate::gen::CardType)> {
+        let Some(data) = &self.data else { return Vec::new() };
+        data.nodes
+            .iter()
+            .map(|n| (card_title(n), crate::gen::card_type(&n.body)))
+            .collect()
+    }
+
+    /// Rel path of the first card whose display title equals `title`.
+    pub(crate) fn rel_path_by_title(&self, title: &str) -> Option<String> {
+        let Some(data) = &self.data else { return None };
+        let base = data_dir();
+        data.nodes
+            .iter()
+            .find(|n| card_title(n) == title)
+            .and_then(|n| {
+                n.path
+                    .strip_prefix(&base)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+    }
+
+    /// Number of child cards of the node whose rel path is `rel_path`
+    /// (None when the card is not on the map).
+    pub(crate) fn card_child_count(&self, rel_path: &str) -> Option<usize> {
+        let Some(data) = &self.data else { return None };
+        let base = data_dir();
+        let i = data.nodes.iter().position(|n| n.path == base.join(rel_path))?;
+        Some(data.nodes[i].children.len())
+    }
+
+    /// Attach a generated learning route (plan cards in learning order) under
+    /// the root card at `root_rel`: add the nodes, wire parents (unknown
+    /// parents fall back to the root), position the new subtree to the right
+    /// of the root, and save. Other trees/groups/pan-zoom are untouched.
+    pub(crate) fn attach_route(
+        &mut self,
+        cx: &mut Cx,
+        root_rel: &str,
+        cards: &[(String, String, String, Option<String>, Option<u32>)],
+    ) {
+        let base = data_dir();
+        let Some(data) = &mut self.data else { return };
+        let Some(ri) = data.nodes.iter().position(|n| n.path == base.join(root_rel)) else {
+            return;
+        };
+        data.attach_route_nodes(ri, &base, cards);
+        // Position: children stack to the right of the root (recursive).
+        self.position_route_subtree(ri);
+        // One edge per parent link; card widget slots align lazily via card_ref.
+        self.edges = (0..self.data.as_ref().unwrap().edges().count())
+            .map(|_| cx.with_vm(|vm| DrawEdge::script_new_with_default(vm)))
+            .collect();
+        self.save_map();
+        self.selected = vec![ri];
+        self.selected_groups.clear();
+        self.reanchor_cards(cx);
+        self.redraw(cx);
+    }
+
+    /// Place the children of `pi` to the card's right (recursive), stacking
+    /// them by index (route children arrive in learning order).
+    fn position_route_subtree(&mut self, pi: usize) {
+        let parent_pos = self.data.as_ref().map(|d| d.nodes[pi].pos);
+        let children = self.data.as_ref().map(|d| d.nodes[pi].children.clone());
+        let (Some(parent_pos), Some(children)) = (parent_pos, children) else {
+            return;
+        };
+        for (k, &ci) in children.iter().enumerate() {
+            let pos = parent_pos + dvec2(CARD_W + 120.0, k as f64 * (CARD_H + 40.0));
+            if let Some(data) = &mut self.data {
+                data.nodes[ci].pos = pos;
+            }
+            self.position_route_subtree(ci);
+        }
+    }
+
     pub(crate) fn save_map(&self) {
         let Some(data) = &self.data else {
             return;

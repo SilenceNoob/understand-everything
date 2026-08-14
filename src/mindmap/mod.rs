@@ -1363,13 +1363,41 @@ impl MindMapRef {
         self.borrow().map(|w| w.card_rel_paths()).unwrap_or_default()
     }
 
-    /// Whether the current map has a live root card (node present, body file
-    /// intact). A map whose root card body was deleted is treated as rootless.
+    /// Display title (file stem) + archetype of every card on the map.
+    pub fn card_infos(&self) -> Vec<(String, crate::gen::CardType)> {
+        self.borrow().map(|w| w.card_infos()).unwrap_or_default()
+    }
+
+    /// Rel path of the first card whose display title equals `title`.
+    pub fn rel_path_by_title(&self, title: &str) -> Option<String> {
+        self.borrow().and_then(|w| w.rel_path_by_title(title))
+    }
+
+    /// Children count of the card at `rel_path` (None = not on the map).
+    pub fn card_child_count(&self, rel_path: &str) -> Option<usize> {
+        self.borrow().and_then(|w| w.card_child_count(rel_path))
+    }
+
+    /// Attach a generated learning route under the root card at `root_rel`.
+    pub fn attach_route(
+        &self,
+        cx: &mut Cx,
+        root_rel: &str,
+        cards: &[(String, String, String, Option<String>, Option<u32>)],
+    ) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.attach_route(cx, root_rel, cards);
+        }
+    }
+
+    /// Whether the current map has at least one live root card (a parent-less
+    /// node whose body file is intact). A map whose root cards' bodies were
+    /// all deleted is treated as rootless (startup page shows).
     pub fn has_root(&self) -> bool {
         self.borrow()
             .map(|w| {
                 w.data.as_ref().is_some_and(|d| {
-                    d.root.is_some_and(|i| d.nodes.get(i).is_some_and(|n| n.path.exists()))
+                    d.nodes.iter().any(|n| n.parent.is_none() && n.path.exists())
                 })
             })
             .unwrap_or(false)

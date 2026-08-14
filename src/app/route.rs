@@ -66,13 +66,16 @@ fn route_card_seed_body(rc: &crate::gen::RouteCard) -> String {
     body
 }
 impl RouteController {
-    /// Kick off learning-route planning for `goal`: ensure the root goal card
-    /// exists (creating it on an empty map), then request the route JSON from
-    /// the model. Re-planning is refused when the route already has cards.
+    /// Kick off learning-route planning for `goal` under the root card at
+    /// `root` (rel path; empty = the startup flow, which falls back to the
+    /// map's only card or creates the primary root on an empty map). Runs the
+    /// diagnostic interview first (see `begin_diag`). Re-planning is refused
+    /// when the target root already has children.
     pub(crate) fn start_route_plan(
         &mut self,
         cx: &mut Cx,
         goal: &str,
+        root: &str,
         diagnostics: &str,
         rag: Option<&rag::service::RagService>,
         toast_until: &mut Option<Instant>,
@@ -90,30 +93,45 @@ impl RouteController {
         let Some(map_file) = mind_map.current_map_file() else {
             return;
         };
-        let existing = mind_map.card_rel_paths();
-        if existing.len() > 1 {
-            show_toast(&self.ui, toast_until, cx, "当前地图已有学习路线卡片，暂不支持重新规划。");
+        // Root card: the menu card when planning from a root card (multi-route
+        // maps pass its rel path through the diagnostic), else the map's only
+        // card, else a fresh primary root on an empty map.
+        let root_rel = if !root.trim().is_empty() {
+            root.trim().to_string()
+        } else {
+            let existing = mind_map.card_rel_paths();
+            if existing.len() == 1 {
+                existing[0].clone()
+            } else if existing.is_empty() {
+                let Some(rel) = self.create_route_card_file(&map_file, goal) else {
+                    return;
+                };
+                // The goal itself is the target knowledge (联结模型): it gets
+                // the knowledge-card prompts for 生成/测试.
+                let body = format!("#c 知识类型 联结模型\n\n#d 学习目标\n{goal}\n");
+                if std::fs::write(base.join(&rel), body).is_err() {
+                    return;
+                }
+                if std::fs::write(base.join(&map_file), mindmap::route_map_json(goal, &rel, &[])).is_err() {
+                    return;
+                }
+                mind_map.reload_map(cx);
+                rel
+            } else {
+                show_toast(
+                    &self.ui,
+                    toast_until,
+                    cx,
+                    "当前地图卡片较多，请右键目标根卡片生成学习路线。",
+                );
+                return;
+            }
+        };
+        // Re-planning is refused when the target root already has a route.
+        if mind_map.card_child_count(&root_rel).unwrap_or(0) > 0 {
+            show_toast(&self.ui, toast_until, cx, "该学习目标已有学习路线，暂不支持重新规划。");
             return;
         }
-        // Root card: reuse the existing one (menu path) or create it fresh.
-        let root_rel = if existing.len() == 1 {
-            existing[0].clone()
-        } else {
-            let Some(rel) = self.create_route_card_file(&map_file, goal) else {
-                return;
-            };
-            // The goal itself is the target knowledge (联结模型): it gets
-            // the knowledge-card prompts for 生成/测试.
-            let body = format!("#c 知识类型 联结模型\n\n#d 学习目标\n{goal}\n");
-            if std::fs::write(base.join(&rel), body).is_err() {
-                return;
-            }
-            if std::fs::write(base.join(&map_file), mindmap::route_map_json(goal, &rel, &[])).is_err() {
-                return;
-            }
-            mind_map.reload_map(cx);
-            rel
-        };
         self.route_goal = goal.to_string();
         self.route_root = root_rel.clone();
         self.route_diag = diagnostics.to_string();
@@ -325,12 +343,9 @@ impl RouteController {
             body = crate::gen::upsert_section(&body, "#c 用户情况", &plan.user_assessment);
         }
         std::fs::write(&root_path, body).ok();
-        std::fs::write(
-            base.join(&map_file),
-            mindmap::route_map_json(&self.route_goal, &self.route_root, &cards),
-        )
-        .ok();
-        mind_map.reload_map(cx);
+        // Merge in-memory: the new nodes attach under the route root without
+        // rewriting the map file, so other roots/groups/pan-zoom survive.
+        mind_map.attach_route(cx, &self.route_root, &cards);
         set_card_title_indicator(&self.ui, cx, &self.route_root, None);
         if let Some(rag) = rag {
             rag.set_map(&map_file);

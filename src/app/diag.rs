@@ -28,6 +28,11 @@ pub(crate) struct DiagController {
     pub(crate) ui: WidgetRef,
     pub(crate) diag_id: LiveId,
     pub(crate) diag_goal: String,
+    /// Rel path of the route's root card (the menu card that started the
+    /// plan); empty for the startup goal-input flow, where the route
+    /// controller picks/creates the root itself. Multi-route maps rely on
+    /// this to target the right root.
+    pub(crate) diag_root: String,
     pub(crate) diag_history: Vec<(crate::gen::DiagQuestion, String)>,
     pub(crate) diag_current: Option<crate::gen::DiagQuestion>,
     pub(crate) diag_single: Option<usize>,
@@ -161,15 +166,17 @@ impl DiagController {
         if text.is_empty() {
             return;
         }
-        self.begin_diag(cx, &text, route, rag, toast_until, ai_config);
+        self.begin_diag(cx, &text, "", route, rag, toast_until, ai_config);
     }
 
-    /// Enter the diagnostic phase for `goal`: reset the session, switch the
+    /// Enter the diagnostic phase for `goal` (targeting the root card at
+    /// `root`, empty for the startup flow): reset the session, switch the
     /// popup to the interview view, and fire the first question.
     pub(crate) fn begin_diag(
         &mut self,
         cx: &mut Cx,
         goal: &str,
+        root: &str,
         route: &mut RouteController,
         rag: Option<&crate::rag::service::RagService>,
         toast_until: &mut Option<Instant>,
@@ -185,6 +192,7 @@ impl DiagController {
         }
         self.reset_diag();
         self.diag_goal = goal.trim().to_string();
+        self.diag_root = root.trim().to_string();
         // The user has committed to a goal: the launch temp map stops being
         // temporary. Ask the model for a name; the temp file is renamed when
         // the reply lands (goal text as fallback).
@@ -589,6 +597,7 @@ impl DiagController {
         ai_config: &crate::ai::AIConfig,
     ) {
         let goal = self.diag_goal.clone();
+        let root = self.diag_root.clone();
         let mut diag = crate::gen::format_diag_history(&self.diag_history);
         if !summary.is_empty() {
             if !diag.is_empty() {
@@ -598,12 +607,13 @@ impl DiagController {
         }
         self.reset_diag();
         route.close_startup(cx, self);
-        route.start_route_plan(cx, &goal, &diag, rag, toast_until, ai_config);
+        route.start_route_plan(cx, &goal, &root, &diag, rag, toast_until, ai_config);
     }
 
     pub(crate) fn reset_diag(&mut self) {
         self.diag_id = LiveId::empty();
         self.diag_goal.clear();
+        self.diag_root.clear();
         self.diag_history.clear();
         self.diag_current = None;
         self.diag_single = None;
@@ -641,10 +651,11 @@ impl App {
         );
     }
 
-    pub(crate) fn begin_diag(&mut self, cx: &mut Cx, goal: &str) {
+    pub(crate) fn begin_diag(&mut self, cx: &mut Cx, goal: &str, root: &str) {
         self.diag.begin_diag(
             cx,
             goal,
+            root,
             &mut self.route,
             self.rag.as_ref(),
             &mut self.toast_until,

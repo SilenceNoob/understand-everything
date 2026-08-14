@@ -108,6 +108,35 @@ pub enum CardType {
     Knowledge,
 }
 
+/// Archetype the user picks in the create-card dialog; mirrors `CardType`
+/// but is user-supplied (the AI must not change it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NewCardType {
+    /// 判别模型卡 (concept card).
+    #[default]
+    Concept,
+    /// 联结模型卡 (knowledge card).
+    Knowledge,
+}
+
+impl NewCardType {
+    /// Full name for prompts/toasts: 概念（判别模型）/知识（联结模型）.
+    pub fn label(self) -> &'static str {
+        match self {
+            NewCardType::Concept => "概念（判别模型）",
+            NewCardType::Knowledge => "知识（联结模型）",
+        }
+    }
+
+    /// Short badge-style name: 判别模型/联结模型.
+    pub fn short(self) -> &'static str {
+        match self {
+            NewCardType::Concept => "判别模型",
+            NewCardType::Knowledge => "联结模型",
+        }
+    }
+}
+
 /// Detect a card's archetype from the route-seeded marker line
 /// `#c 知识类型 联结模型` (absent -> concept, the legacy default).
 pub fn card_type(body: &str) -> CardType {
@@ -241,6 +270,123 @@ fn parse_judge(v: JudgeResp) -> Result<SubcardJudge, String> {
         input_space: v.input_space,
         output_space: v.output_space,
     })
+}
+
+/// The AI's plan for a user-requested card: title, input/output summaries,
+/// and the suggested parent card (an existing card's display title, or None
+/// when the topic is unrelated to the current map).
+pub struct CreateCardPlan {
+    pub title: String,
+    pub input: String,
+    pub output: String,
+    pub input_space: String,
+    pub output_space: String,
+    pub parent: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateResp {
+    title: String,
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    input_space: String,
+    #[serde(default)]
+    output_space: String,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+/// Messages for creating a card from a user-supplied topic: the type is
+/// already chosen by the user (never re-judged), the model only names the
+/// card, summarizes its input/output, and picks the most related existing
+/// card as parent (null when nothing matches). `map_context` is the current
+/// map's card list ("标题（类型）" lines); `context` is the RAG excerpt block.
+pub fn create_card_messages(
+    topic: &str,
+    ctype: NewCardType,
+    map_context: &str,
+    context: &str,
+) -> (String, String) {
+    let type_cn = ctype.label();
+    let system = format!(
+        "你是一位学习卡片写作助手。用户想在思维导图上创建一张新卡片并给出了主题，卡片正文稍后由另一个助手按标准板块格式生成，你不需要写正文。\n\
+         \n\
+         【任务】\n\
+         1. 为卡片起一个自然名称（不要带序号前缀，不要含 / 、\\ 等路径字符）。\n\
+         2. 概括这张卡片的输入输出（第一原则：明确输入输出）。\n\
+         3. 从「当前地图已有卡片」清单中，选出与新卡片在内容上最相关的一张卡片作为父卡（新卡片将挂到它的下面）。如果新卡片与清单中所有卡片都明显无关，parent 填 null。\n\
+         \n\
+         【类型】\n\
+         用户已指定卡片类型为：{type_cn}，你必须遵守，不要更改。\n\
+         - 概念（判别模型）：描述「一类事物的判定依据/共有属性」，用于把对象归类。\n\
+         - 知识（联结模型）：描述「两类现象之间的映射/规律」，由输入推测输出，存在明确的「输入→输出」关系。\n\
+         \n\
+         【输出格式】\n\
+         必须只输出 JSON 对象，不要 markdown 代码块、不要任何解释或前后缀文字：\n\
+         {{\n\
+           \"title\": \"自然名称\",\n\
+           \"input\": \"输入空间的现象，一句话概括\",\n\
+           \"output\": \"输出空间的结果，一句话概括\",\n\
+           \"input_space\": \"输入空间的详细描述，仅联结模型填写，概念卡留空字符串\",\n\
+           \"output_space\": \"输出空间的详细描述，仅联结模型填写，概念卡留空字符串\",\n\
+           \"parent\": \"现有卡片标题之一（原样复制清单中的标题），或 null\"\n\
+         }}\n\
+         概念卡（判别模型）的 input/output 按标准形式填写：输入=论域内所有现象（可结合主题具体化论域），\
+         输出=此概念/非此概念。联结模型卡：input/output 用一句话概括，input_space 写清哪些现象属于输入空间\
+         （适用对象，含判别特征），output_space 写清输出空间涵盖什么结果。"
+    );
+    let mut user = format!("【卡片类型】{type_cn}\n【主题】{topic}\n");
+    if !map_context.is_empty() {
+        user.push_str(&format!(
+            "\n【当前地图已有卡片】（标题（类型）；parent 只能从这些标题中原文选择）\n{map_context}\n"
+        ));
+    }
+    if !context.is_empty() {
+        user.push_str(&format!("\n参考资料（供概括时参考，可能不完整）：\n{context}\n"));
+    }
+    user.push_str("\n请输出 JSON。");
+    (system, user)
+}
+
+/// Parse the create-card response. Tolerates prose around the object:
+/// extracts the first parseable `{` .. `}` span (last `{` backwards).
+pub fn parse_create_card(text: &str) -> Result<CreateCardPlan, String> {
+    let t = strip_json_fence(text);
+    let mut last_err = String::new();
+    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
+        let cand = &t[i..];
+        let cand = match cand.rfind('}') {
+            Some(e) => &cand[..=e],
+            None => cand,
+        };
+        match serde_json::from_str::<CreateResp>(cand) {
+            Ok(v) => {
+                let title = v.title.trim().to_string();
+                if title.is_empty() {
+                    return Err("标题为空".to_string());
+                }
+                return Ok(CreateCardPlan {
+                    title,
+                    input: v.input,
+                    output: v.output,
+                    input_space: v.input_space,
+                    output_space: v.output_space,
+                    parent: v
+                        .parent
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty()),
+                });
+            }
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(last_err);
+    }
+    Err("JSON 解析失败: 未找到 JSON 对象".to_string())
 }
 
 
@@ -1427,6 +1573,40 @@ mod tests {
         assert_eq!(card_type("#d 学习目标\nx"), CardType::Concept);
         assert_eq!(card_type("#c 知识类型 联结模型\nx"), CardType::Knowledge);
         assert_eq!(card_type("#c 知识类型 概念\nx"), CardType::Concept);
+    }
+
+    #[test]
+    fn parse_create_card_ok_and_fenced() {
+        let text = r#"{"title":"所有权","input":"论域内的现象","output":"此概念/非此概念","input_space":"","output_space":"","parent":"Rust"}"#;
+        let plan = parse_create_card(text).unwrap();
+        assert_eq!(plan.title, "所有权");
+        assert_eq!(plan.parent.as_deref(), Some("Rust"));
+        assert!(plan.input_space.is_empty());
+        // fenced + prose around it, parent null
+        let text = "好的\n```json\n{\"title\":\"浮力定律\",\"input\":\"浸入液体的物体\",\"output\":\"浮力大小\",\"input_space\":\"所有浸入液体的物体\",\"output_space\":\"浮力值\",\"parent\":null}\n```";
+        let plan = parse_create_card(text).unwrap();
+        assert_eq!(plan.title, "浮力定律");
+        assert_eq!(plan.parent, None);
+        assert_eq!(plan.input_space, "所有浸入液体的物体");
+        // empty title rejected
+        assert!(parse_create_card(r#"{"title":"  ","parent":null}"#).is_err());
+        assert!(parse_create_card("没有 JSON").is_err());
+    }
+
+    #[test]
+    fn create_card_messages_forces_user_type_and_lists_parents() {
+        let (system, user) = create_card_messages(
+            "浮力",
+            NewCardType::Knowledge,
+            "「密度」（判别模型）\n「液体」（判别模型）",
+            "参考资料片段",
+        );
+        assert!(system.contains("知识（联结模型）"), "{system}");
+        assert!(system.contains("用户已指定卡片类型"), "{system}");
+        assert!(user.contains("【卡片类型】知识（联结模型）"), "{user}");
+        assert!(user.contains("「密度」（判别模型）"), "{user}");
+        assert!(user.contains("参考资料片段"), "{user}");
+        assert!(user.contains("【主题】浮力"), "{user}");
     }
 
     #[test]
