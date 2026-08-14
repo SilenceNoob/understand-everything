@@ -20,21 +20,59 @@ pub(crate) struct GenWait {
     started: Instant,
 }
 
-/// Card-generation state + logic, extracted from App.
+/// One card's generation queue: sections are generated one request at a time
+/// (a thinking model can't eat the whole output budget with reasoning), so the
+/// task keeps the remaining queue plus the id of the request in flight.
+pub(crate) struct GenTask {
+    /// Request id of the section currently in flight (fresh per section).
+    id: LiveId,
+    path: String,
+    title: String,
+    context: String,
+    /// Sections still to generate after the in-flight one.
+    sections: Vec<GenSection>,
+    /// Total section count, for the progress indicator.
+    total: usize,
+}
+
+/// One 生成子卡片 phase-1 request (type/title/input/output judgement).
+pub(crate) struct SubcardTask {
+    id: LiveId,
+    parent: String,
+    selected: String,
+}
+
+/// Card-generation state + logic, extracted from App. Unlike the single-slot
+/// controller this replaced, generation is keyed per card: any number of cards
+/// can generate at once (each card still queues its own sections serially),
+/// and 生成子卡片 judgement requests run in parallel the same way.
 #[derive(Default)]
 pub(crate) struct GenController {
     pub(crate) ui: WidgetRef,
-    pub(crate) gen_wait: Option<GenWait>,
-    pub(crate) gen_id: LiveId,
-    pub(crate) gen_path: String,
-    pub(crate) gen_sections: Vec<GenSection>,
-    pub(crate) gen_total: usize,
-    pub(crate) gen_context: String,
-    pub(crate) gen_title: String,
-    pub(crate) subcard_id: LiveId,
-    pub(crate) subcard_parent: String,
+    /// Deferred generation requests waiting on hybrid RAG retrieval.
+    pub(crate) gen_waits: Vec<GenWait>,
+    /// Card-generation queues, one per card, each firing one request at a time.
+    pub(crate) gen_tasks: Vec<GenTask>,
+    /// Subcard judgement requests in flight (deduped per parent + selection).
+    pub(crate) subcards: Vec<SubcardTask>,
 }
 impl GenController {
+    /// Whether a generation queue (running or awaiting retrieval) targets path.
+    pub(crate) fn is_generating(&self, path: &str) -> bool {
+        self.gen_waits.iter().any(|w| w.path == path)
+            || self.gen_tasks.iter().any(|t| t.path == path)
+    }
+
+    /// Whether id belongs to a card-generation request in flight.
+    pub(crate) fn is_gen_request(&self, id: LiveId) -> bool {
+        self.gen_tasks.iter().any(|t| t.id == id)
+    }
+
+    /// Whether id belongs to a subcard-judgement request in flight.
+    pub(crate) fn is_subcard_request(&self, id: LiveId) -> bool {
+        self.subcards.iter().any(|t| t.id == id)
+    }
+
     pub(crate) fn start_generation(
         &mut self,
         cx: &mut Cx,
@@ -43,7 +81,9 @@ impl GenController {
         rag: Option<&rag::service::RagService>,
         ai_config: &crate::ai::AIConfig,
     ) {
-        if self.gen_wait.is_some() || self.gen_id != LiveId::empty() {
+        // One queue per card: while it runs (or waits on retrieval) further
+        // requests for the same card are dropped, other cards run in parallel.
+        if self.is_generating(path) {
             return;
         }
         let title = std::path::Path::new(path)
@@ -65,7 +105,7 @@ impl GenController {
         let upgradeable = rag.is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
         if upgradeable {
             let rx = rag.unwrap().retrieve(&title);
-            self.gen_wait = Some(GenWait {
+            self.gen_waits.push(GenWait {
                 path: path.to_string(),
                 sections,
                 title: title.clone(),
@@ -88,94 +128,145 @@ impl GenController {
         context: &str,
         ai_config: &crate::ai::AIConfig,
     ) {
-        self.gen_path = path.to_string();
-        self.gen_title = title.to_string();
-        self.gen_context = context.to_string();
-        self.gen_total = sections.len();
+        let total = sections.len();
         let Some(first) = sections.drain(..1).next() else {
             return;
         };
-        self.gen_sections = sections;
-        self.send_gen_section(cx, first, ai_config);
+        let task = GenTask {
+            id: LiveId::unique(),
+            path: path.to_string(),
+            title: title.to_string(),
+            context: context.to_string(),
+            sections,
+            total,
+        };
+        self.gen_tasks.push(task);
+        let idx = self.gen_tasks.len() - 1;
+        self.send_gen_section(cx, idx, first, ai_config);
     }
 
     /// Fire the HTTP request for one generation section, with progress.
-    pub(crate) fn send_gen_section(
+    fn send_gen_section(
         &mut self,
         cx: &mut Cx,
+        idx: usize,
         section: GenSection,
         ai_config: &crate::ai::AIConfig,
     ) {
-        self.gen_id = LiveId::unique();
-        let done = self.gen_total.saturating_sub(self.gen_sections.len() + 1);
-        let indicator = format!("生成中… ({}/{})", done + 1, self.gen_total);
-        set_card_title_indicator(&self.ui, cx, &self.gen_path, Some(&indicator));
-        let body = std::fs::read_to_string(crate::util::data_dir().join(&self.gen_path))
+        let Some(task) = self.gen_tasks.get_mut(idx) else {
+            return;
+        };
+        task.id = LiveId::unique();
+        let id = task.id;
+        let done = task.total.saturating_sub(task.sections.len() + 1);
+        let indicator = format!("生成中… ({}/{})", done + 1, task.total);
+        let path = task.path.clone();
+        set_card_title_indicator(&self.ui, cx, &path, Some(&indicator));
+        let body = std::fs::read_to_string(crate::util::data_dir().join(&path))
             .unwrap_or_default();
         let ctype = crate::gen::card_type(&body);
-        let (system, user) = generation_messages(section, &self.gen_title, &self.gen_context, ctype);
+        let (system, user) = generation_messages(section, &task.title, &task.context, ctype);
         ai::chat_completions(
             cx,
-            self.gen_id,
-            &ai_config,
+            id,
+            ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
             358400,
         );
     }
 
-    /// Abort the current generation queue and surface `msg` as a toast.
-    pub(crate) fn abort_generation(
+    /// Drop the card-generation queue at idx and surface msg as a toast.
+    pub(crate) fn abort_task(
         &mut self,
         cx: &mut Cx,
+        idx: usize,
         msg: String,
         toast_until: &mut Option<Instant>,
     ) {
-        self.gen_sections.clear();
-        set_card_title_indicator(&self.ui, cx, &self.gen_path, None);
+        let Some(task) = self.gen_tasks.get(idx) else {
+            show_toast(&self.ui, toast_until, cx, &msg);
+            return;
+        };
+        let path = task.path.clone();
+        self.gen_tasks.remove(idx);
+        set_card_title_indicator(&self.ui, cx, &path, None);
         show_toast(&self.ui, toast_until, cx, &msg);
+    }
+
+    /// A card-generation request failed at the transport level: drop its
+    /// queue and toast.
+    pub(crate) fn gen_request_failed(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        msg: String,
+        toast_until: &mut Option<Instant>,
+    ) {
+        if let Some(idx) = self.gen_tasks.iter().position(|t| t.id == request_id) {
+            self.abort_task(cx, idx, msg, toast_until);
+        }
+    }
+
+    /// A subcard-judgement request failed at the transport level.
+    pub(crate) fn subcard_request_failed(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        msg: String,
+        toast_until: &mut Option<Instant>,
+    ) {
+        if let Some(idx) = self.subcards.iter().position(|t| t.id == request_id) {
+            self.subcards.remove(idx);
+            show_toast(&self.ui, toast_until, cx, &msg);
+        }
     }
 
     pub(crate) fn handle_gen_response(
         &mut self,
         cx: &mut Cx,
+        request_id: LiveId,
         response: &HttpResponse,
         rag: Option<&rag::service::RagService>,
         toast_until: &mut Option<Instant>,
         ai_config: &crate::ai::AIConfig,
     ) {
-        self.gen_id = LiveId::empty();
+        let Some(idx) = self.gen_tasks.iter().position(|t| t.id == request_id) else {
+            return;
+        };
         let status = response.status_code;
-        let full_path = crate::util::data_dir().join(&self.gen_path);
         if status != 200 {
             let detail = response
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
-            self.abort_generation(cx, format!("生成失败 ({})：{}", status, detail), toast_until);
+            self.abort_task(cx, idx, format!("生成失败 ({})：{}", status, detail), toast_until);
             return;
         }
         let content = ai::response_content(response).unwrap_or_default();
         let sections = parse_generation_output(&content);
         if sections.is_empty() {
             let debug = ai::response_debug_preview(response);
-            self.abort_generation(cx, format!("生成返回为空或格式不正确（{debug}）"), toast_until);
+            self.abort_task(cx, idx, format!("生成返回为空或格式不正确（{debug}）"), toast_until);
             return;
         }
+        let path = self.gen_tasks[idx].path.clone();
+        let full_path = crate::util::data_dir().join(&path);
         let body = std::fs::read_to_string(&full_path).unwrap_or_default();
         let new_body = upsert_sections(&body, &sections);
         if let Err(e) = std::fs::write(&full_path, &new_body) {
-            self.abort_generation(cx, format!("保存卡片失败：{}", e), toast_until);
+            self.abort_task(cx, idx, format!("保存卡片失败：{}", e), toast_until);
             return;
         }
         // Update the card body if the card is still in the current map.
         let mind_map = self.ui.mind_map(cx, ids!(mindmap));
         mind_map.update_card_body(cx, &full_path, new_body);
         // Continue the queue, or finish when it is exhausted.
-        if !self.gen_sections.is_empty() {
-            let next = self.gen_sections.remove(0);
-            self.send_gen_section(cx, next, ai_config);
+        if !self.gen_tasks[idx].sections.is_empty() {
+            let next = self.gen_tasks[idx].sections.remove(0);
+            self.send_gen_section(cx, idx, next, ai_config);
         } else {
-            set_card_title_indicator(&self.ui, cx, &self.gen_path, None);
+            self.gen_tasks.remove(idx);
+            set_card_title_indicator(&self.ui, cx, &path, None);
             if let Some(rag) = rag {
                 rag.set_map(&self.ui.mind_map(cx, ids!(mindmap)).current_map_file().unwrap_or_default());
             }
@@ -193,7 +284,13 @@ impl GenController {
         rag: Option<&rag::service::RagService>,
         ai_config: &crate::ai::AIConfig,
     ) {
-        if self.subcard_id != LiveId::empty() {
+        // One judge request per (parent, selection): identical re-clicks are
+        // dropped, other cards/selections run in parallel.
+        if self
+            .subcards
+            .iter()
+            .any(|t| t.parent == parent && t.selected == selected)
+        {
             return;
         }
         let base = crate::util::data_dir();
@@ -205,12 +302,16 @@ impl GenController {
         let ctx = rag_bm25_context(rag, selected);
         let (system, user) =
             crate::gen::subcard_judge_messages(&parent_title, &parent_body, selected, &ctx);
-        self.subcard_parent = parent.to_string();
-        self.subcard_id = LiveId::unique();
+        let id = LiveId::unique();
+        self.subcards.push(SubcardTask {
+            id,
+            parent: parent.to_string(),
+            selected: selected.to_string(),
+        });
         ai::chat_completions(
             cx,
-            self.subcard_id,
-            &ai_config,
+            id,
+            ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
             358400,
         );
@@ -219,13 +320,17 @@ impl GenController {
     pub(crate) fn handle_subcard_response(
         &mut self,
         cx: &mut Cx,
+        request_id: LiveId,
         response: &HttpResponse,
         rag: Option<&rag::service::RagService>,
         toast_until: &mut Option<Instant>,
         ai_config: &crate::ai::AIConfig,
     ) {
-        self.subcard_id = LiveId::empty();
+        let Some(idx) = self.subcards.iter().position(|t| t.id == request_id) else {
+            return;
+        };
         if response.status_code != 200 {
+            self.subcards.remove(idx);
             let detail = response
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
@@ -237,13 +342,15 @@ impl GenController {
         let judge = match crate::gen::parse_subcard_judge(&content) {
             Ok(v) => v,
             Err(e) => {
+                self.subcards.remove(idx);
                 let preview = ai::response_debug_preview(response);
                 show_toast(&self.ui, toast_until, cx, &format!("生成子卡片失败：{e}（{preview}）"));
                 return;
             }
         };
+        let parent_rel = self.subcards[idx].parent.clone();
+        self.subcards.remove(idx);
         let base = crate::util::data_dir();
-        let parent_rel = self.subcard_parent.clone();
         let parent_path = base.join(&parent_rel);
         let dir = parent_path
             .parent()
@@ -319,6 +426,8 @@ impl GenController {
                 );
                 // Phase 2: the per-section pipeline fills the card body
                 // (each section in its own request — immune to truncation).
+                // The new card has no queue yet, so it starts immediately even
+                // while other cards are still generating.
                 self.start_generation(cx, &rel, crate::gen::GenSection::All, rag, ai_config);
             }
             None => show_toast(&self.ui, toast_until, cx, "生成子卡片失败：无法创建卡片文件。"),
@@ -326,62 +435,70 @@ impl GenController {
     }
 }
 impl GenController {
-    /// Poll deferred card-generation retrieval and promote it to a real request.
+    /// Poll deferred card-generation retrievals and promote the ready ones to
+    /// real requests (each wait is polled independently, so several cards can
+    /// be promoted in the same tick).
     pub(crate) fn poll_gen_wait(
         &mut self,
         cx: &mut Cx,
         ai_config: &crate::ai::AIConfig,
     ) {
-        let Some(wait) = &mut self.gen_wait else { return };
         let now = Instant::now();
-        let hits = match wait.rx.try_recv() {
-            Ok(r) if r.query == wait.title => Some(r.hits),
-            Ok(_) => None,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
-                    Some(Vec::new())
-                } else {
-                    None
+        let mut ready: Vec<(String, Vec<GenSection>, String, String)> = Vec::new();
+        self.gen_waits.retain(|wait| {
+            let hits = match wait.rx.try_recv() {
+                Ok(r) if r.query == wait.title => Some(r.hits),
+                Ok(_) => None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                        Some(Vec::new())
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => Some(Vec::new()),
+            };
+            match hits {
+                None => true,
+                Some(hits) => {
+                    let ctx = if hits.is_empty() {
+                        wait.fallback.clone()
+                    } else {
+                        rag::service::format_context(&hits)
+                    };
+                    ready.push((wait.path.clone(), wait.sections.clone(), wait.title.clone(), ctx));
+                    false
                 }
             }
-            Err(_) => Some(Vec::new()),
-        };
-        let Some(hits) = hits else { return };
-        let ctx = if hits.is_empty() {
-            wait.fallback.clone()
-        } else {
-            rag::service::format_context(&hits)
-        };
-        let path = wait.path.clone();
-        let sections = std::mem::take(&mut wait.sections);
-        let title = wait.title.clone();
-        self.gen_wait = None;
-        self.send_generation(cx, &path, sections, &title, &ctx, ai_config);
+        });
+        for (path, sections, title, ctx) in ready {
+            self.send_generation(cx, &path, sections, &title, &ctx, ai_config);
+        }
     }
 }
 
 impl App {
     /// Forwarding shims (state lives in GenController).
     pub(crate) fn start_generation(&mut self, cx: &mut Cx, path: &str, section: GenSection) {
+        if self.gen.is_generating(path) {
+            show_toast(&self.ui, &mut self.toast_until, cx, "该卡片正在生成中，请稍候");
+            return;
+        }
         self.gen.start_generation(cx, path, section, self.rag.as_ref(), &self.ai_config);
     }
 
-    pub(crate) fn abort_generation(&mut self, cx: &mut Cx, msg: String) {
-        self.gen.abort_generation(cx, msg, &mut self.toast_until);
-    }
-
-    pub(crate) fn handle_gen_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+    pub(crate) fn handle_gen_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
         self.gen
-            .handle_gen_response(cx, response, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
+            .handle_gen_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
     }
 
     pub(crate) fn start_subcard_gen(&mut self, cx: &mut Cx, parent: &str, selected: &str) {
         self.gen.start_subcard_gen(cx, parent, selected, self.rag.as_ref(), &self.ai_config);
     }
 
-    pub(crate) fn handle_subcard_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+    pub(crate) fn handle_subcard_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
         self.gen
-            .handle_subcard_response(cx, response, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
+            .handle_subcard_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
     }
 
     pub(crate) fn handle_gen_rag_tick(&mut self, cx: &mut Cx) {

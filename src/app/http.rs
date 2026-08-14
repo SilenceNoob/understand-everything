@@ -32,12 +32,12 @@ impl MatchEvent for App {
             .set_text(cx, &msg);
             return;
         }
-        if request_id == self.gen.gen_id && self.gen.gen_id != LiveId::empty() {
-            self.handle_gen_response(cx, response);
+        if self.gen.is_gen_request(request_id) {
+            self.handle_gen_response(cx, request_id, response);
             return;
         }
-        if request_id == self.gen.subcard_id && self.gen.subcard_id != LiveId::empty() {
-            self.handle_subcard_response(cx, response);
+        if self.gen.is_subcard_request(request_id) {
+            self.handle_subcard_response(cx, request_id, response);
             return;
         }
         if request_id == self.diag.diag_id && self.diag.diag_id != LiveId::empty() {
@@ -73,14 +73,22 @@ impl MatchEvent for App {
             .set_text(cx, &format!("连接失败：{}", err.message));
             return;
         }
-        if request_id == self.gen.gen_id && self.gen.gen_id != LiveId::empty() {
-            self.gen.gen_id = LiveId::empty();
-            self.abort_generation(cx, format!("生成请求失败：{}", err.message));
+        if self.gen.is_gen_request(request_id) {
+            self.gen.gen_request_failed(
+                cx,
+                request_id,
+                format!("生成请求失败：{}", err.message),
+                &mut self.toast_until,
+            );
             return;
         }
-        if request_id == self.gen.subcard_id && self.gen.subcard_id != LiveId::empty() {
-            self.gen.subcard_id = LiveId::empty();
-            self.show_toast(cx, &format!("生成子卡片失败：{}", err.message));
+        if self.gen.is_subcard_request(request_id) {
+            self.gen.subcard_request_failed(
+                cx,
+                request_id,
+                format!("生成子卡片失败：{}", err.message),
+                &mut self.toast_until,
+            );
             return;
         }
         if request_id == self.route.route_id && self.route.route_id != LiveId::empty() {

@@ -2,7 +2,7 @@ use makepad_widgets::*;
 
 
 use crate::ai::{self};
-use crate::app::{popup_child, popup_widget, show_toast, toast_widget};
+use crate::app::{popup_child, popup_widget, toast_widget};
 use crate::bottom_bar::BottomBarWidgetRefExt;
 use crate::float_panel::FloatPanelWidgetRefExt;
 use crate::popup_panel::PopupPanelWidgetRefExt;
@@ -26,11 +26,6 @@ impl App {
     /// live children like the popups.
     pub(crate) fn toast_widget(&self) -> WidgetRef {
         toast_widget(&self.ui)
-    }
-
-    /// Show a 5-second corner toast; replaces any toast still showing.
-    pub(crate) fn show_toast(&mut self, cx: &mut Cx, msg: &str) {
-        show_toast(&self.ui, &mut self.toast_until, cx, msg);
     }
 
     /// Setting/About popup close buttons.
