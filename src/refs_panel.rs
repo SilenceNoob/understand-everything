@@ -638,15 +638,13 @@ impl RefsPanel {
     /// coords; registers the panel rect for the mindmap's pointer guards.
     fn compute_rects(&mut self, cx: &Cx2d) -> Rect {
         self.window_size = cx.current_pass_size();
-        let body_y = cx.turtle().rect().pos.y; // body top, window coords
-        let body_h = (self.window_size.y - body_y).max(0.0);
-        // 85% of the body height, centered vertically.
-        let panel_h = body_h * crate::util::SIDE_PANEL_H_FRAC;
-        let y_off = (body_h - panel_h) * 0.5;
+        // 95% of the window height, centered vertically.
+        let panel_h = self.window_size.y * crate::util::SIDE_PANEL_H_FRAC;
+        let y_off = (self.window_size.y - panel_h) * 0.5;
         let panel = Rect {
             pos: dvec2(
                 self.window_size.x - (crate::util::SIDE_PANEL_GAP + self.panel_w) * self.slide.progress,
-                body_y + y_off,
+                y_off,
             ),
             size: dvec2(self.panel_w, panel_h),
         };

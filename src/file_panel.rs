@@ -471,8 +471,7 @@ impl WidgetNode for FilePanel {
 impl Widget for FilePanel {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         self.window_size = cx.current_pass_size();
-        let body_y = cx.turtle().rect().pos.y; // body top, window coords
-        let geo = panel_geometry(self.slide.progress, self.split, self.panel_w, self.window_size, body_y);
+        let geo = panel_geometry(self.slide.progress, self.split, self.panel_w, self.window_size);
         self.panel_rect = geo.panel;
         self.tab_rect = geo.tab;
         self.splitter_rect = geo.splitter;
@@ -802,27 +801,27 @@ mod test {
     #[test]
     fn geometry_open_collapsed_and_clamped_tab() {
         let window = dvec2(1440.0, 900.0);
-        let h = 866.0 * crate::util::SIDE_PANEL_H_FRAC;
-        let y = 34.0 + (866.0 - h) * 0.5;
-        // open: panel is 95% of the body height, centered, 8px off the left
+        let h = window.y * crate::util::SIDE_PANEL_H_FRAC;
+        let y = (window.y - h) * 0.5;
+        // open: panel is 95% of the window height, centered, 8px off the left
         // edge; the tab straddles the panel's right edge (centering keeps it
-        // at the body center)
-        let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
+        // at the window center)
+        let geo = panel_geometry(1.0, 0.5, 260.0, window);
         assert_eq!(geo.panel, Rect { pos: dvec2(8.0, y), size: dvec2(260.0, h) });
-        assert_eq!(geo.tab, Rect { pos: dvec2(268.0, 443.0), size: dvec2(14.0, 48.0) });
+        assert_eq!(geo.tab, Rect { pos: dvec2(268.0, 426.0), size: dvec2(14.0, 48.0) });
         // collapsed: panel fully off-screen (right edge at x=0), tab parked
         // 8px off the edge
-        let geo = panel_geometry(0.0, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(0.0, 0.5, 260.0, window);
         assert_eq!(geo.panel, Rect { pos: dvec2(-260.0, y), size: dvec2(260.0, h) });
-        assert_eq!(geo.tab, Rect { pos: dvec2(8.0, 443.0), size: dvec2(14.0, 48.0) });
+        assert_eq!(geo.tab, Rect { pos: dvec2(8.0, 426.0), size: dvec2(14.0, 48.0) });
         // half-open: tab tracks the panel edge
-        let geo = panel_geometry(0.5, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(0.5, 0.5, 260.0, window);
         assert_eq!(geo.panel.pos.x, -126.0);
         // window resize shrinks the panel height
-        let geo = panel_geometry(1.0, 0.5, 260.0, dvec2(800.0, 600.0), 34.0);
-        assert_eq!(geo.panel.size.y, 566.0 * crate::util::SIDE_PANEL_H_FRAC);
+        let geo = panel_geometry(1.0, 0.5, 260.0, dvec2(800.0, 600.0));
+        assert_eq!(geo.panel.size.y, 600.0 * crate::util::SIDE_PANEL_H_FRAC);
         // custom width moves the right edge and the tab with it
-        let geo = panel_geometry(1.0, 0.5, 360.0, window, 34.0);
+        let geo = panel_geometry(1.0, 0.5, 360.0, window);
         assert_eq!(geo.panel.size.x, 360.0);
         assert_eq!(geo.tab.pos.x, 368.0);
     }
@@ -830,10 +829,10 @@ mod test {
     #[test]
     fn splitter_strip_tracks_split_and_drag_clamps() {
         let window = dvec2(1440.0, 900.0);
-        let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(1.0, 0.5, 260.0, window);
         let panel = geo.panel;
         // strip (12px grab + 3px margins) centered on the divider line
-        assert_eq!(geo.splitter, Rect { pos: dvec2(8.0, 458.0), size: dvec2(260.0, 18.0) });
+        assert_eq!(geo.splitter, Rect { pos: dvec2(8.0, 441.0), size: dvec2(260.0, 18.0) });
         // dragging the strip center keeps the ratio
         let center = geo.splitter.pos.y + geo.splitter.size.y * 0.5;
         assert!((split_from_y(center, panel, 60.0) - 0.5).abs() < 1e-9);
@@ -844,19 +843,19 @@ mod test {
             1.0 - 60.0 / panel.size.y
         );
         // collapsed panel: strip slides off-screen with it
-        let geo = panel_geometry(0.0, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(0.0, 0.5, 260.0, window);
         assert_eq!(geo.splitter.pos.x, -260.0);
     }
 
     #[test]
     fn edge_strip_and_width_clamp() {
         let window = dvec2(1440.0, 900.0);
-        let h = 866.0 * crate::util::SIDE_PANEL_H_FRAC;
+        let h = window.y * crate::util::SIDE_PANEL_H_FRAC;
         // edge strip hugs the panel's right edge (8px inside, 4px overhang)
-        let geo = panel_geometry(1.0, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(1.0, 0.5, 260.0, window);
         assert_eq!(
             geo.edge,
-            Rect { pos: dvec2(260.0, 34.0 + (866.0 - h) * 0.5), size: dvec2(12.0, h) }
+            Rect { pos: dvec2(260.0, (window.y - h) * 0.5), size: dvec2(12.0, h) }
         );
         // width follows the cursor (right edge at abs x), clamped to 140..520
         let panel = geo.panel;
@@ -864,7 +863,7 @@ mod test {
         assert_eq!(panel_w_from_x(panel.pos.x + 50.0, panel, 140.0, 520.0), 140.0);
         assert_eq!(panel_w_from_x(panel.pos.x + 700.0, panel, 140.0, 520.0), 520.0);
         // collapsed panel: edge slides off-screen with it
-        let geo = panel_geometry(0.0, 0.5, 260.0, window, 34.0);
+        let geo = panel_geometry(0.0, 0.5, 260.0, window);
         assert_eq!(geo.edge.pos.x, -8.0);
     }
 

@@ -289,18 +289,17 @@ pub(crate) struct PanelGeo {
 /// Panel body, tab, divider-strip and edge rects for a given slide progress
 /// (0 = collapsed off the left edge, 1 = fully open), split fraction and
 /// panel width.
-pub(crate) fn panel_geometry(slide: f64, split: f64, panel_w: f64, window: DVec2, body_y: f64) -> PanelGeo {
-    let body_h = (window.y - body_y).max(0.0);
-    // 95% of the body height, centered vertically.
-    let panel_h = body_h * crate::util::SIDE_PANEL_H_FRAC;
-    let y_off = (body_h - panel_h) * 0.5;
+pub(crate) fn panel_geometry(slide: f64, split: f64, panel_w: f64, window: DVec2) -> PanelGeo {
+    // 95% of the window height, centered vertically.
+    let panel_h = window.y * crate::util::SIDE_PANEL_H_FRAC;
+    let y_off = (window.y - panel_h) * 0.5;
     // GAP keeps the open panel off the window edge; the interpolation
     // (GAP+panel_w)*slide - panel_w puts the collapsed panel fully outside
     // (right edge flush with x=0) so no sliver shows while the tab stays
     // parked at the gap.
     let offset_x = (crate::util::SIDE_PANEL_GAP + panel_w) * slide - panel_w;
     let panel = Rect {
-        pos: dvec2(offset_x, body_y + y_off),
+        pos: dvec2(offset_x, y_off),
         size: dvec2(panel_w, panel_h),
     };
     // Tab protrudes fully outside the panel, flush against its right edge;
