@@ -53,6 +53,12 @@ pub(crate) struct CreateTask {
     auto_attach: bool,
 }
 
+/// One 重新估计学习序号 request (root card rel path).
+pub(crate) struct ReorderTask {
+    id: LiveId,
+    root: String,
+}
+
 /// Card-generation state + logic, extracted from App. Unlike the single-slot
 /// controller this replaced, generation is keyed per card: any number of cards
 /// can generate at once (each card still queues its own sections serially),
@@ -68,6 +74,8 @@ pub(crate) struct GenController {
     pub(crate) subcards: Vec<SubcardTask>,
     /// Create-card requests in flight (parallel, like subcards).
     pub(crate) creates: Vec<CreateTask>,
+    /// 重新估计学习序号 requests in flight.
+    pub(crate) reorders: Vec<ReorderTask>,
 }
 impl GenController {
     /// Whether a generation queue (running or awaiting retrieval) targets path.
@@ -89,6 +97,11 @@ impl GenController {
     /// Whether id belongs to a create-card request in flight.
     pub(crate) fn is_create_request(&self, id: LiveId) -> bool {
         self.creates.iter().any(|t| t.id == id)
+    }
+
+    /// Whether id belongs to a reorder request in flight.
+    pub(crate) fn is_reorder_request(&self, id: LiveId) -> bool {
+        self.reorders.iter().any(|t| t.id == id)
     }
 
     pub(crate) fn start_generation(
@@ -660,6 +673,115 @@ impl GenController {
             rag.set_map(&mind_map.current_map_file().unwrap_or_default());
         }
     }
+
+    /// 重新估计学习序号: ask the model for a title→order mapping of the
+    /// subtree under the root card at `root_rel`. The root card's title flips
+    /// to 估计序号中… while the request is in flight.
+    pub(crate) fn start_reorder(
+        &mut self,
+        cx: &mut Cx,
+        root_rel: &str,
+        rag: Option<&rag::service::RagService>,
+        toast_until: &mut Option<Instant>,
+        ai_config: &crate::ai::AIConfig,
+    ) {
+        let mind_map = self.ui.mind_map(cx, ids!(mindmap));
+        let entries = mind_map.subtree_entries(root_rel);
+        if entries.is_empty() {
+            show_toast(&self.ui, toast_until, cx, "该根卡片下没有子卡片，无需估计序号。");
+            return;
+        }
+        let root_title = std::path::Path::new(root_rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ctx = rag_bm25_context(rag, &root_title);
+        let (system, user) = crate::gen::reorder_messages(&root_title, &entries, &ctx);
+        set_card_title_indicator(&self.ui, cx, root_rel, Some("估计序号中…"));
+        let id = LiveId::unique();
+        self.reorders.push(ReorderTask {
+            id,
+            root: root_rel.to_string(),
+        });
+        ai::chat_completions(
+            cx,
+            id,
+            ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            358400,
+        );
+    }
+
+    /// A reorder request failed at the transport level: restore the root
+    /// title and toast.
+    pub(crate) fn reorder_request_failed(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        msg: String,
+        toast_until: &mut Option<Instant>,
+    ) {
+        if let Some(idx) = self.reorders.iter().position(|t| t.id == request_id) {
+            let root = self.reorders[idx].root.clone();
+            self.reorders.remove(idx);
+            set_card_title_indicator(&self.ui, cx, &root, None);
+            show_toast(&self.ui, toast_until, cx, &msg);
+        }
+    }
+
+    /// A reorder response: apply the title→order mapping to the root's
+    /// subtree, restore the root title, and toast.
+    pub(crate) fn handle_reorder_response(
+        &mut self,
+        cx: &mut Cx,
+        request_id: LiveId,
+        response: &HttpResponse,
+        rag: Option<&rag::service::RagService>,
+        toast_until: &mut Option<Instant>,
+    ) {
+        let Some(idx) = self.reorders.iter().position(|t| t.id == request_id) else {
+            return;
+        };
+        let root = self.reorders[idx].root.clone();
+        self.reorders.remove(idx);
+        if response.status_code != 200 {
+            let detail = response
+                .get_string_body()
+                .and_then(|b| ai::body_error_message(&b))
+                .unwrap_or_default();
+            set_card_title_indicator(&self.ui, cx, &root, None);
+            show_toast(
+                &self.ui,
+                toast_until,
+                cx,
+                &format!("序号估计失败 ({})：{}", response.status_code, detail),
+            );
+            return;
+        }
+        let content = ai::response_content(response).unwrap_or_default();
+        match crate::gen::parse_reorder(&content) {
+            Ok(orders) => {
+                let n = orders.len();
+                self.ui.mind_map(cx, ids!(mindmap)).apply_orders(cx, &root, &orders);
+                set_card_title_indicator(&self.ui, cx, &root, None);
+                show_toast(&self.ui, toast_until, cx, &format!("已重新估计学习序号：{n} 张卡片。"));
+                if let Some(rag) = rag {
+                    rag.set_map(
+                        &self
+                            .ui
+                            .mind_map(cx, ids!(mindmap))
+                            .current_map_file()
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            Err(e) => {
+                let preview = ai::response_debug_preview(response);
+                set_card_title_indicator(&self.ui, cx, &root, None);
+                show_toast(&self.ui, toast_until, cx, &format!("序号估计失败：{e}（{preview}）"));
+            }
+        }
+    }
 }
 impl GenController {
     /// Poll deferred card-generation retrievals and promote the ready ones to
@@ -731,6 +853,11 @@ impl App {
     pub(crate) fn handle_create_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
         self.gen
             .handle_create_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until);
+    }
+
+    pub(crate) fn handle_reorder_response(&mut self, cx: &mut Cx, request_id: LiveId, response: &HttpResponse) {
+        self.gen
+            .handle_reorder_response(cx, request_id, response, self.rag.as_ref(), &mut self.toast_until);
     }
 
     pub(crate) fn handle_gen_rag_tick(&mut self, cx: &mut Cx) {

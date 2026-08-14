@@ -57,6 +57,14 @@ impl MindMap {
                 }
             }
         }
+        // Esc cancels manual connect mode.
+        if self.connect_from.is_some() {
+            if let Event::KeyDown(ke) = event {
+                if ke.key_code == KeyCode::Escape {
+                    self.cancel_connect_mode(cx);
+                }
+            }
+        }
         if self.editing_card.is_none()
             && self.editing_group.is_none()
             && self.order_editing.is_none()

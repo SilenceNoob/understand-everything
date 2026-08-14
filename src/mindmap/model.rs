@@ -172,6 +172,105 @@ impl MindMapData {
         true
     }
 
+    /// Manual edge ops. `connect` attaches `child` under `parent` (the target
+    /// card becomes the parent; the moved card loses its learning-order
+    /// number so a stale 序号 badge can't mislead the learning order).
+    /// Refused for self/duplicate/cycle (a cycle would make the map file
+    /// unloadable). `disconnect` detaches `child` from its parent — the
+    /// subtree becomes an independent root card, order cleared.
+    pub fn connect(&mut self, parent: usize, child: usize) -> Result<(), &'static str> {
+        if parent >= self.nodes.len() || child >= self.nodes.len() {
+            return Err("卡片不存在");
+        }
+        if parent == child {
+            return Err("不能把卡片连到自己下面");
+        }
+        if self.nodes[child].parent == Some(parent) {
+            return Ok(()); // already connected; idempotent
+        }
+        // Cycle check: walk up from `parent`; if `child` sits on that chain,
+        // connecting would create a cycle (and make the map file unloadable).
+        let mut cur = Some(parent);
+        while let Some(i) = cur {
+            if i == child {
+                return Err("不能连线：会形成循环");
+            }
+            cur = self.nodes[i].parent;
+        }
+        self.nodes[child].parent = Some(parent);
+        self.nodes[parent].children.push(child);
+        self.nodes[child].order = None;
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self, child: usize) {
+        if child >= self.nodes.len() {
+            return;
+        }
+        let Some(p) = self.nodes[child].parent else {
+            return;
+        };
+        self.nodes[p].children.retain(|&c| c != child);
+        self.nodes[child].parent = None;
+        self.nodes[child].order = None;
+    }
+
+    /// Remove node `i` and its entire subtree from the map (nodes only; card
+    /// files stay on disk). Groups lose the removed members and cascade-drop
+    /// when empty. Returns the number of nodes removed.
+    pub fn remove_subtree(&mut self, i: usize) -> usize {
+        if i >= self.nodes.len() {
+            return 0;
+        }
+        // Collect the subtree (pre-order from i).
+        let mut drop: Vec<usize> = Vec::new();
+        let mut stack = vec![i];
+        while let Some(x) = stack.pop() {
+            drop.push(x);
+            stack.extend(self.nodes[x].children.iter().copied());
+        }
+        drop.sort_unstable();
+        drop.dedup();
+
+        let mut map: Vec<Option<usize>> = Vec::with_capacity(self.nodes.len());
+        let mut next = 0;
+        for old in 0..self.nodes.len() {
+            if drop.contains(&old) {
+                map.push(None);
+            } else {
+                map.push(Some(next));
+                next += 1;
+            }
+        }
+        let mut nodes: Vec<Node> = Vec::with_capacity(next);
+        for (old, n) in self.nodes.iter().enumerate() {
+            if drop.contains(&old) {
+                continue;
+            }
+            nodes.push(Node {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                path: n.path.clone(),
+                body: n.body.clone(),
+                parent: n.parent.and_then(|p| map[p]),
+                children: n.children.iter().filter_map(|&c| map[c]).collect(),
+                pos: n.pos,
+                size: n.size,
+                subtree_h: n.subtree_h,
+                order: n.order,
+            });
+        }
+        self.nodes = nodes;
+        self.root = self.nodes.iter().position(|n| n.parent.is_none());
+
+        for g in &mut self.groups {
+            g.cards = g.cards.iter().filter_map(|&c| map[c]).collect();
+        }
+        self.prune_empty_groups();
+        self.recompute_bounds();
+        drop.len()
+    }
+
     /// Add a standalone (parent-less) node for the card at `path`, placed at
     /// `pos`. Returns its index. The body file must already exist; the node
     /// keeps its manual position (layout() only places tree children).
@@ -1816,6 +1915,85 @@ mod tests {
         // Duplicate card path is skipped.
         let again = data.attach_route_nodes(ri, &dir, &cards[..1]);
         assert!(again.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn connect_disconnect_guard_cycles_and_clear_order() {
+        let dir = std::env::temp_dir().join(format!("ue-connect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        std::fs::write(dir.join("cards/a.md"), "x").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"r1","title":"","path":"cards/a.md","children":["k1"]},
+                {"id":"k1","title":"","path":"cards/a.md","children":null},
+                {"id":"r2","title":"","path":"cards/a.md","children":null}
+            ]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let r1 = data.nodes.iter().position(|n| n.id == "r1").unwrap();
+        let k1 = data.nodes.iter().position(|n| n.id == "k1").unwrap();
+        let r2 = data.nodes.iter().position(|n| n.id == "r2").unwrap();
+        data.nodes[k1].order = Some(3);
+        // connect r2 under k1: moved card's order clears
+        data.connect(k1, r2).unwrap();
+        assert_eq!(data.nodes[r2].parent, Some(k1));
+        assert_eq!(data.nodes[r2].order, None);
+        assert_eq!(data.nodes[k1].children, vec![r2]);
+        // duplicate connect is a no-op
+        data.connect(k1, r2).unwrap();
+        assert_eq!(data.nodes[k1].children, vec![r2]);
+        // self connect refused
+        assert!(data.connect(r2, r2).is_err());
+        // cycle: connecting k1 under r2 (r2 is k1's child) refused
+        assert!(data.connect(r2, k1).is_err());
+        // cycle through the chain: r1 under r2 refused
+        assert!(data.connect(r2, r1).is_err());
+        // disconnect: r2 becomes an independent root, order stays cleared
+        data.disconnect(r2);
+        assert_eq!(data.nodes[r2].parent, None);
+        assert!(data.nodes[k1].children.is_empty());
+        // write/reload keeps the forest
+        write_map(&dir, &data, dvec2(0.0, 0.0), 1.0, "maps/map.json");
+        let again = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let r2 = again.nodes.iter().position(|n| n.id == "r2").unwrap();
+        assert_eq!(again.nodes[r2].parent, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_subtree_drops_descendants_and_prunes_groups() {
+        let dir = std::env::temp_dir().join(format!("ue-subtree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        std::fs::create_dir_all(dir.join("cards")).unwrap();
+        std::fs::write(dir.join("cards/a.md"), "x").unwrap();
+        std::fs::write(
+            dir.join("maps/map.json"),
+            r#"{"nodes":[
+                {"id":"r1","title":"","path":"cards/a.md","children":["k1","k3"]},
+                {"id":"k1","title":"","path":"cards/a.md","children":["k2"]},
+                {"id":"k2","title":"","path":"cards/a.md","children":null},
+                {"id":"k3","title":"","path":"cards/a.md","children":null},
+                {"id":"r2","title":"","path":"cards/a.md","children":null}
+            ],"groups":[{"id":"g1","title":"g","cards":["k2","k3"],"groups":[]}]}"#,
+        )
+        .unwrap();
+        let mut data = MindMapData::load_from(&dir, "maps/map.json").unwrap();
+        let r1 = data.nodes.iter().position(|n| n.id == "r1").unwrap();
+        // r1 subtree = r1,k1,k2,k3 → removed; r2 survives; group g1 keeps k3? no:
+        // k2/k3 both removed → g1 pruned entirely.
+        let removed = data.remove_subtree(r1);
+        assert_eq!(removed, 4);
+        assert_eq!(data.nodes.len(), 1);
+        assert_eq!(data.nodes[0].id, "r2");
+        assert_eq!(data.nodes[0].parent, None);
+        assert!(data.groups.is_empty());
+        assert_eq!(data.root, Some(0));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

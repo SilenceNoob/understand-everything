@@ -18,6 +18,58 @@ impl MindMap {
         }
     }
 
+    /// Manual connect mode preview: an indigo connector from the source card's
+    /// right edge to the hovered target's left edge (or the cursor), plus a
+    /// glow on both cards. Drawn over the cards.
+    pub(crate) fn draw_connect_preview(&mut self, cx2d: &mut Cx2d, local_view: Rect) {
+        let Some(from) = self.connect_from else { return };
+        // Compute all geometry before borrowing the draw objects (field
+        // borrows and whole-self method calls can't overlap).
+        let p1 = {
+            let r = self.card_rect(from);
+            r.pos + dvec2(r.size.x, r.size.y * 0.5)
+        };
+        let p4 = match self.connect_hover {
+            Some(t) => {
+                let r = self.card_rect(t);
+                r.pos + dvec2(0.0, r.size.y * 0.5)
+            }
+            None => self.connect_cursor,
+        };
+        let r = self.card_rect(from);
+        let r2 = self.connect_hover.map(|t| self.card_rect(t));
+        let reach = ((p4.x - p1.x).abs() * 0.5).clamp(60.0, 220.0);
+        let p2 = p1 + dvec2(reach, 0.0);
+        let p3 = p4 - dvec2(reach, 0.0);
+        if let Some(preview) = &mut self.preview_edge {
+            preview
+                .draw_vars
+                .set_uniform(cx2d, id!(line_color), &[0.49, 0.55, 0.83, 0.9]);
+            draw_edge(cx2d, preview, p1, p2, p3, p4, 2.5, Some(local_view));
+        }
+        // Source + hover-target glow (shared highlight draw, distinct colors).
+        if let Some(hl) = &mut self.highlight {
+            hl.draw_vars.set_uniform(cx2d, id!(color), &[0.49, 0.55, 0.83, 0.5]);
+            hl.draw_abs(
+                cx2d,
+                Rect {
+                    pos: r.pos - dvec2(4.0, 4.0),
+                    size: r.size + dvec2(8.0, 8.0),
+                },
+            );
+            if let Some(r2) = r2 {
+                hl.draw_vars.set_uniform(cx2d, id!(color), &[0.85, 0.9, 1.0, 0.4]);
+                hl.draw_abs(
+                    cx2d,
+                    Rect {
+                        pos: r2.pos - dvec2(4.0, 4.0),
+                        size: r2.size + dvec2(8.0, 8.0),
+                    },
+                );
+            }
+        }
+    }
+
     /// Draw the cards visible in the viewport: selection highlight, zoom
     /// collapse layers and the edit-mode swap. set_visible no-ops when the
     /// state is unchanged, so calling it every frame is free outside the

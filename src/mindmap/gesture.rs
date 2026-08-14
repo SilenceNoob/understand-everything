@@ -118,6 +118,15 @@ impl MindMap {
         // Panels (file/refs/float/dock) own their presses; the canvas must
         // not start a marquee/drag under them.
         if !crate::util::over_any_panel(fe.abs) {
+            // Connect mode: the click picks the target (blank = cancel).
+            // Card-internal widgets (edit buttons, links, scrollbars) keep
+            // their own behavior.
+            if self.connect_from.is_some() && !child_grabbed {
+                let world = self.screen_to_world(fe.abs);
+                let target = self.hit_card(world);
+                self.connect_click(cx, target);
+                return;
+            }
             if self.minimap_rect.contains(fe.abs) {
                 self.mm_dragging = true;
                 self.navigate_minimap(cx, fe.abs);
@@ -209,8 +218,12 @@ impl MindMap {
 
     /// Right-button press: prepare a context menu on a card, or fall back to a
     /// pan if the drag exceeds a small threshold. Click outside panels/minimap
-    /// closes any open color popup.
+    /// closes any open color popup. In connect mode it cancels the mode.
     pub(crate) fn handle_finger_down_secondary(&mut self, cx: &mut Cx, fe: &FingerDownEvent) {
+        if self.connect_from.is_some() {
+            self.cancel_connect_mode(cx);
+            return;
+        }
         if self.editing_group.is_some() {
             self.commit_group_edit(cx);
         }
@@ -252,6 +265,17 @@ impl MindMap {
         }
         if self.mm_dragging {
             self.navigate_minimap(cx, fe.abs);
+            return;
+        }
+        // Connect mode: track the hovered target / cursor for the preview.
+        if self.connect_from.is_some() {
+            let world = self.screen_to_world(fe.abs);
+            let hover = self.hit_card(world);
+            if hover != self.connect_hover || world != self.connect_cursor {
+                self.connect_hover = hover;
+                self.connect_cursor = world;
+                self.redraw(cx);
+            }
             return;
         }
         if let Some(m) = self.marquee {

@@ -30,8 +30,11 @@ impl MindMap {
         // parent-less leaf (an independent root card) that is not mid-plan,
         // and must either be the primary root (legacy root goal card) or a
         // 联结模型 card (the goal of a learning route). 生成子卡片 only while
-        // the card body has a selection. Both rows sit at the end of the menu;
-        // item4 = plan row, item5 = subcard row.
+        // the card body has a selection. 断开与父卡片的连线 only while the
+        // card has a parent; 重新估计学习序号 only on parent-less cards with
+        // a subtree; 连线到… is always present. Rows sit at the end of the
+        // menu: item4 = plan, item5 = subcard, item6 = detach, item7 =
+        // connect, item8 = reorder.
         let is_primary_root = data.root == Some(card);
         let is_knowledge =
             crate::gen::card_type(&data.nodes[card].body) == crate::gen::CardType::Knowledge;
@@ -40,7 +43,15 @@ impl MindMap {
             && !self.route_planning
             && (is_primary_root || is_knowledge);
         self.menu_subcard_row = !self.menu_card_selection.trim().is_empty();
-        self.menu_items = 4 + usize::from(self.menu_plan_row) + usize::from(self.menu_subcard_row);
+        self.menu_detach_row = data.nodes[card].parent.is_some();
+        self.menu_reorder_row =
+            data.nodes[card].parent.is_none() && !data.nodes[card].children.is_empty();
+        self.menu_items = 4
+            + usize::from(self.menu_plan_row)
+            + usize::from(self.menu_subcard_row)
+            + usize::from(self.menu_detach_row)
+            + 1
+            + usize::from(self.menu_reorder_row);
         self.menu_rect = menu_rect(view, abs, self.menu_items);
         self.menu_hover = menu_item_index(self.menu_rect, self.menu_items, abs);
         self.sub_open = false;
@@ -64,10 +75,32 @@ impl MindMap {
     }
 
     /// Remove the card from the current map: re-attach children to the parent,
-    /// drop the node, rebuild index-dependent state, and save.
+    /// drop the node, rebuild index-dependent state, and save. A root card
+    /// with a subtree (a whole learning route) asks the App for confirmation
+    /// instead of removing directly.
     pub(crate) fn remove_card(&mut self, cx: &mut Cx, i: usize) {
         let Some(data) = &mut self.data else { return };
-        if data.root == Some(i) || !data.remove_node(i) {
+        if data.nodes[i].parent.is_none() && !data.nodes[i].children.is_empty() {
+            let base = data_dir();
+            let rel = data.nodes[i]
+                .path
+                .strip_prefix(&base)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let title = crate::mindmap::card_title(&data.nodes[i]);
+            let mut count = 0usize;
+            let mut stack = data.nodes[i].children.clone();
+            while let Some(x) = stack.pop() {
+                count += 1;
+                stack.extend(data.nodes[x].children.iter().copied());
+            }
+            cx.widget_action(
+                self.widget_uid(),
+                MindMapAction::RemoveRootConfirm(rel, title, count),
+            );
+            return;
+        }
+        if !data.remove_node(i) {
             return;
         }
         self.cards.clear();
@@ -195,9 +228,15 @@ impl MindMap {
         }
         if let Some(w) = self.ctx_menu_widget(cx) {
             // Conditional rows at the end of the menu: 生成学习路线 on the
-            // root goal card, 生成子卡片 while the body has a selection.
+            // root goal card, 生成子卡片 while the body has a selection,
+            // 断开与父卡片的连线 while the card has a parent, and
+            // 重新估计学习序号 on root cards with a subtree (连线到… is
+            // always visible).
             w.view(cx, ids!(item4)).set_visible(cx, self.menu_plan_row);
             w.view(cx, ids!(item5)).set_visible(cx, self.menu_subcard_row);
+            w.view(cx, ids!(item6)).set_visible(cx, self.menu_detach_row);
+            w.view(cx, ids!(item7)).set_visible(cx, true);
+            w.view(cx, ids!(item8)).set_visible(cx, self.menu_reorder_row);
             let _ = w.draw_walk(
                 cx,
                 scope,
@@ -300,8 +339,10 @@ impl MindMap {
                 }
                 return;
             }
-            // Rows 4+: 生成学习路线 (plan row) then 生成子卡片 (subcard row),
-            // each only present when its flag is set.
+            // Rows 4+: 生成学习路线 (plan), 生成子卡片 (subcard),
+            // 断开与父卡片的连线 (detach), 连线到… (connect), and
+            // 重新估计学习序号 (reorder), each only present when its flag
+            // is set (connect is always present).
             if idx >= 4 {
                 let mut row = 4usize;
                 if self.menu_plan_row {
@@ -317,18 +358,55 @@ impl MindMap {
                     }
                     row += 1;
                 }
-                if self.menu_subcard_row && idx == row {
-                    if !self.menu_card_path.is_empty() {
-                        cx.widget_action(
-                            self.widget_uid(),
-                            MindMapAction::GenSubCard(
-                                self.menu_card_path.clone(),
-                                self.menu_card_selection.clone(),
-                            ),
-                        );
+                if self.menu_subcard_row {
+                    if idx == row {
+                        if !self.menu_card_path.is_empty() {
+                            cx.widget_action(
+                                self.widget_uid(),
+                                MindMapAction::GenSubCard(
+                                    self.menu_card_path.clone(),
+                                    self.menu_card_selection.clone(),
+                                ),
+                            );
+                        }
+                        self.close_menu(cx);
+                        return;
                     }
+                    row += 1;
+                }
+                if self.menu_detach_row {
+                    if idx == row {
+                        let i = self.menu_card;
+                        self.close_menu(cx);
+                        if let Some(i) = i {
+                            self.disconnect_card(cx, i);
+                        }
+                        return;
+                    }
+                    row += 1;
+                }
+                if idx == row {
+                    // 连线到…: enter connect mode (next canvas click picks
+                    // the parent target).
+                    let i = self.menu_card;
                     self.close_menu(cx);
+                    if let Some(i) = i {
+                        self.enter_connect_mode(cx, i);
+                    }
                     return;
+                }
+                row += 1;
+                if self.menu_reorder_row {
+                    if idx == row {
+                        if !self.menu_card_path.is_empty() {
+                            cx.widget_action(
+                                self.widget_uid(),
+                                MindMapAction::Reorder(self.menu_card_path.clone()),
+                            );
+                        }
+                        self.close_menu(cx);
+                        return;
+                    }
                 }
             }
         }

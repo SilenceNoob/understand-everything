@@ -2,6 +2,7 @@ use makepad_widgets::*;
 
 
 use crate::ai::{self, AIConfig};
+use crate::app::show_toast;
 use crate::file_panel::{self, FilePanelWidgetRefExt};
 use crate::mindmap::{self, MindMapWidgetRefExt};
 use crate::popup_panel::PopupPanelWidgetRefExt;
@@ -96,6 +97,7 @@ impl App {
     /// map that references it.
     pub(crate) fn open_card_delete_confirm(&mut self, cx: &mut Cx, rel: &str) {
         self.pending_delete_card = Some(rel.to_string());
+        self.pending_remove_root = None;
         let base = crate::util::data_dir();
         let name = std::path::Path::new(rel)
             .file_stem()
@@ -113,8 +115,11 @@ impl App {
             format!("该卡片被以下 {} 个 map 使用：\n{list}", maps.len())
         };
         let child = |path: &[LiveId]| self.popup_child(live_id!(confirm_popup), path);
+        child(&[live_id!(content), live_id!(panel), live_id!(title)]).set_text(cx, "删除卡片");
         child(&[live_id!(content), live_id!(panel), live_id!(card_name)]).set_text(cx, &name);
         child(&[live_id!(content), live_id!(panel), live_id!(usage)]).set_text(cx, &usage);
+        child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(delete_btn)])
+            .set_text(cx, "删除");
         self.popup_widget(live_id!(confirm_popup)).as_popup_panel().show(cx);
         for id in [
             live_id!(setting_popup),
@@ -127,15 +132,47 @@ impl App {
         }
     }
 
-    /// Card delete-confirm popup buttons.
+    /// Open the confirm popup for removing a root card and its whole subtree
+    /// from the current map (card files stay on disk).
+    pub(crate) fn open_remove_root_confirm(&mut self, cx: &mut Cx, rel: &str, title: &str, children: usize) {
+        self.pending_delete_card = None;
+        self.pending_remove_root = Some((rel.to_string(), title.to_string(), children));
+        let child = |path: &[LiveId]| self.popup_child(live_id!(confirm_popup), path);
+        child(&[live_id!(content), live_id!(panel), live_id!(title)]).set_text(cx, "移除根卡片");
+        child(&[live_id!(content), live_id!(panel), live_id!(card_name)]).set_text(cx, title);
+        child(&[live_id!(content), live_id!(panel), live_id!(usage)]).set_text(
+            cx,
+            &format!(
+                "该根卡片下还有 {children} 张卡片（整条学习路线）。\n移除后它们将一起从当前 map 中移除，卡片文件保留在 cards/ 中。"
+            ),
+        );
+        child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(delete_btn)])
+            .set_text(cx, "移除");
+        self.popup_widget(live_id!(confirm_popup)).as_popup_panel().show(cx);
+        for id in [
+            live_id!(setting_popup),
+            live_id!(about_popup),
+            live_id!(startup_popup),
+            live_id!(quiz_popup),
+            live_id!(picker_popup),
+        ] {
+            self.popup_widget(id).as_popup_panel().hide(cx);
+        }
+    }
+
+    /// Card delete-confirm popup buttons (file deletion + root-subtree removal
+    /// share the popup; the pending state picks the action).
     pub(crate) fn handle_card_delete_confirm(&mut self, cx: &mut Cx, actions: &Actions) {
         let popup = live_id!(confirm_popup);
-        let child = |path: &[LiveId]| self.popup_child(popup, path);
+        // Field-based closure (only borrows self.ui) so the pending-state
+        // mutations below can coexist with it.
+        let child = |path: &[LiveId]| crate::app::popup_child(&self.ui, popup, path);
         if child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(cancel_btn)])
             .as_button()
             .clicked(actions)
         {
             self.pending_delete_card = None;
+            self.pending_remove_root = None;
             self.popup_widget(popup).as_popup_panel().hide(cx);
             return;
         }
@@ -143,6 +180,22 @@ impl App {
             .as_button()
             .clicked(actions)
         {
+            // Root card + subtree removal (manual-wiring relaxation).
+            if let Some((rel, title, count)) = self.pending_remove_root.take() {
+                self.pending_delete_card = None;
+                self.popup_widget(popup).as_popup_panel().hide(cx);
+                child(&[live_id!(content), live_id!(panel), live_id!(btn_row), live_id!(delete_btn)])
+                    .set_text(cx, "删除");
+                self.ui.mind_map(cx, ids!(mindmap)).remove_root_subtree(cx, &rel);
+                show_toast(
+                    &self.ui,
+                    &mut self.toast_until,
+                    cx,
+                    &format!("已从 map 中移除根卡片「{title}」及其 {count} 张卡片。"),
+                );
+                self.sync_startup(cx);
+                return;
+            }
             let rel = self.pending_delete_card.take();
             self.popup_widget(popup).as_popup_panel().hide(cx);
             let Some(rel) = rel else { return };

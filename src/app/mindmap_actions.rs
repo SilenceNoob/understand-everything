@@ -1,10 +1,20 @@
 use makepad_widgets::*;
 
 
+use crate::app::show_toast;
 use crate::card_picker::{CardPickerWidgetRefExt, PickChoice};
 use crate::mindmap::MindMapWidgetRefExt;
 use crate::popup_panel::PopupPanelWidgetRefExt;
 use crate::App;
+
+/// Display title of a card rel path (file stem, order prefix stripped).
+fn rel_stem(rel: &str) -> String {
+    std::path::Path::new(rel)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| crate::gen::strip_order_prefix(&s).to_string())
+        .unwrap_or_else(|| rel.to_string())
+}
 
 impl App {
     /// Card context menu: generate a section, start a quiz, or open the
@@ -35,6 +45,33 @@ impl App {
         }
         if let Some(pos) = mind_map.canvas_menu_clicked(actions) {
             self.open_card_picker(cx, pos);
+        }
+        // Manual wiring.
+        if let Some((from, to)) = mind_map.connect_clicked(actions) {
+            show_toast(
+                &self.ui,
+                &mut self.toast_until,
+                cx,
+                &format!("已将「{}」连到「{}」下。", rel_stem(&from), rel_stem(&to)),
+            );
+        }
+        if let Some(msg) = mind_map.connect_rejected(actions) {
+            show_toast(&self.ui, &mut self.toast_until, cx, &msg);
+        }
+        if let Some(rel) = mind_map.disconnect_clicked(actions) {
+            show_toast(
+                &self.ui,
+                &mut self.toast_until,
+                cx,
+                &format!("已断开「{}」与父卡片的连线，它现在是独立的根卡片。", rel_stem(&rel)),
+            );
+        }
+        if let Some((rel, title, count)) = mind_map.remove_root_confirm(actions) {
+            self.open_remove_root_confirm(cx, &rel, &title, count);
+        }
+        if let Some(rel) = mind_map.reorder_clicked(actions) {
+            self.gen
+                .start_reorder(cx, &rel, self.rag.as_ref(), &mut self.toast_until, &self.ai_config);
         }
     }
 

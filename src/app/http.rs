@@ -44,6 +44,10 @@ impl MatchEvent for App {
             self.handle_create_response(cx, request_id, response);
             return;
         }
+        if self.gen.is_reorder_request(request_id) {
+            self.handle_reorder_response(cx, request_id, response);
+            return;
+        }
         if request_id == self.diag.diag_id && self.diag.diag_id != LiveId::empty() {
             self.handle_diag_response(cx, response);
             return;
@@ -100,6 +104,15 @@ impl MatchEvent for App {
                 cx,
                 request_id,
                 format!("创建卡片失败：{}", err.message),
+                &mut self.toast_until,
+            );
+            return;
+        }
+        if self.gen.is_reorder_request(request_id) {
+            self.gen.reorder_request_failed(
+                cx,
+                request_id,
+                format!("序号估计失败：{}", err.message),
                 &mut self.toast_until,
             );
             return;

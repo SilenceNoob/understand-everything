@@ -1098,6 +1098,10 @@ pub struct App {
     /// popup is open.
     #[rust]
     pending_delete_card: Option<String>,
+    /// Root card (with its subtree) awaiting removal confirmation: (rel path,
+    /// title, subtree card count), set while the confirm popup is open.
+    #[rust]
+    pending_remove_root: Option<(String, String, usize)>,
 }
 
 

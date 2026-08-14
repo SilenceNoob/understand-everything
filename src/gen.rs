@@ -391,6 +391,104 @@ pub fn parse_create_card(text: &str) -> Result<CreateCardPlan, String> {
 
 
 
+/// Messages for re-estimating the learning order (序号) of a route subtree:
+/// given the tree structure (title + archetype + parent title of every
+/// subtree card), the model returns a title→order mapping. The root card
+/// (learning goal) is learned last and stays unnumbered; 1 = first learned.
+/// `context` is the RAG excerpt block (may be empty).
+pub fn reorder_messages(
+    root_title: &str,
+    entries: &[(String, String, CardType)],
+    context: &str,
+) -> (String, String) {
+    let system = "你是一位学习路线序号助手。给定一棵学习路线卡片树（根卡=学习目标，最后学，不编号），\
+        请你为根卡之下的每一张卡片估计学习顺序号（1 = 最先学）。\n\
+        \n\
+        【顺序原则】\n\
+        - 子卡是父卡的前置：要学会父卡，必须先掌握它的子卡，所以叶子（最深的子卡）先学，序号靠前。\n\
+        - 概念（判别模型）先于使用它的知识（联结模型）：联结模型卡的输入/输出概念必须先已掌握。\n\
+        - 同一父卡下的多个子卡之间，按逻辑依赖和由浅入深的顺序排列。\n\
+        - 根卡（学习目标）不编号。\n\
+        \n\
+        【输出格式】\n\
+        必须只输出 JSON 对象，不要 markdown 代码块、不要任何解释或前后缀文字：\n\
+        {\n\
+          \"orders\": [\n\
+            {\"title\": \"卡片标题\", \"order\": 1},\n\
+            {\"title\": \"卡片标题\", \"order\": 2}\n\
+          ]\n\
+        }\n\
+        要求：为输入中列出的每一张卡片恰好输出一条（标题原样复制，不重不漏）；order 从 1 开始连续编号。"
+        .to_string();
+    let mut user = format!("【根卡（学习目标，不编号）】{root_title}\n\n【树中的卡片】（标题（类型）← 父卡标题）\n");
+    for (t, p, c) in entries {
+        let kind = match c {
+            CardType::Concept => "判别模型",
+            CardType::Knowledge => "联结模型",
+        };
+        user.push_str(&format!("{t}（{kind}）← {p}\n"));
+    }
+    if !context.is_empty() {
+        user.push_str(&format!("\n参考资料（供估计顺序时参考，可能不完整）：\n{context}\n"));
+    }
+    user.push_str("\n请输出 JSON。");
+    (system, user)
+}
+
+#[derive(Deserialize)]
+struct ReorderResp {
+    #[serde(default)]
+    orders: Vec<ReorderItem>,
+}
+
+#[derive(Deserialize)]
+struct ReorderItem {
+    title: String,
+    order: u32,
+}
+
+/// Parse the reorder response into a title→order list. Tolerates prose
+/// around the object; rejects empty lists, duplicate titles, and order 0.
+pub fn parse_reorder(text: &str) -> Result<Vec<(String, u32)>, String> {
+    let t = strip_json_fence(text);
+    let mut last_err = String::new();
+    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
+        let cand = &t[i..];
+        let cand = match cand.rfind('}') {
+            Some(e) => &cand[..=e],
+            None => cand,
+        };
+        match serde_json::from_str::<ReorderResp>(cand) {
+            Ok(v) => {
+                if v.orders.is_empty() {
+                    return Err("序号列表为空".to_string());
+                }
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::with_capacity(v.orders.len());
+                for item in v.orders {
+                    let title = item.title.trim().to_string();
+                    if title.is_empty() {
+                        return Err("存在标题为空的序号条目".to_string());
+                    }
+                    if !seen.insert(title.clone()) {
+                        return Err(format!("序号条目标题重复：{title}"));
+                    }
+                    if item.order == 0 {
+                        return Err("序号必须从 1 开始".to_string());
+                    }
+                    out.push((title, item.order));
+                }
+                return Ok(out);
+            }
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(last_err);
+    }
+    Err("JSON 解析失败: 未找到 JSON 对象".to_string())
+}
+
 /// Build the (system, user) messages for generating a section of a card.
 /// `context` is the BM25/hybrid excerpt block from `rag::service::format_context`.
 /// Concept cards explain a 判别模型 (intension + 正负例); knowledge cards
@@ -1607,6 +1705,36 @@ mod tests {
         assert!(user.contains("「密度」（判别模型）"), "{user}");
         assert!(user.contains("参考资料片段"), "{user}");
         assert!(user.contains("【主题】浮力"), "{user}");
+    }
+
+    #[test]
+    fn parse_reorder_ok_fenced_and_invalid() {
+        let text = r#"{"orders":[{"title":"密度","order":1},{"title":"浮力定律","order":2}]}"#;
+        let orders = parse_reorder(text).unwrap();
+        assert_eq!(orders, vec![("密度".to_string(), 1), ("浮力定律".to_string(), 2)]);
+        // fenced + prose
+        let text = "好的\n```json\n{\"orders\":[{\"title\":\"液体\",\"order\":1}]}\n```";
+        assert_eq!(parse_reorder(text).unwrap(), vec![("液体".to_string(), 1)]);
+        // invalid: empty list, order 0, duplicate titles, no JSON
+        assert!(parse_reorder(r#"{"orders":[]}"#).is_err());
+        assert!(parse_reorder(r#"{"orders":[{"title":"a","order":0}]}"#).is_err());
+        assert!(parse_reorder(r#"{"orders":[{"title":"a","order":1},{"title":"a","order":2}]}"#).is_err());
+        assert!(parse_reorder("没有 JSON").is_err());
+    }
+
+    #[test]
+    fn reorder_messages_lists_subtree_with_types() {
+        let entries = vec![
+            ("密度".to_string(), "学会浮力".to_string(), CardType::Concept),
+            ("浮力定律".to_string(), "学会浮力".to_string(), CardType::Knowledge),
+        ];
+        let (system, user) = reorder_messages("学会浮力", &entries, "参考");
+        assert!(system.contains("子卡是父卡的前置"), "{system}");
+        assert!(system.contains("不编号"), "{system}");
+        assert!(user.contains("【根卡（学习目标，不编号）】学会浮力"), "{user}");
+        assert!(user.contains("密度（判别模型）← 学会浮力"), "{user}");
+        assert!(user.contains("浮力定律（联结模型）← 学会浮力"), "{user}");
+        assert!(user.contains("参考"), "{user}");
     }
 
     #[test]

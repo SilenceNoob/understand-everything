@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod draw;
 mod edit;
+mod edges;
 mod geometry;
 mod gesture;
 mod groups;
@@ -466,6 +467,9 @@ script_mod! {
             item3 := MenuItem{ label.text: "设置序号" }
             item4 := MenuItem{ label.text: "生成学习路线" }
             item5 := MenuItem{ label.text: "生成子卡片" }
+            item6 := MenuItem{ visible: false, label.text: "断开与父卡片的连线" }
+            item7 := MenuItem{ label.text: "连线到…" }
+            item8 := MenuItem{ visible: false, label.text: "重新估计学习序号" }
         }
         // In-canvas 序号 editor, opened by the context menu item; drawn at
         // the card's top-left in world coords (group-rename style).
@@ -788,6 +792,23 @@ pub struct MindMap {
     menu_plan_row: bool,
     #[rust]
     menu_subcard_row: bool,
+    /// Whether the 断开与父卡片的连线 row is shown (card has a parent) /
+    /// whether the 重新估计学习序号 row is shown (parent-less card with a
+    /// subtree). 连线到… is always present.
+    #[rust]
+    menu_detach_row: bool,
+    #[rust]
+    menu_reorder_row: bool,
+    /// Manual connect mode: source card (menu 「连线到…」), hovered target,
+    /// last cursor world position, and the preview edge draw.
+    #[rust]
+    connect_from: Option<usize>,
+    #[rust]
+    connect_hover: Option<usize>,
+    #[rust]
+    connect_cursor: DVec2,
+    #[rust]
+    preview_edge: Option<DrawEdge>,
     /// True while the App is planning a learning route: hides the
     /// 生成学习路线 row to prevent re-entry mid-plan.
     #[rust]
@@ -985,6 +1006,10 @@ impl Widget for MindMap {
 
                 self.draw_cards(cx2d, scope, local_view);
 
+                // connect-mode preview (edge + source/target glow), on top of
+                // the cards so the pending link is always visible.
+                self.draw_connect_preview(cx2d, local_view);
+
                 // marquee, drawn on top of the cards
                 if let Some(m) = self.marquee {
                     let rect = Rect {
@@ -1161,6 +1186,8 @@ impl MindMap {
             self.menu_hover = None;
             self.sub_hover = None;
             self.sec_press = None;
+            self.connect_from = None;
+            self.connect_hover = None;
             self.mm_dragging = false;
             self.cancel_zoom_anim(cx);
             self.cancel_page_burst(cx);
@@ -1180,11 +1207,15 @@ impl MindMap {
         self.highlight = Some(cx.with_vm(|vm| DrawHighlight::script_new_with_default(vm)));
         self.marquee_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         self.grid_draw = Some(cx.with_vm(|vm| DrawGrid::script_new_with_default(vm)));
+        self.preview_edge = Some(cx.with_vm(|vm| DrawEdge::script_new_with_default(vm)));
         self.cards = Vec::with_capacity(n);
         self.canvas = Some(DrawList2d::new(cx));
         self.rebuild_group_widgets(cx);
         self.popup_draw = Some(cx.with_vm(|vm| DrawMarquee::script_new_with_default(vm)));
         // Per-map transient state must not leak across switches.
+        self.connect_from = None;
+        self.connect_hover = None;
+        self.pending_titles.clear();
         self.selected.clear();
         self.selected_groups.clear();
         self.marquee = None;
@@ -1241,6 +1272,17 @@ pub enum MindMapAction {
     GenSubCard(String, String),
     /// Canvas right-click at the given screen position: open the card picker.
     CanvasMenu(DVec2),
+    /// Manual connect succeeded: (source rel path, parent rel path).
+    Connect(String, String),
+    /// Manual connect refused (cycle/self/duplicate): toast message.
+    ConnectRejected(String),
+    /// Manual disconnect done: the detached card's rel path.
+    Disconnect(String),
+    /// 从 map 中移除 hit a root card with a subtree: (rel path, title, child
+    /// count) — the App asks for confirmation.
+    RemoveRootConfirm(String, String, usize),
+    /// 重新估计学习序号 clicked on a root card: its rel path.
+    Reorder(String),
 }
 
 impl MindMapRef {
@@ -1333,6 +1375,80 @@ impl MindMapRef {
             }
         }
         None
+    }
+
+    /// Poll the action list for a successful manual connect: (source rel,
+    /// parent rel).
+    pub fn connect_clicked(&self, actions: &Actions) -> Option<(String, String)> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::Connect(from, to) = item.cast() {
+                return Some((from, to));
+            }
+        }
+        None
+    }
+
+    /// Poll the action list for a refused manual connect; returns the reason.
+    pub fn connect_rejected(&self, actions: &Actions) -> Option<String> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::ConnectRejected(msg) = item.cast() {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
+    /// Poll the action list for a manual disconnect; returns the detached
+    /// card's rel path.
+    pub fn disconnect_clicked(&self, actions: &Actions) -> Option<String> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::Disconnect(rel) = item.cast() {
+                return Some(rel);
+            }
+        }
+        None
+    }
+
+    /// Poll the action list for a root-removal confirmation request:
+    /// (rel path, title, child count).
+    pub fn remove_root_confirm(&self, actions: &Actions) -> Option<(String, String, usize)> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::RemoveRootConfirm(rel, title, count) = item.cast() {
+                return Some((rel, title, count));
+            }
+        }
+        None
+    }
+
+    /// Poll the action list for a 重新估计学习序号 click; returns the root
+    /// card's rel path.
+    pub fn reorder_clicked(&self, actions: &Actions) -> Option<String> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let MindMapAction::Reorder(rel) = item.cast() {
+                return Some(rel);
+            }
+        }
+        None
+    }
+
+    /// Display titles + parent titles + archetypes of the subtree under the
+    /// root card at `root_rel`.
+    pub fn subtree_entries(&self, root_rel: &str) -> Vec<(String, String, crate::gen::CardType)> {
+        self.borrow().map(|w| w.subtree_entries(root_rel)).unwrap_or_default()
+    }
+
+    /// Apply AI-estimated learning orders under the root card at `root_rel`.
+    pub fn apply_orders(&self, cx: &mut Cx, root_rel: &str, orders: &[(String, u32)]) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.apply_orders(cx, root_rel, orders);
+        }
+    }
+
+    /// Remove the root card at `rel` and its whole subtree from the map.
+    pub fn remove_root_subtree(&self, cx: &mut Cx, rel: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.remove_root_subtree(cx, rel);
+        }
     }
 
     /// Add the card file at `rel_path` to the canvas at the last right-click
