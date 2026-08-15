@@ -224,25 +224,17 @@ struct JudgeResp {
     output_space: String,
 }
 
-/// Parse the judge response. Tolerates prose around the object: extracts the
-/// first `{` .. last `}` span before parsing.
+/// Parse the judge response. Tolerates prose/fences around the object and
+/// tries the whole text plus every balanced object span (last one backwards).
 pub fn parse_subcard_judge(text: &str) -> Result<SubcardJudge, String> {
     let t = strip_json_fence(text);
-    // Try candidate spans from the last `{` backwards: prose/thinking before
-    // the JSON may itself contain braces, and the JSON's own braces are
-    // balanced, so first-`{`-to-last-`}` can start on the wrong brace.
     let mut last_err = String::new();
-    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
-        let cand = &t[i..];
-        let cand = match cand.rfind('}') {
-            Some(e) => &cand[..=e],
-            None => cand,
-        };
+    for cand in json_candidate_texts(t) {
         match serde_json::from_str::<JudgeResp>(cand) {
-            Ok(v) => {
-                last_err.clear();
-                return parse_judge(v);
-            }
+            Ok(v) => match parse_judge(v) {
+                Ok(out) => return Ok(out),
+                Err(e) => last_err = e,
+            },
             Err(e) => last_err = format!("JSON 解析失败: {e}"),
         }
     }
@@ -351,22 +343,19 @@ pub fn create_card_messages(
     (system, user)
 }
 
-/// Parse the create-card response. Tolerates prose around the object:
-/// extracts the first parseable `{` .. `}` span (last `{` backwards).
+/// Parse the create-card response. Tolerates prose/fences around the object
+/// and tries the whole text plus every balanced object span (last one
+/// backwards).
 pub fn parse_create_card(text: &str) -> Result<CreateCardPlan, String> {
     let t = strip_json_fence(text);
     let mut last_err = String::new();
-    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
-        let cand = &t[i..];
-        let cand = match cand.rfind('}') {
-            Some(e) => &cand[..=e],
-            None => cand,
-        };
+    for cand in json_candidate_texts(t) {
         match serde_json::from_str::<CreateResp>(cand) {
             Ok(v) => {
                 let title = v.title.trim().to_string();
                 if title.is_empty() {
-                    return Err("标题为空".to_string());
+                    last_err = "标题为空".to_string();
+                    continue;
                 }
                 return Ok(CreateCardPlan {
                     title,
@@ -452,33 +441,37 @@ struct ReorderItem {
 pub fn parse_reorder(text: &str) -> Result<Vec<(String, u32)>, String> {
     let t = strip_json_fence(text);
     let mut last_err = String::new();
-    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
-        let cand = &t[i..];
-        let cand = match cand.rfind('}') {
-            Some(e) => &cand[..=e],
-            None => cand,
-        };
+    for cand in json_candidate_texts(t) {
         match serde_json::from_str::<ReorderResp>(cand) {
             Ok(v) => {
                 if v.orders.is_empty() {
-                    return Err("序号列表为空".to_string());
+                    last_err = "序号列表为空".to_string();
+                    continue;
                 }
                 let mut seen = std::collections::HashSet::new();
                 let mut out = Vec::with_capacity(v.orders.len());
                 for item in v.orders {
                     let title = item.title.trim().to_string();
                     if title.is_empty() {
-                        return Err("存在标题为空的序号条目".to_string());
+                        last_err = "存在标题为空的序号条目".to_string();
+                        out.clear();
+                        break;
                     }
                     if !seen.insert(title.clone()) {
-                        return Err(format!("序号条目标题重复：{title}"));
+                        last_err = format!("序号条目标题重复：{title}");
+                        out.clear();
+                        break;
                     }
                     if item.order == 0 {
-                        return Err("序号必须从 1 开始".to_string());
+                        last_err = "序号必须从 1 开始".to_string();
+                        out.clear();
+                        break;
                     }
                     out.push((title, item.order));
                 }
-                return Ok(out);
+                if !out.is_empty() {
+                    return Ok(out);
+                }
             }
             Err(e) => last_err = format!("JSON 解析失败: {e}"),
         }
@@ -993,6 +986,8 @@ pub fn diagnostic_messages(
          - 覆盖顺序：目标的前置基础概念 → 目标知识本身。\n\
          - 当信息足够判断用户已具备/缺失哪些判别模型与联结模型时，停止出题并输出掌握情况摘要。\
 最多再出 6 题。\n\
+         - 题目可以包含代码（编程语言特性、API、算法等），但代码只能作为 JSON 字符串字段的值：\
+代码中的换行写为 \\n，双引号写为 \\\"；JSON 内部不要再使用 ``` 代码围栏。\n\
          \n\
          【输出】只输出 JSON，不要 markdown 代码块、不要解释：\n\
          继续出题：{\"done\": false, \"kind\": \"single\", \"question\": \"...\", \
@@ -1074,11 +1069,30 @@ pub fn format_diag_history(history: &[(DiagQuestion, String)]) -> String {
     out
 }
 
-/// Parse the model's next interview step (fenced JSON tolerated). Choices
-/// are validated (kind, option count, answer letters).
+/// Parse the model's next interview step. Fenced/prose-wrapped JSON is
+/// tolerated; choices are validated (kind, option count, answer letters).
+/// The whole text is tried first, then every balanced object/array span
+/// from the end backwards, so `reasoning_content` or prose around the JSON
+/// no longer needs to be pre-stripped perfectly.
 pub fn parse_diag_step(text: &str) -> Result<DiagStep, String> {
-    let v: serde_json::Value = serde_json::from_str(strip_json_fence(text))
-        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let t = strip_json_fence(text);
+    let mut last_err = String::new();
+    for cand in json_candidate_texts(t) {
+        match serde_json::from_str::<serde_json::Value>(cand) {
+            Ok(v) => match diag_step_from_value(&v) {
+                Ok(step) => return Ok(step),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(last_err);
+    }
+    Err("JSON 解析失败: 未找到 JSON 对象".to_string())
+}
+
+fn diag_step_from_value(v: &serde_json::Value) -> Result<DiagStep, String> {
     if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
         let summary = v
             .get("summary")
@@ -1133,18 +1147,19 @@ pub fn parse_diag_step(text: &str) -> Result<DiagStep, String> {
 fn normalize_answer_letters(v: &Option<&serde_json::Value>) -> Vec<String> {
     let Some(v) = v else { return Vec::new() };
     let mut out = Vec::new();
+    let push_letters = |out: &mut Vec<String>, s: &str| {
+        out.extend(
+            s.chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .map(|c| c.to_ascii_uppercase().to_string()),
+        );
+    };
     match v {
-        serde_json::Value::String(s) => {
-            out.extend(s.chars().filter(|c| c.is_ascii_uppercase()).map(|c| c.to_string()))
-        }
+        serde_json::Value::String(s) => push_letters(&mut out, s),
         serde_json::Value::Array(a) => {
             for item in a {
                 if let Some(s) = item.as_str() {
-                    out.extend(
-                        s.chars()
-                            .filter(|c| c.is_ascii_uppercase())
-                            .map(|c| c.to_string()),
-                    );
+                    push_letters(&mut out, s);
                 }
             }
         }
@@ -1155,18 +1170,138 @@ fn normalize_answer_letters(v: &Option<&serde_json::Value>) -> Vec<String> {
     out
 }
 
-/// Strip a possibly fenced JSON response (fences may sit anywhere, with
-/// leading/trailing prose like "好的" from the model).
+/// Whether `line` is a markdown closing fence: optional whitespace around a
+/// run of three or more backticks.
+fn is_fence_line(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 3 && line.bytes().all(|b| b == b'`')
+}
+
+/// Strip one *outer* markdown fence only when it opens at the very start of
+/// the text and its closing fence is the final line. Never searches inside
+/// the body, so a code fence embedded in a JSON string cannot be mistaken
+/// for the outer fence (unlike a blind `rfind("```")`). Leading prose like
+/// "好的" means no outer fence is stripped; the candidate scanner below
+/// still recovers the JSON object inside.
 fn strip_json_fence(text: &str) -> &str {
-    let mut t = text.trim();
-    if let Some(start) = t.find("```") {
-        let rest = &t[start + 3..];
-        t = rest.strip_prefix("json").unwrap_or(rest).trim_start();
+    let t = text.trim();
+    let Some(mut after_open) = t.strip_prefix("```") else {
+        return t;
+    };
+    // Only treat the opening as a fence line when the rest of that line is a
+    // language tag (or empty). ````json{...}` on one line is not an outer
+    // fence; the candidate scanner will recover the object from the raw text.
+    let opening_is_fence = match after_open.find('\n') {
+        Some(nl) => {
+            let line = &after_open[..nl];
+            line.trim().is_empty()
+                || line
+                    .trim()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }
+        None => {
+            let line = after_open.trim();
+            line.is_empty()
+                || line
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }
+    };
+    if !opening_is_fence {
+        return t;
     }
-    if let Some(end) = t.rfind("```") {
-        t = &t[..end];
+    // Drop the whole opening fence line (```, ```json, ```markdown, …).
+    after_open = match after_open.find('\n') {
+        Some(nl) => &after_open[nl + 1..],
+        None => "",
+    };
+    after_open = after_open.trim_start();
+    // Drop the final line only when it is itself a fence line.
+    let trimmed = after_open.trim_end();
+    let without_close = match trimmed.rfind('\n') {
+        Some(nl) => {
+            let last_line = &trimmed[nl + 1..];
+            if is_fence_line(last_line) {
+                &trimmed[..nl]
+            } else {
+                trimmed
+            }
+        }
+        None => {
+            if is_fence_line(trimmed) {
+                ""
+            } else {
+                trimmed
+            }
+        }
+    };
+    without_close.trim()
+}
+
+/// End byte index (inclusive) of the bracket at `start`, matched with
+/// quote/escape awareness. `open`/`close` must be ASCII bracket bytes.
+fn balanced_span(text: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if start >= bytes.len() || bytes[start] != open {
+        return None;
     }
-    t.trim()
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Balanced JSON object/array candidates in `text`, ordered from the last
+/// opening bracket backwards. Unlike a naive `{`-to-last-`}` cut, each
+/// candidate is a bracket-balanced span and never gets truncated by code
+/// fences or prose braces.
+fn json_candidates(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    for (i, b) in text.bytes().enumerate() {
+        let (open, close) = match b {
+            b'{' => (b'{', b'}'),
+            b'[' => (b'[', b']'),
+            _ => continue,
+        };
+        if let Some(end) = balanced_span(text, i, open, close) {
+            spans.push((i, end));
+        }
+    }
+    spans.reverse();
+    spans
+        .into_iter()
+        .map(|(start, end)| &text[start..=end])
+        .collect()
+}
+
+/// Parse candidates for a JSON response: the whole text first, then balanced
+/// object/array spans from the end backwards (prose/thinking before the
+/// payload is tolerated).
+fn json_candidate_texts(text: &str) -> Vec<&str> {
+    let mut out = vec![text];
+    out.extend(json_candidates(text));
+    out
 }
 
 /// Parse and validate a route plan. Unknown/missing parents are re-attached
@@ -1174,17 +1309,12 @@ fn strip_json_fence(text: &str) -> &str {
 /// to "concept"/"knowledge".
 pub fn parse_route_plan(text: &str) -> Result<RoutePlan, String> {
     let t = strip_json_fence(text);
-    // Try candidate spans from the last `{` backwards: prose/thinking before
-    // the JSON may itself contain braces, and the JSON's own braces are
-    // balanced, so first-`{`-to-last-`}` can start on the wrong brace.
+    // Try the whole text first, then balanced object/array spans from the
+    // last opening bracket backwards, so prose/thinking before the payload
+    // is tolerated without a naive first-`{`-to-last-`}` cut.
     let mut last_err = String::new();
     let mut plan: Option<RoutePlan> = None;
-    for (i, _) in t.match_indices('{').collect::<Vec<_>>().into_iter().rev() {
-        let cand = &t[i..];
-        let cand = match cand.rfind('}') {
-            Some(e) => &cand[..=e],
-            None => cand,
-        };
+    for cand in json_candidate_texts(t) {
         match serde_json::from_str::<RoutePlan>(cand) {
             Ok(p) => {
                 plan = Some(p);
@@ -1386,7 +1516,9 @@ pub fn quiz_generation_messages(body: &str, ctype: CardType) -> (String, String)
          2. 多选题 2 道，每道 4 个选项，答案为字母数组（如 [\"A\",\"C\"]）。\n\
          3. 费曼学习法开放题 1 道，要求学生用自己的话解释知识，并给出标准解答。\n\
          4. 题目要围绕知识理解，不要只是死记硬背。{extra}\n\
-         5. 必须只输出 JSON，不要 markdown 代码块、不要解释。\n\n\
+         5. 题目可以包含代码（编程语言特性、API、算法等），但代码只能作为 JSON 字符串字段的值：\
+代码中的换行写为 \\n，双引号写为 \\\"；JSON 内部不要再使用 ``` 代码围栏。\n\
+         6. 必须只输出 JSON，不要 markdown 代码块、不要任何解释或前后缀文字。\n\n\
          卡片内容：\n{}\n\n\
          JSON 格式：\n{}",
         body,
@@ -1410,18 +1542,91 @@ fn quiz_json_schema() -> String {
         .to_string()
 }
 
-/// Parse a possibly fenced JSON response into a Quiz.
+/// Parse a quiz response. Fences/prose around the JSON are tolerated (whole
+/// text first, then balanced spans), and each recovered quiz is validated so
+/// a nested-but-parseable object can't masquerade as an empty quiz.
 pub fn parse_quiz(text: &str) -> Result<Quiz, String> {
-    let mut text = text.trim();
-    if text.starts_with("```json") {
-        text = text.strip_prefix("```json").unwrap_or(text).trim();
-    } else if text.starts_with("```") {
-        text = text.strip_prefix("```").unwrap_or(text).trim();
+    let t = strip_json_fence(text);
+    let mut last_err = String::new();
+    for cand in json_candidate_texts(t) {
+        match serde_json::from_str::<Quiz>(cand) {
+            Ok(quiz) => match validate_quiz(&quiz) {
+                Ok(()) => return Ok(quiz),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = format!("JSON 解析失败: {e}"),
+        }
     }
-    if text.ends_with("```") {
-        text = text.strip_suffix("```").unwrap_or(text).trim();
+    if !last_err.is_empty() {
+        return Err(last_err);
     }
-    serde_json::from_str(text).map_err(|e| format!("JSON 解析失败: {e}"))
+    Err("JSON 解析失败: 未找到 JSON 对象".to_string())
+}
+
+fn validate_quiz(quiz: &Quiz) -> Result<(), String> {
+    if quiz.single.is_empty() && quiz.multi.is_empty() && quiz.open.is_empty() {
+        return Err("JSON 中没有任何题目（single/multi/open 均为空）".to_string());
+    }
+    for (i, q) in quiz.single.iter().enumerate() {
+        validate_choice(&q.question, &q.options, &q.answer, &[], i, "单选题")?;
+    }
+    for (i, q) in quiz.multi.iter().enumerate() {
+        validate_choice(&q.question, &q.options, "", &q.answers, i, "多选题")?;
+    }
+    for (i, q) in quiz.open.iter().enumerate() {
+        if q.question.trim().is_empty() {
+            return Err(format!("第 {} 道开放题缺少 question", i + 1));
+        }
+    }
+    Ok(())
+}
+
+fn validate_choice(
+    question: &str,
+    options: &[String],
+    single_answer: &str,
+    multi_answers: &[String],
+    index: usize,
+    label: &str,
+) -> Result<(), String> {
+    if question.trim().is_empty() {
+        return Err(format!("第 {} 道{label}缺少 question", index + 1));
+    }
+    if options.len() != 4 {
+        return Err(format!(
+            "第 {} 道{label}的选项数必须为 4，收到 {}",
+            index + 1,
+            options.len()
+        ));
+    }
+    for (oi, opt) in options.iter().enumerate() {
+        if opt.trim().is_empty() {
+            return Err(format!("第 {} 道{label}的第 {} 个选项为空", index + 1, oi + 1));
+        }
+    }
+    let valid_letter = |s: &str| {
+        let s = s.trim();
+        s.len() == 1 && matches!(s.as_bytes()[0], b'A'..=b'D' | b'a'..=b'd')
+    };
+    if !multi_answers.is_empty() {
+        if multi_answers.iter().any(|a| !valid_letter(a)) {
+            return Err(format!(
+                "第 {} 道{label}的 answers 只能是 A-D 字母",
+                index + 1
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in multi_answers {
+            if !seen.insert(a.trim().to_ascii_uppercase()) {
+                return Err(format!("第 {} 道{label}的 answers 有重复字母", index + 1));
+            }
+        }
+    } else if label == "多选题" {
+        return Err(format!("第 {} 道{label}缺少 answers", index + 1));
+    } else if !valid_letter(single_answer) {
+        return Err(format!("第 {} 道{label}的 answer 只能是 A-D 单个字母", index + 1));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1457,17 +1662,40 @@ pub fn quiz_grading_messages(
     (system, user)
 }
 
+/// Parse a grading response. The expected shape is a JSON array, possibly
+/// fenced or wrapped in prose; balanced candidate spans make both forms
+/// recoverable.
 pub fn parse_grades(text: &str) -> Result<Vec<GradeResult>, String> {
-    let mut text = text.trim();
-    if text.starts_with("```json") {
-        text = text.strip_prefix("```json").unwrap_or(text).trim();
-    } else if text.starts_with("```") {
-        text = text.strip_prefix("```").unwrap_or(text).trim();
+    let t = strip_json_fence(text);
+    let mut last_err = String::new();
+    for cand in json_candidate_texts(t) {
+        match serde_json::from_str::<Vec<GradeResult>>(cand) {
+            Ok(grades) => match validate_grades(&grades) {
+                Ok(()) => return Ok(grades),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = format!("评分解析失败: {e}"),
+        }
     }
-    if text.ends_with("```") {
-        text = text.strip_suffix("```").unwrap_or(text).trim();
+    if !last_err.is_empty() {
+        return Err(last_err);
     }
-    serde_json::from_str(text).map_err(|e| format!("评分解析失败: {e}"))
+    Err("评分解析失败: 未找到 JSON 数组".to_string())
+}
+
+fn validate_grades(grades: &[GradeResult]) -> Result<(), String> {
+    if grades.is_empty() {
+        return Err("评分结果为空数组".to_string());
+    }
+    for (i, g) in grades.iter().enumerate() {
+        if !(0..=10).contains(&g.score) {
+            return Err(format!("第 {} 道题的 score 必须在 0-10，收到 {}", i + 1, g.score));
+        }
+        if g.feedback.trim().is_empty() {
+            return Err(format!("第 {} 道题缺少 feedback", i + 1));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1599,11 +1827,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_quiz_tolerates_prose_and_code_strings() {
+        // Prose before a non-json fence: the balanced-span scanner recovers
+        // the object even though the text does not start with the fence.
+        let text = "好的，以下是题目：\n```markdown\n{\"single\":[{\"question\":\"看代码：\\nlet x = 1;\\n\",\"options\":[\"A.a\",\"B.b\",\"C.c\",\"D.d\"],\"answer\":\"a\"}],\"multi\":[],\"open\":[]}\n```";
+        let q = parse_quiz(text).unwrap();
+        assert_eq!(q.single.len(), 1);
+        assert!(q.single[0].question.contains("let x = 1;"), "{:?}", q.single[0]);
+        // lowercase answer is accepted.
+        assert_eq!(q.single[0].answer, "a");
+        // Empty quiz objects are rejected instead of silently accepted.
+        assert!(parse_quiz(r#"{"single":[],"multi":[],"open":[]}"#).is_err());
+        // A nested question object is valid JSON but not a valid quiz; the
+        // parser must continue to the outer object instead of returning it.
+        let nested = format!("前缀 {{\"question\":\"内层\"}} 后缀 {text}");
+        assert!(parse_quiz(&nested).is_ok());
+    }
+
+    #[test]
+    fn parse_quiz_rejects_malformed_choice_fields() {
+        let ok = |single: &str| {
+            format!(
+                r#"{{"single":[{{{single}}}],"multi":[],"open":[]}}"#
+            )
+        };
+        let base = r#""question":"q","options":["A.a","B.b","C.c","D.d"],"answer":"A""#;
+        assert!(parse_quiz(&ok(base)).is_ok());
+        assert!(parse_quiz(&ok(r#""question":"q","options":["A.a","B.b"],"answer":"A""#)).is_err());
+        assert!(parse_quiz(&ok(r#""question":"q","options":["A.a","B.b","C.c","D.d"],"answer":"E""#)).is_err());
+        assert!(parse_quiz(&ok(r#""question":"","options":["A.a","B.b","C.c","D.d"],"answer":"A""#)).is_err());
+        // multi answers must be unique A-D letters.
+        let multi = r#"{"multi":[{"question":"q","options":["A.a","B.b","C.c","D.d"],"answers":["A","A"]}],"single":[],"open":[]}"#;
+        assert!(parse_quiz(multi).is_err());
+    }
+
+    #[test]
     fn parse_grades_ok() {
         let text = "[{\"score\":7,\"feedback\":\"ok\",\"reference_answer\":\"ref\"}]";
         let g = parse_grades(text).unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].score, 7);
+        // Prose/fence around the array is recovered; invalid scores rejected.
+        let text = "好的：\n```json\n[{\"score\":9,\"feedback\":\"不错\",\"reference_answer\":\"r\"}]\n```";
+        let g = parse_grades(text).unwrap();
+        assert_eq!(g[0].score, 9);
+        assert!(parse_grades("[{\"score\":11,\"feedback\":\"x\",\"reference_answer\":\"r\"}]").is_err());
+        assert!(parse_grades("[{\"score\":5,\"feedback\":\"\",\"reference_answer\":\"r\"}]").is_err());
     }
 
     #[test]
@@ -1755,6 +2024,12 @@ mod tests {
             DiagStep::Question(q) => assert_eq!(q.answer, vec!["A".to_string(), "C".to_string()]),
             _ => panic!("expected question"),
         }
+        // lowercase single answer is normalized too
+        let text = r#"{"kind": "single", "question": "q", "options": ["A. a", "B. b"], "answer": "b"}"#;
+        match parse_diag_step(text).unwrap() {
+            DiagStep::Question(q) => assert_eq!(q.answer, vec!["B".to_string()]),
+            _ => panic!("expected question"),
+        }
         // done
         match parse_diag_step(r#"{"done": true, "summary": "已掌握：水果"}"#).unwrap() {
             DiagStep::Done(s) => assert_eq!(s, "已掌握：水果"),
@@ -1772,6 +2047,26 @@ mod tests {
         assert!(parse_diag_step(r#"{"kind":"x","question":"q"}"#).is_err());
         assert!(parse_diag_step(r#"{"kind":"single","question":"q","options":["A. a"],"answer":"A"}"#).is_err());
         assert!(parse_diag_step(r#"{"kind":"single","question":"q","options":["A. a","B. b"]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_diag_step_tolerates_thinking_text_and_code_fences() {
+        // Thinking text with unbalanced prose braces before the real object.
+        let text = "让我想想 { 这个概念（判别模型）应该怎么考。\n\
+                    {\"kind\":\"open\",\"question\":\"看代码：\\nfn main() { println!(\\\"x\\\"); }\\n输出什么？\",\"reference_answer\":\"x\"}\n\
+                    以上。";
+        match parse_diag_step(text).unwrap() {
+            DiagStep::Question(q) => {
+                assert_eq!(q.kind, "open");
+                assert!(q.question.contains("fn main()"), "{:?}", q.question);
+            }
+            _ => panic!("expected question"),
+        }
+        // A markdown code fence whose language tag is not json.
+        let fenced = "```markdown\n{\"kind\":\"open\",\"question\":\"解释\",\"reference_answer\":\"r\"}\n```";
+        assert!(parse_diag_step(fenced).is_ok());
+        // Empty content still reports the serde error (the original symptom).
+        assert!(parse_diag_step("").is_err());
     }
 
     #[test]
@@ -1979,5 +2274,24 @@ mod tests {
         assert_eq!(match_card_path(&existing, "所有权 Ownership"), None);
         assert_eq!(match_card_path(&existing, "不存在的概念"), None);
         assert_eq!(match_card_path(&existing, "TestCard"), Some("cards/TestCard.md".to_string()));
+    }
+
+    #[test]
+    fn strip_json_fence_only_strips_the_outer_fence() {
+        // A fence embedded in a JSON string must not be treated as the outer
+        // closing fence.
+        let text = "```json\n{\"question\":\"看 ```python\\nprint(1)\\n```\"}\n```";
+        let t = strip_json_fence(text);
+        assert!(t.starts_with('{'), "{t}");
+        assert!(t.contains("```python"), "{t}");
+        assert!(t.ends_with('}'), "{t}");
+        // Leading prose means the outer fence is not stripped (the candidate
+        // scanner recovers the object instead).
+        let prose = "好的\n```json\n{\"a\":1}\n```";
+        assert_eq!(strip_json_fence(prose), prose.trim());
+        // An opening "fence" with JSON on the same line is not a fence at
+        // all, so the text is left for the candidate scanner to recover.
+        let same_line = "```json{\"a\":1}\n```";
+        assert!(strip_json_fence(same_line).starts_with("```json{"));
     }
 }

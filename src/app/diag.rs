@@ -38,6 +38,12 @@ pub(crate) struct DiagController {
     pub(crate) diag_single: Option<usize>,
     pub(crate) diag_multi: [bool; 4],
     pub(crate) diag_retried: bool,
+    /// True once an endpoint rejected `response_format` (HTTP 400): the next
+    /// request falls back to a normal prompt-only JSON request.
+    pub(crate) diag_json_retried: bool,
+    /// Format-fix instruction appended to the retry request after a parse
+    /// failure, so the model sees what was wrong instead of a blind retry.
+    pub(crate) diag_repair_hint: Option<String>,
     /// In-flight map-naming request (startup goal input; the temp map is
     /// renamed to the AI's answer when it lands).
     pub(crate) map_name_id: LiveId,
@@ -243,7 +249,10 @@ impl DiagController {
         }
         let goal = self.diag_goal.clone();
         let ctx = rag_bm25_context(rag, &goal);
-        let (system, user) = crate::gen::diagnostic_messages(&goal, &ctx, &self.diag_history);
+        let (system, mut user) = crate::gen::diagnostic_messages(&goal, &ctx, &self.diag_history);
+        if let Some(hint) = self.diag_repair_hint.take() {
+            user.push_str(&format!("\n\n【格式修复要求】{hint}"));
+        }
         self.diag_id = LiveId::unique();
         self.set_diag_status(cx, "正在出题…");
         // Clear the answered question so the popup shows a clean waiting
@@ -278,12 +287,19 @@ impl DiagController {
             &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row)],
         )
         .set_visible(cx, false);
-        ai::chat_completions(
+        ai::chat_completions_structured(
             cx,
             self.diag_id,
             ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
+            ai::StructuredRequest {
+                // One question plus a compact reference answer fits in a few
+                // thousand tokens even with code examples; the previous
+                // 358400 cap only invited oversized/truncated responses.
+                max_tokens: 8192,
+                json_mode: !self.diag_json_retried,
+                thinking: Some("low"),
+            },
         );
     }
 
@@ -307,25 +323,44 @@ impl DiagController {
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
+            // Some OpenAI-compatible gateways reject `response_format` with a
+            // 400. Retry once without it before surfacing the failure.
+            if matches!(response.status_code, 400 | 422) && !self.diag_json_retried {
+                self.diag_json_retried = true;
+                self.send_diag_request(cx, rag, ai_config);
+                return;
+            }
             self.set_diag_status(cx, &format!("出题失败 ({}): {}", response.status_code, detail));
             self.diag_unknown_btn(cx).set_visible(cx, false);
             self.diag_btn_row_visible(cx, true);
             return;
         }
-        let content = ai::response_content(response).unwrap_or_default();
+        // Structured responses may arrive as empty `content` with the final
+        // JSON left in `reasoning_content`; prefer content but fall back.
+        let content = ai::response_structured_text(response);
         match crate::gen::parse_diag_step(&content) {
             Ok(crate::gen::DiagStep::Question(q)) => {
+                self.diag_retried = false;
                 self.diag_current = Some(q);
                 self.diag_single = None;
                 self.diag_multi = [false; 4];
                 self.render_diag_question(cx);
             }
-            Ok(crate::gen::DiagStep::Done(summary)) => self.finish_diag(cx, &summary, route, rag, toast_until, ai_config),
+            Ok(crate::gen::DiagStep::Done(summary)) => {
+                self.diag_retried = false;
+                self.finish_diag(cx, &summary, route, rag, toast_until, ai_config);
+            }
             Err(e) => {
-                // Empty/unparseable content is often a transient thinking-model
-                // response; retry once before surfacing the failure.
+                // Retry once with the parse error fed back to the model,
+                // instead of blindly re-sending the identical request.
                 if !self.diag_retried {
                     self.diag_retried = true;
+                    let preview = ai::text_preview(&content, 300);
+                    self.diag_repair_hint = Some(format!(
+                        "你上一次的输出无法解析为 JSON（错误：{e}；输出预览：{preview}）。\
+请严格只输出一个 JSON 对象，不要 markdown 代码块、不要任何解释或前后缀文字；题干或选项若包含代码，\
+代码必须作为 JSON 字符串的值，换行写为 \\n、双引号写为 \\\"，JSON 内部不要使用 ``` 围栏。"
+                    ));
                     self.send_diag_request(cx, rag, ai_config);
                     return;
                 }
@@ -529,6 +564,7 @@ impl DiagController {
             // question-request failure.
             if self.diag_id == LiveId::empty() {
                 self.diag_retried = false;
+                self.diag_repair_hint = None;
                 self.send_diag_request(cx, rag, ai_config);
             }
             return;
@@ -619,6 +655,8 @@ impl DiagController {
         self.diag_single = None;
         self.diag_multi = [false; 4];
         self.diag_retried = false;
+        self.diag_json_retried = false;
+        self.diag_repair_hint = None;
     }
 
     /// Switch the startup popup between the goal-input and diag phases.

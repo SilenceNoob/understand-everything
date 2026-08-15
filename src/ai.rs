@@ -114,6 +114,20 @@ pub fn save_config(config: &AIConfig) {
     }
 }
 
+/// Options for non-streaming requests that need a structured JSON answer.
+#[derive(Clone, Copy)]
+pub struct StructuredRequest<'a> {
+    pub max_tokens: usize,
+    /// Ask the OpenAI-compatible endpoint for JSON object output. Some
+    /// compatible gateways reject `response_format`; callers fall back to
+    /// a normal request on HTTP 400/422.
+    pub json_mode: bool,
+    /// Override the user's configured thinking strength for this request
+    /// (structured extraction works better with less reasoning); None uses
+    /// the configured value.
+    pub thinking: Option<&'a str>,
+}
+
 /// Send a chat/completions request (non-streaming). `messages` is
 /// (role, content) pairs; the response arrives via
 /// `MatchEvent::handle_http_response` keyed by `request_id`.
@@ -124,16 +138,40 @@ pub fn chat_completions(
     messages: &[(String, String)],
     max_tokens: usize,
 ) {
+    chat_completions_structured(
+        cx,
+        request_id,
+        config,
+        messages,
+        StructuredRequest {
+            max_tokens,
+            json_mode: false,
+            thinking: None,
+        },
+    );
+}
+
+/// Non-streaming request with structured-output options (`json_mode`,
+/// thinking override, explicit token cap).
+pub fn chat_completions_structured(
+    cx: &mut Cx,
+    request_id: LiveId,
+    config: &AIConfig,
+    messages: &[(String, String)],
+    options: StructuredRequest<'_>,
+) {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": config.model,
         "messages": messages.iter().map(|(role, content)| serde_json::json!({"role": role, "content": content})).collect::<Vec<_>>(),
-        "max_tokens": max_tokens,
+        "max_tokens": options.max_tokens,
         "stream": false,
-        (THINKING_PARAM.to_string()): config.thinking,
-    })
-    .to_string();
-    send_chat_request(cx, request_id, config, url, body, false);
+        (THINKING_PARAM.to_string()): options.thinking.unwrap_or(config.thinking.as_str()),
+    });
+    if options.json_mode {
+        payload["response_format"] = serde_json::json!({"type": "json_object"});
+    }
+    send_chat_request(cx, request_id, config, url, payload.to_string(), false);
 }
 
 /// Send a streaming chat/completions request. Raw SSE bytes arrive via
@@ -204,19 +242,56 @@ pub fn body_error_message(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Extract the assistant content from a non-streaming chat/completions response.
-pub fn response_content(response: &HttpResponse) -> Option<String> {
+/// Extract the assistant `(content, reasoning_content)` pair from a
+/// non-streaming chat/completions response.
+pub fn response_message_parts(response: &HttpResponse) -> Option<(String, String)> {
     if response.status_code != 200 {
         return None;
     }
     let body = response.get_string_body()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    v.get("choices")?
-        .get(0)?
-        .get("message")?
-        .get("content")?
-        .as_str()
-        .map(|s| s.to_string())
+    let msg = v.get("choices")?.get(0)?.get("message")?;
+    let content = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let reasoning = msg
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((content, reasoning))
+}
+
+/// Extract the assistant content from a non-streaming chat/completions response.
+pub fn response_content(response: &HttpResponse) -> Option<String> {
+    response_message_parts(response).map(|(content, _)| content)
+}
+
+/// Text for structured JSON responses: the normal content, or the reasoning
+/// chain when the model left `content` empty (a thinking model can emit the
+/// final JSON inside `reasoning_content` on structured prompts).
+pub fn response_structured_text(response: &HttpResponse) -> String {
+    let (content, reasoning) = response_message_parts(response).unwrap_or_default();
+    if content.trim().is_empty() {
+        reasoning
+    } else {
+        content
+    }
+}
+
+/// A short printable preview of arbitrary model text (for repair prompts).
+pub fn text_preview(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return "<空>".to_string();
+    }
+    if text.chars().count() > max_chars {
+        text.chars().take(max_chars).collect::<String>() + "…"
+    } else {
+        text.to_string()
+    }
 }
 
 /// Diagnostics for a failed/unparseable generation: finish_reason plus a
@@ -253,7 +328,9 @@ pub fn response_debug_preview(response: &HttpResponse) -> String {
         content
     };
     let preview = preview.trim();
-    let preview = if preview.chars().count() > 200 {
+    let preview = if preview.is_empty() {
+        "<空>".to_string()
+    } else if preview.chars().count() > 200 {
         preview.chars().take(200).collect::<String>() + "…"
     } else {
         preview.to_string()

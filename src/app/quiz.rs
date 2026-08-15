@@ -17,9 +17,59 @@ pub(crate) struct QuizController {
     pub(crate) quiz_path: Option<String>,
     pub(crate) quiz_body: Option<String>,
     pub(crate) grade_id: LiveId,
+    /// One automatic format-repair retry per quiz generation.
+    pub(crate) quiz_retried: bool,
+    /// True once the endpoint rejected `response_format` (HTTP 400): fall
+    /// back to prompt-only JSON requests from then on.
+    pub(crate) quiz_json_retried: bool,
+    /// Same fallback flag for the grading request.
+    pub(crate) grade_json_retried: bool,
+    /// One automatic format-repair retry per grading request.
+    pub(crate) grade_retried: bool,
+    /// The last grading submission, kept so a 400 fallback or a repair retry
+    /// can re-fire the request without user interaction.
+    pub(crate) grade_submission: Option<QuizSubmission>,
 }
 
 impl QuizController {
+    fn quiz_title(&self) -> String {
+        self.quiz_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Fire the quiz-generation request. `repair_hint`, when present, is
+    /// appended to the user message after a parse failure so the retry tells
+    /// the model what was wrong.
+    fn send_quiz_request(
+        &mut self,
+        cx: &mut Cx,
+        ai_config: &crate::ai::AIConfig,
+        repair_hint: Option<&str>,
+    ) {
+        let Some(body) = self.quiz_body.clone() else { return };
+        let (system, mut user) = quiz_generation_messages(&body, crate::gen::card_type(&body));
+        if let Some(hint) = repair_hint {
+            user.push_str(&format!("\n\n【格式修复要求】{hint}"));
+        }
+        self.quiz_id = LiveId::unique();
+        ai::chat_completions_structured(
+            cx,
+            self.quiz_id,
+            ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            ai::StructuredRequest {
+                // A full quiz (3 single + 2 multi + 1 open) is a few KB at
+                // most; the previous 358400 cap only invited huge outputs.
+                max_tokens: 16384,
+                json_mode: !self.quiz_json_retried,
+                thinking: Some("low"),
+            },
+        );
+    }
+
     pub(crate) fn start_quiz(
         &mut self,
         cx: &mut Cx,
@@ -40,19 +90,21 @@ impl QuizController {
         }
         self.quiz_path = Some(path.to_string());
         self.quiz_body = Some(body.clone());
+        self.quiz_retried = false;
+        self.quiz_json_retried = false;
+        self.grade_retried = false;
+        self.grade_json_retried = false;
+        self.grade_submission = None;
         quiz_panel.show_loading(cx, &title);
-        self.quiz_id = LiveId::unique();
-        let (system, user) = quiz_generation_messages(&body, crate::gen::card_type(&body));
-        ai::chat_completions(
-            cx,
-            self.quiz_id,
-            &ai_config,
-            &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
-        );
+        self.send_quiz_request(cx, ai_config, None);
     }
 
-    pub(crate) fn handle_quiz_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+    pub(crate) fn handle_quiz_response(
+        &mut self,
+        cx: &mut Cx,
+        response: &HttpResponse,
+        ai_config: &crate::ai::AIConfig,
+    ) {
         self.quiz_id = LiveId::empty();
         self.open_quiz_popup(cx);
         let quiz_panel = self.quiz_panel();
@@ -61,22 +113,45 @@ impl QuizController {
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
+            // `response_format` is rejected by some OpenAI-compatible
+            // gateways with HTTP 400; retry once without it.
+            if matches!(response.status_code, 400 | 422) && !self.quiz_json_retried {
+                self.quiz_json_retried = true;
+                quiz_panel.show_loading(cx, &self.quiz_title());
+                self.send_quiz_request(cx, ai_config, None);
+                return;
+            }
             quiz_panel.show_error(cx, &format!("出题失败：{} {}", response.status_code, detail));
             return;
         }
-        let content = ai::response_content(response).unwrap_or_default();
+        // Prefer content but fall back to the thinking chain when the model
+        // left `content` empty.
+        let content = ai::response_structured_text(response);
         match parse_quiz(&content) {
             Ok(q) => {
-                let title = self
-                    .quiz_path
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_stem())
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let body = self.quiz_body.clone().unwrap_or_default();
-                quiz_panel.set_quiz(cx, &title, &body, &q);
+                self.quiz_retried = false;
+                quiz_panel.set_quiz(cx, &self.quiz_title(), self.quiz_body.as_deref().unwrap_or(""), &q);
             }
-            Err(e) => quiz_panel.show_error(cx, &format!("题目解析失败：{}", e)),
+            Err(e) => {
+                if !self.quiz_retried {
+                    self.quiz_retried = true;
+                    let preview = ai::text_preview(&content, 300);
+                    quiz_panel.show_loading(cx, &self.quiz_title());
+                    self.send_quiz_request(
+                        cx,
+                        ai_config,
+                        Some(&format!(
+                            "你上一次的输出无法解析为 JSON（错误：{e}；输出预览：{preview}）。\
+请严格只输出一个 JSON 对象，不要 markdown 代码块、不要任何解释或前后缀文字；题目若包含代码，\
+代码必须作为 JSON 字符串的值，换行写为 \\n、双引号写为 \\\"，JSON 内部不要使用 ``` 围栏；\
+单选题和多选题都必须恰好 4 个选项，answer/answers 只能是 A-D 字母。"
+                        )),
+                    );
+                    return;
+                }
+                let debug = ai::response_debug_preview(response);
+                quiz_panel.show_error(cx, &format!("题目解析失败：{e}（{debug}）"));
+            }
         }
     }
 
@@ -95,30 +170,56 @@ impl QuizController {
         }
     }
 
+    /// Fire the grading request for the stored submission. `repair_hint`, when
+    /// present, is appended after a parse failure so the retry is not blind.
+    fn send_grade_request_inner(
+        &mut self,
+        cx: &mut Cx,
+        ai_config: &crate::ai::AIConfig,
+        repair_hint: Option<&str>,
+    ) {
+        let Some(body) = self.quiz_body.clone() else { return };
+        let Some(submission) = self.grade_submission.clone() else { return };
+        if submission.open_questions.is_empty() || submission.open.is_empty() {
+            return;
+        }
+        let (system, mut user) =
+            quiz_grading_messages(&body, &submission.open_questions, &submission.open);
+        if let Some(hint) = repair_hint {
+            user.push_str(&format!("\n\n【格式修复要求】{hint}"));
+        }
+        self.grade_id = LiveId::unique();
+        ai::chat_completions_structured(
+            cx,
+            self.grade_id,
+            ai_config,
+            &[("system".to_string(), system), ("user".to_string(), user)],
+            ai::StructuredRequest {
+                max_tokens: 8192,
+                json_mode: !self.grade_json_retried,
+                thinking: Some("low"),
+            },
+        );
+    }
+
     pub(crate) fn send_grade_request(
         &mut self,
         cx: &mut Cx,
         submission: QuizSubmission,
         ai_config: &crate::ai::AIConfig,
     ) {
-        let Some(body) = self.quiz_body.as_deref() else { return };
-        let questions = submission.open_questions;
-        let answers = submission.open;
-        if questions.is_empty() || answers.is_empty() {
-            return;
-        }
-        let (system, user) = quiz_grading_messages(body, &questions, &answers);
-        self.grade_id = LiveId::unique();
-        ai::chat_completions(
-            cx,
-            self.grade_id,
-            &ai_config,
-            &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
-        );
+        self.grade_submission = Some(submission);
+        self.grade_retried = false;
+        self.grade_json_retried = false;
+        self.send_grade_request_inner(cx, ai_config, None);
     }
 
-    pub(crate) fn handle_grade_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
+    pub(crate) fn handle_grade_response(
+        &mut self,
+        cx: &mut Cx,
+        response: &HttpResponse,
+        ai_config: &crate::ai::AIConfig,
+    ) {
         self.grade_id = LiveId::empty();
         self.open_quiz_popup(cx);
         let quiz_panel = self.quiz_panel();
@@ -127,12 +228,33 @@ impl QuizController {
                 .get_string_body()
                 .and_then(|b| ai::body_error_message(&b))
                 .unwrap_or_default();
+            if matches!(response.status_code, 400 | 422) && !self.grade_json_retried {
+                self.grade_json_retried = true;
+                quiz_panel.grade_retrying(cx, "评分请求格式不受支持，正在重试…");
+                self.send_grade_request_inner(cx, ai_config, None);
+                return;
+            }
             quiz_panel.grade_failed(cx, &format!("评分失败：{} {}", response.status_code, detail));
             return;
         }
-        let content = ai::response_content(response).unwrap_or_default();
-        match parse_grades(&content) {
+        let content = ai::response_structured_text(response);
+        let expected = self
+            .grade_submission
+            .as_ref()
+            .map(|s| s.open_questions.len())
+            .unwrap_or(0);
+        let outcome = match parse_grades(&content) {
+            Ok(g) if g.len() == expected => Ok(g),
+            Ok(g) => Err(format!(
+                "评分结果数量不匹配：应为 {expected} 条，收到 {} 条",
+                g.len()
+            )),
+            Err(e) => Err(e),
+        };
+        match outcome {
             Ok(g) => {
+                self.grade_retried = false;
+                self.grade_submission = None;
                 quiz_panel.set_grades(cx, &g);
                 // Persist the mastery score (已见/未见) and refresh the canvas
                 // badge. The card is keyed by rel path so progress follows it
@@ -148,7 +270,25 @@ impl QuizController {
                     }
                 }
             }
-            Err(e) => quiz_panel.grade_failed(cx, &format!("评分解析失败：{}", e)),
+            Err(e) => {
+                if !self.grade_retried {
+                    self.grade_retried = true;
+                    let preview = ai::text_preview(&content, 300);
+                    quiz_panel.grade_retrying(cx, "评分结果格式有误，正在重试…");
+                    self.send_grade_request_inner(
+                        cx,
+                        ai_config,
+                        Some(&format!(
+                            "你上一次的输出无法解析为 JSON 数组（错误：{e}；输出预览：{preview}）。\
+请严格只输出一个 JSON 数组，元素数量与题目数量一致，不要 markdown 代码块、不要任何解释或前后缀文字。"
+                        )),
+                    );
+                    return;
+                }
+                self.grade_submission = None;
+                let debug = ai::response_debug_preview(response);
+                quiz_panel.grade_failed(cx, &format!("评分解析失败：{e}（{debug}）"));
+            }
         }
     }
 
@@ -182,7 +322,7 @@ impl App {
     }
 
     pub(crate) fn handle_quiz_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
-        self.quiz.handle_quiz_response(cx, response);
+        self.quiz.handle_quiz_response(cx, response, &self.ai_config);
     }
 
     pub(crate) fn handle_quiz_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -190,7 +330,7 @@ impl App {
     }
 
     pub(crate) fn handle_grade_response(&mut self, cx: &mut Cx, response: &HttpResponse) {
-        self.quiz.handle_grade_response(cx, response);
+        self.quiz.handle_grade_response(cx, response, &self.ai_config);
     }
 
     pub(crate) fn quiz_panel(&self) -> crate::quiz_panel::QuizPanelRef {

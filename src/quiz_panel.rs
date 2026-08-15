@@ -709,6 +709,17 @@ impl QuizPanelRef {
         }
     }
 
+    /// Update the status while a grade repair retry is in flight; the submit
+    /// button stays locked and `grading` stays true.
+    pub fn grade_retrying(&self, cx: &mut Cx, msg: &str) {
+        if let Some(mut w) = self.borrow_mut() {
+            w.grading = true;
+            w.submit_btn(cx).set_visible(cx, false);
+            w.set_status(cx, msg);
+            w.redraw(cx);
+        }
+    }
+
     pub fn set_quiz(&self, cx: &mut Cx, title: &str, body: &str, quiz: &Quiz) {
         if let Some(mut w) = self.borrow_mut() {
             w.quiz = Some(quiz.clone());
