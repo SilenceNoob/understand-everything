@@ -1,5 +1,6 @@
 use makepad_widgets::*;
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::ai::{self};
@@ -76,6 +77,11 @@ pub(crate) struct GenController {
     pub(crate) creates: Vec<CreateTask>,
     /// 重新估计学习序号 requests in flight.
     pub(crate) reorders: Vec<ReorderTask>,
+    /// SSE accumulators for the in-flight streaming requests, keyed by
+    /// request id (streaming keeps bytes flowing during long generations;
+    /// the reply is finalized into an HttpResponse by the app's stream
+    /// handlers).
+    pub(crate) streams: HashMap<LiveId, ai::StructStream>,
 }
 impl GenController {
     /// Whether a generation queue (running or awaiting retrieval) targets path.
@@ -197,12 +203,17 @@ impl GenController {
             .unwrap_or_default();
         let ctype = crate::gen::card_type(&body);
         let (system, user) = generation_messages(section, &task.title, &task.context, ctype);
-        ai::chat_completions(
+        self.streams.insert(id, ai::StructStream::default());
+        ai::chat_completions_structured_stream(
             cx,
             id,
             ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
+            ai::StructuredRequest {
+                max_tokens: 358400,
+                json_mode: false,
+                thinking: None,
+            },
         );
     }
 
@@ -339,12 +350,17 @@ impl GenController {
             parent: parent.to_string(),
             selected: selected.to_string(),
         });
-        ai::chat_completions(
+        self.streams.insert(id, ai::StructStream::default());
+        ai::chat_completions_structured_stream(
             cx,
             id,
             ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
+            ai::StructuredRequest {
+                max_tokens: 358400,
+                json_mode: false,
+                thinking: None,
+            },
         );
     }
 
@@ -506,12 +522,17 @@ impl GenController {
             ctype,
             auto_attach,
         });
-        ai::chat_completions(
+        self.streams.insert(id, ai::StructStream::default());
+        ai::chat_completions_structured_stream(
             cx,
             id,
             ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
+            ai::StructuredRequest {
+                max_tokens: 358400,
+                json_mode: false,
+                thinking: None,
+            },
         );
     }
 
@@ -703,12 +724,17 @@ impl GenController {
             id,
             root: root_rel.to_string(),
         });
-        ai::chat_completions(
+        self.streams.insert(id, ai::StructStream::default());
+        ai::chat_completions_structured_stream(
             cx,
             id,
             ai_config,
             &[("system".to_string(), system), ("user".to_string(), user)],
-            358400,
+            ai::StructuredRequest {
+                max_tokens: 358400,
+                json_mode: false,
+                thinking: None,
+            },
         );
     }
 

@@ -27,6 +27,10 @@ const MAX_DIAG_ROUNDS: usize = 6;
 pub(crate) struct DiagController {
     pub(crate) ui: WidgetRef,
     pub(crate) diag_id: LiveId,
+    /// SSE accumulator for the in-flight diagnostic-question stream
+    /// (streaming keeps bytes flowing during long generations; the reply is
+    /// finalized into an HttpResponse by the app's stream handlers).
+    pub(crate) diag_stream: crate::ai::StructStream,
     pub(crate) diag_goal: String,
     /// Rel path of the route's root card (the menu card that started the
     /// plan); empty for the startup goal-input flow, where the route
@@ -287,7 +291,8 @@ impl DiagController {
             &[live_id!(content), live_id!(panel), live_id!(diag_view), live_id!(diag_btn_row)],
         )
         .set_visible(cx, false);
-        ai::chat_completions_structured(
+        self.diag_stream = ai::StructStream::default();
+        ai::chat_completions_structured_stream(
             cx,
             self.diag_id,
             ai_config,

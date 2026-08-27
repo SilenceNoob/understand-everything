@@ -17,6 +17,12 @@ pub(crate) struct QuizController {
     pub(crate) quiz_path: Option<String>,
     pub(crate) quiz_body: Option<String>,
     pub(crate) grade_id: LiveId,
+    /// SSE accumulator for the in-flight quiz-generation stream (streaming
+    /// keeps bytes flowing during long generations; the reply is finalized
+    /// into an HttpResponse by the app's stream handlers).
+    pub(crate) quiz_stream: ai::StructStream,
+    /// SSE accumulator for the in-flight grading stream.
+    pub(crate) grade_stream: ai::StructStream,
     /// One automatic format-repair retry per quiz generation.
     pub(crate) quiz_retried: bool,
     /// True once the endpoint rejected `response_format` (HTTP 400): fall
@@ -32,7 +38,7 @@ pub(crate) struct QuizController {
 }
 
 impl QuizController {
-    fn quiz_title(&self) -> String {
+    pub(crate) fn quiz_title(&self) -> String {
         self.quiz_path
             .as_deref()
             .and_then(|p| std::path::Path::new(p).file_stem())
@@ -55,7 +61,8 @@ impl QuizController {
             user.push_str(&format!("\n\n【格式修复要求】{hint}"));
         }
         self.quiz_id = LiveId::unique();
-        ai::chat_completions_structured(
+        self.quiz_stream = ai::StructStream::default();
+        ai::chat_completions_structured_stream(
             cx,
             self.quiz_id,
             ai_config,
@@ -189,7 +196,8 @@ impl QuizController {
             user.push_str(&format!("\n\n【格式修复要求】{hint}"));
         }
         self.grade_id = LiveId::unique();
-        ai::chat_completions_structured(
+        self.grade_stream = ai::StructStream::default();
+        ai::chat_completions_structured_stream(
             cx,
             self.grade_id,
             ai_config,

@@ -686,6 +686,17 @@ impl QuizPanelRef {
         }
     }
 
+    /// Refresh the loading status line with streaming progress; a no-op
+    /// unless the panel is in the loading state.
+    pub fn update_loading_progress(&self, cx: &mut Cx, text: &str) {
+        if let Some(mut w) = self.borrow_mut() {
+            if w.loading {
+                w.set_status(cx, text);
+                w.redraw(cx);
+            }
+        }
+    }
+
     pub fn show_error(&self, cx: &mut Cx, msg: &str) {
         if let Some(mut w) = self.borrow_mut() {
             w.quiz = None;

@@ -174,6 +174,36 @@ pub fn chat_completions_structured(
     send_chat_request(cx, request_id, config, url, payload.to_string(), false);
 }
 
+/// Streaming variant of `chat_completions_structured`: the same payload with
+/// `stream: true`. The reply arrives as SSE chunks (accumulated in a
+/// `StructStream`) and is finalized by the app's stream handlers — see
+/// `src/app/http.rs`. Long LLM requests must use this instead of the
+/// non-streaming form: streaming keeps bytes flowing while thinking models
+/// reason (idle-connection kills become unlikely), and the SSE terminator
+/// (`[DONE]`) lets the app salvage the reply even when the connection close
+/// trips a transport error (makepad's OpenSSL read loop reports a clean
+/// `close_notify` as "unknown OpenSSL error").
+pub fn chat_completions_structured_stream(
+    cx: &mut Cx,
+    request_id: LiveId,
+    config: &AIConfig,
+    messages: &[(String, String)],
+    options: StructuredRequest<'_>,
+) {
+    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let mut payload = serde_json::json!({
+        "model": config.model,
+        "messages": messages.iter().map(|(role, content)| serde_json::json!({"role": role, "content": content})).collect::<Vec<_>>(),
+        "max_tokens": options.max_tokens,
+        "stream": true,
+        (THINKING_PARAM.to_string()): options.thinking.unwrap_or(config.thinking.as_str()),
+    });
+    if options.json_mode {
+        payload["response_format"] = serde_json::json!({"type": "json_object"});
+    }
+    send_chat_request(cx, request_id, config, url, payload.to_string(), true);
+}
+
 /// Send a streaming chat/completions request. Raw SSE bytes arrive via
 /// `MatchEvent::handle_http_stream`, the final status via
 /// `handle_http_stream_complete` (both keyed by `request_id`).
@@ -432,6 +462,17 @@ impl ChunkDecoder {
         std::mem::take(&mut self.out)
     }
 
+    /// Flush bytes still held while the framing was undecided. A short tail
+    /// without any newline (e.g. a tiny error JSON body) never reaches the
+    /// 64-byte hold threshold, so it would otherwise be lost at stream end.
+    fn finish(&mut self) -> Vec<u8> {
+        if self.mode.is_none() {
+            self.mode = Some(false);
+            return std::mem::take(&mut self.size_buf);
+        }
+        Vec::new()
+    }
+
     /// Consume `bytes` as chunked framing, appending payload to `self.out`.
     fn process_chunked(&mut self, bytes: &[u8]) {
         let mut i = 0usize;
@@ -533,6 +574,14 @@ impl SseParser {
         String::from_utf8_lossy(&self.raw).into_owned()
     }
 
+    /// Finalize the stream: release bytes the chunk decoder still holds
+    /// into the raw buffer, so a short trailing body (e.g. an error JSON
+    /// with no trailing newline) stays recoverable.
+    pub fn finish(&mut self) {
+        let held = self.decoder.finish();
+        self.raw.extend_from_slice(&held);
+    }
+
     /// Feed a chunk; returns (content deltas, thinking deltas) extracted
     /// since the previous call.
     pub fn feed(&mut self, bytes: &[u8]) -> (Vec<String>, Vec<String>) {
@@ -588,6 +637,89 @@ impl SseParser {
             }
         }
         (content, thinking)
+    }
+}
+
+/// Accumulator for a streaming structured-chat reply: SSE bytes in, one
+/// synthesized non-streaming `HttpResponse` out, so the single-shot
+/// `handle_http_response` handlers (quiz/grade/diag/gen) keep working
+/// unchanged.
+#[derive(Default)]
+pub struct StructStream {
+    parser: SseParser,
+    content: String,
+    thinking: String,
+}
+
+impl StructStream {
+    /// Feed one `HttpStreamChunk` body; accumulates the content and thinking
+    /// deltas since the previous call.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        let (content, thinking) = self.parser.feed(bytes);
+        for delta in content {
+            self.content.push_str(&delta);
+        }
+        for delta in thinking {
+            self.thinking.push_str(&delta);
+        }
+    }
+
+    /// Characters of assistant content received so far (progress display).
+    pub fn content_chars(&self) -> usize {
+        self.content.chars().count()
+    }
+
+    /// True once the SSE terminator arrived: the stream is complete no
+    /// matter what the transport does afterwards.
+    pub fn saw_done(&self) -> bool {
+        self.parser.raw().contains("[DONE]")
+    }
+
+    /// Release any bytes the stream decoder still holds (call once the
+    /// stream ended, before deciding on salvage via `saw_done`).
+    pub fn finish(&mut self) {
+        self.parser.finish();
+    }
+
+    /// Synthesize the single-shot response shape the handlers expect.
+    /// `status` comes from `HttpStreamComplete`, or 200 when finalizing a
+    /// salvaged stream (terminal `HttpError` seen after `[DONE]`). A status
+    /// of 0 means the backend didn't report one (macOS streaming): success
+    /// is then judged by `[DONE]`, as in the chat/route paths.
+    pub fn into_response(mut self, status: u16) -> HttpResponse {
+        self.parser.finish();
+        if status == 200 || (status == 0 && self.saw_done()) {
+            // The same envelope the non-streaming endpoint returns, so
+            // response_message_parts / response_structured_text /
+            // response_debug_preview all keep working (including the
+            // empty-content → reasoning_content fallback).
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": self.content,
+                        "reasoning_content": self.thinking,
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+            .to_string();
+            HttpResponse::new(
+                LiveId::empty(),
+                200,
+                Default::default(),
+                Some(body.into_bytes()),
+            )
+        } else {
+            // Non-200: the body was plain JSON (not SSE); the parser's raw
+            // buffer holds it verbatim for body_error_message and the
+            // 400/422 response_format fallback retries.
+            HttpResponse::new(
+                LiveId::empty(),
+                status,
+                Default::default(),
+                Some(self.parser.raw().into_bytes()),
+            )
+        }
     }
 }
 
@@ -769,5 +901,71 @@ mod tests {
             }
         }
         assert_eq!(joined, "{\"goal_input\":\"...\"}");
+    }
+
+    #[test]
+    fn struct_stream_synthesizes_envelope_roundtrip() {
+        // Byte-at-a-time feeding exercises every split boundary; the
+        // synthesized response must parse back through the same helpers the
+        // single-shot handlers use.
+        let sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思考\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"q\\\":1}\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        let mut s = StructStream::default();
+        for i in 0..sse.len() {
+            s.feed(sse.as_bytes().get(i..=i).unwrap());
+        }
+        assert!(s.saw_done());
+        let resp = s.into_response(200);
+        assert_eq!(resp.status_code, 200);
+        let (content, reasoning) = response_message_parts(&resp).unwrap();
+        assert_eq!(content, "{\"q\":1}");
+        assert_eq!(reasoning, "思考");
+    }
+
+    #[test]
+    fn struct_stream_normalizes_macos_zero_status() {
+        let mut s = StructStream::default();
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n");
+        assert_eq!(s.into_response(0).status_code, 200);
+    }
+
+    #[test]
+    fn struct_stream_keeps_error_body_and_status() {
+        // A non-200 reply arrives as plain JSON (no SSE framing): the raw
+        // buffer must carry it verbatim so the 400/422 fallback retries and
+        // body_error_message keep working.
+        let mut s = StructStream::default();
+        s.feed(b"{\"error\":{\"message\":\"bad key\"}}");
+        assert!(!s.saw_done());
+        let resp = s.into_response(401);
+        assert_eq!(resp.status_code, 401);
+        let body = resp.get_string_body().unwrap();
+        assert_eq!(
+            body_error_message(&body).as_deref(),
+            Some("bad key")
+        );
+    }
+
+    #[test]
+    fn sse_parser_finish_releases_short_held_tail() {
+        // A tiny body with no newline never reaches the chunk decoder's
+        // 64-byte hold threshold and stays held; finish() must release it
+        // into raw so short error bodies stay recoverable.
+        let mut p = SseParser::new();
+        p.feed(b"{\"error\":{\"message\":\"bad key\"}}");
+        assert!(!p.raw().contains("bad key"));
+        p.finish();
+        assert!(p.raw().contains("bad key"));
+    }
+
+    #[test]
+    fn struct_stream_empty_content_falls_back_to_reasoning() {
+        // A thinking model can emit the final JSON inside reasoning_content;
+        // the existing structured-text fallback must still apply.
+        let mut s = StructStream::default();
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"[1,2]\"}}]}\n\ndata: [DONE]\n\n");
+        let resp = s.into_response(0);
+        assert_eq!(response_structured_text(&resp), "[1,2]");
     }
 }

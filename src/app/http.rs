@@ -67,6 +67,19 @@ impl MatchEvent for App {
     }
 
     fn handle_http_request_error(&mut self, cx: &mut Cx, request_id: LiveId, err: &HttpError) {
+        // A streaming structured request whose SSE stream already saw the
+        // protocol terminator (`[DONE]`) is complete: makepad's OpenSSL read
+        // loop reports a peer's clean close_notify as "unknown OpenSSL
+        // error" AFTER the full body has arrived — salvage the reply
+        // instead of failing the request. A stream without [DONE] is a real
+        // truncation and falls through to the error arms below.
+        if let Some(mut stream) = self.take_struct_stream(request_id) {
+            stream.finish();
+            if let Some(response) = stream.saw_done().then(|| stream.into_response(200)) {
+                self.handle_http_response(cx, request_id, &response);
+                return;
+            }
+        }
         if request_id == self.test_id && self.testing {
             self.testing = false;
             self.popup_child(
@@ -161,6 +174,28 @@ impl MatchEvent for App {
             }
             return;
         }
+        // Streaming structured requests (quiz/grade/diag/gen): accumulate
+        // the SSE deltas; the finalize happens on completion (or on a
+        // post-[DONE] transport error) in the handlers below.
+        if self.struct_stream_mut(request_id).is_some() {
+            let mut received = 0;
+            if let Some(bytes) = data.body() {
+                let stream = self.struct_stream_mut(request_id).unwrap();
+                stream.feed(bytes);
+                received = stream.content_chars();
+            }
+            if request_id == self.quiz.quiz_id
+                && self.quiz.quiz_id != LiveId::empty()
+                && received > 0
+            {
+                let title = self.quiz.quiz_title();
+                self.quiz_panel().update_loading_progress(
+                    cx,
+                    &format!("{title}: 出题中… 已生成 {received} 字"),
+                );
+            }
+            return;
+        }
         if request_id != self.chat.chat_id || !self.chat.chat_pending {
             return;
         }
@@ -196,6 +231,15 @@ impl MatchEvent for App {
             }
             return;
         }
+        // Streaming structured requests (quiz/grade/diag/gen): synthesize
+        // the accumulated SSE back into a single-shot HttpResponse and reuse
+        // the regular response dispatch, so all existing handlers (JSON
+        // parsing, 400/422 fallback retries, repair retries) keep working.
+        if let Some(stream) = self.take_struct_stream(request_id) {
+            let response = stream.into_response(data.status_code);
+            self.handle_http_response(cx, request_id, &response);
+            return;
+        }
         if request_id != self.chat.chat_id || !self.chat.chat_pending {
             return;
         }
@@ -222,6 +266,35 @@ impl MatchEvent for App {
         } else {
             self.chat.chat_think.clear();
             self.push_chat_msg(cx, "assistant", &content);
+        }
+    }
+}
+
+impl App {
+    /// The StructStream accumulating a streaming structured request
+    /// (quiz/grade/diag/gen), when that id is in flight.
+    fn struct_stream_mut(&mut self, request_id: LiveId) -> Option<&mut ai::StructStream> {
+        if request_id == self.quiz.quiz_id && self.quiz.quiz_id != LiveId::empty() {
+            Some(&mut self.quiz.quiz_stream)
+        } else if request_id == self.quiz.grade_id && self.quiz.grade_id != LiveId::empty() {
+            Some(&mut self.quiz.grade_stream)
+        } else if request_id == self.diag.diag_id && self.diag.diag_id != LiveId::empty() {
+            Some(&mut self.diag.diag_stream)
+        } else {
+            self.gen.streams.get_mut(&request_id)
+        }
+    }
+
+    /// Take the finished accumulator for request_id, if any.
+    fn take_struct_stream(&mut self, request_id: LiveId) -> Option<ai::StructStream> {
+        if request_id == self.quiz.quiz_id && self.quiz.quiz_id != LiveId::empty() {
+            Some(std::mem::take(&mut self.quiz.quiz_stream))
+        } else if request_id == self.quiz.grade_id && self.quiz.grade_id != LiveId::empty() {
+            Some(std::mem::take(&mut self.quiz.grade_stream))
+        } else if request_id == self.diag.diag_id && self.diag.diag_id != LiveId::empty() {
+            Some(std::mem::take(&mut self.diag.diag_stream))
+        } else {
+            self.gen.streams.remove(&request_id)
         }
     }
 }
