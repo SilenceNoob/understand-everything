@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120">
+  <rect width="320" height="120" rx="12" fill="#232834"/>
+  <text x="20" y="60" font-size="28" fill="#e6e9f0" font-family="sans-serif">MD Canvas Image</text>
+  <circle cx="270" cy="60" r="30" fill="#4c6ef5"/>
+</svg>
