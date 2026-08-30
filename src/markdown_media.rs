@@ -698,18 +698,25 @@ impl MarkdownMedia {
                 }
                 // Inline code
                 MdEvent::Code(text) => {
-                    // Inline code is likewise opaque: `==` inside backticks is
-                    // code, and a mark opened before the code span must not
-                    // close after it (which would reorder the highlight).
-                    flush_pending(tf, cx, &mut self.pill, &mut self.mark);
-                    const FIXED_FONT_SIZE_SCALE: f64 = 0.85;
-                    tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
-                    tf.fixed.push();
-                    tf.inline_code.push();
-                    tf.draw_text(cx, text);
-                    tf.font_sizes.pop();
-                    tf.fixed.pop();
-                    tf.inline_code.pop();
+                    // Inline code stays opaque to the custom `==`/pill
+                    // markers: merge it into a pending pill/mark so the
+                    // badge/highlight stays continuous and a mark's closing
+                    // `==` still pairs (flushing here would truncate the
+                    // background and make the closer open a new mark).
+                    if let Some((_, pill_text)) = &mut self.pill {
+                        pill_text.push_str(text);
+                    } else if let Some(mark) = &mut self.mark {
+                        mark.push_str(text);
+                    } else {
+                        const FIXED_FONT_SIZE_SCALE: f64 = 0.85;
+                        tf.push_size_rel_scale(FIXED_FONT_SIZE_SCALE);
+                        tf.fixed.push();
+                        tf.inline_code.push();
+                        tf.draw_text(cx, text);
+                        tf.font_sizes.pop();
+                        tf.fixed.pop();
+                        tf.inline_code.pop();
+                    }
                 }
                 // Inline math ($...$)
                 MdEvent::InlineMath(text) => {
