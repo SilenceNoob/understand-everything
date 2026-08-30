@@ -17,6 +17,21 @@ pub struct RetrieveResult {
     pub hits: Vec<RetrievedChunk>,
 }
 
+/// Handle for one queued/in-flight retrieval: poll `rx` from the UI timer;
+/// `cancel()` when the waiter gives up (timeout, user abort, dropped
+/// prefetch) so the worker skips the remaining embed/rerank forwards
+/// instead of burning CPU on a result nobody reads.
+pub struct RetrievalHandle {
+    pub rx: mpsc::Receiver<RetrieveResult>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RetrievalHandle {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The published index plus its inverted index. Bm25Index is O(all tokens) to
 /// build, so it is built once per index change and shared via Arc; readers
 /// take both under one short read lock. `map_rel` distinguishes the current
@@ -43,7 +58,7 @@ pub struct RagService {
     shared: Arc<RwLock<SharedState>>,
     indexing: Arc<AtomicBool>,
     index_tx: mpsc::Sender<String>,
-    retr_tx: mpsc::Sender<(String, mpsc::Sender<RetrieveResult>)>,
+    retr_tx: mpsc::Sender<(String, mpsc::Sender<RetrieveResult>, Arc<AtomicBool>)>,
 }
 
 impl RagService {
@@ -56,7 +71,8 @@ impl RagService {
         }));
         let indexing = Arc::new(AtomicBool::new(false));
         let (index_tx, index_rx) = mpsc::channel::<String>();
-        let (retr_tx, retr_rx) = mpsc::channel::<(String, mpsc::Sender<RetrieveResult>)>();
+        let (retr_tx, retr_rx) =
+            mpsc::channel::<(String, mpsc::Sender<RetrieveResult>, Arc<AtomicBool>)>();
 
         {
             let slot = slot.clone();
@@ -74,6 +90,13 @@ impl RagService {
                 // fall back to BM25 while it loads).
                 models.warm_reranker();
                 while let Ok(map_rel) = index_rx.recv() {
+                    // Collapse bursts: while a pass runs, the UI's periodic
+                    // resyncs pile up; every pass re-snapshots from disk, so
+                    // only the newest request matters.
+                    let mut map_rel = map_rel;
+                    while let Ok(later) = index_rx.try_recv() {
+                        map_rel = later;
+                    }
                     // A panic (e.g. candle OOM) must not kill the worker or
                     // leave `indexing` stuck true; the index swap only
                     // happens after a fully-built local index, so a partial
@@ -125,14 +148,14 @@ impl RagService {
             let slot = slot.clone();
             let shared = shared.clone();
             thread::spawn(move || {
-                while let Ok((query, reply)) = retr_rx.recv() {
+                while let Ok((query, reply, cancel)) = retr_rx.recv() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let Some(models) = slot.get() else {
                             return;
                         };
                         let (chunks, bm25) = read_state(&shared);
                         let hits = if models.embedding_ready() {
-                            retrieve_hybrid(&chunks, &bm25, models, &query, CONTEXT_HITS)
+                            retrieve_hybrid(&chunks, &bm25, models, &query, CONTEXT_HITS, &cancel)
                         } else {
                             retrieve(&chunks, &bm25, &query, CONTEXT_HITS)
                         };
@@ -167,12 +190,14 @@ impl RagService {
         let _ = self.index_tx.send(map_rel.to_string());
     }
 
-    /// Enqueue a retrieval; the UI polls the returned receiver (from its
-    /// timer, never blocking the main thread).
-    pub fn retrieve(&self, query: &str) -> mpsc::Receiver<RetrieveResult> {
+    /// Enqueue a retrieval; the UI polls the returned handle's receiver from
+    /// its timer (never blocking the main thread) and cancels it when it
+    /// stops caring (timeout/abort), skipping the queued-but-expensive work.
+    pub fn retrieve(&self, query: &str) -> RetrievalHandle {
         let (tx, rx) = mpsc::channel();
-        let _ = self.retr_tx.send((query.to_string(), tx));
-        rx
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _ = self.retr_tx.send((query.to_string(), tx, cancel.clone()));
+        RetrievalHandle { rx, cancel }
     }
 
     /// Synchronous BM25-only search against the current index (µs; reuses

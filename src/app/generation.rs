@@ -18,7 +18,7 @@ pub(crate) struct GenWait {
     /// The sections to generate, in order (7 items for "所有").
     sections: Vec<GenSection>,
     title: String,
-    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    retr: rag::service::RetrievalHandle,
     fallback: String,
     started: Instant,
 }
@@ -141,12 +141,12 @@ impl GenController {
         let fallback = rag_bm25_context(rag, &title);
         let upgradeable = rag.is_some_and(|r| r.models().is_some_and(|m| m.embedding_ready()));
         if upgradeable {
-            let rx = rag.unwrap().retrieve(&title);
+            let retr = rag.unwrap().retrieve(&title);
             self.gen_waits.push(GenWait {
                 path: path.to_string(),
                 sections,
                 title: title.clone(),
-                rx,
+                retr,
                 fallback,
                 started: Instant::now(),
             });
@@ -821,11 +821,14 @@ impl GenController {
         let now = Instant::now();
         let mut ready: Vec<(String, Vec<GenSection>, String, String)> = Vec::new();
         self.gen_waits.retain(|wait| {
-            let hits = match wait.rx.try_recv() {
+            let hits = match wait.retr.rx.try_recv() {
                 Ok(r) if r.query == wait.title => Some(r.hits),
                 Ok(_) => None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                        // The generation proceeds on the BM25 fallback; stop
+                        // the worker from finishing a result nobody reads.
+                        wait.retr.cancel();
                         Some(Vec::new())
                     } else {
                         None

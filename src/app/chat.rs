@@ -15,7 +15,7 @@ use crate::App;
 /// timeout falls back to the BM25 context computed at send time).
 pub(crate) struct RagWait {
     query: String,
-    rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    retr: rag::service::RetrievalHandle,
     fallback: String,
     started: Instant,
 }
@@ -328,10 +328,10 @@ impl ChatController {
         let mut defer = false;
         if let Some(rag) = rag {
             if upgradeable {
-                let rx = rag.retrieve(text);
+                let retr = rag.retrieve(text);
                 self.rag_wait = Some(RagWait {
                     query: text.to_string(),
-                    rx,
+                    retr,
                     fallback: ctx.clone(),
                     started: Instant::now(),
                 });
@@ -392,11 +392,14 @@ impl ChatController {
         let Some(wait) = &mut self.rag_wait else {
             return;
         };
-        let hits = match wait.rx.try_recv() {
+        let hits = match wait.retr.rx.try_recv() {
             Ok(r) if r.query == wait.query => Some(r.hits),
             Ok(_) => None,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                    // Chat fires on the BM25 fallback; stop the worker from
+                    // finishing a result nobody reads.
+                    wait.retr.cancel();
                     Some(Vec::new())
                 } else {
                     None
@@ -422,6 +425,9 @@ impl ChatController {
         if self.chat_pending {
             cx.cancel_http_request(self.chat_id);
         }
+        if let Some(wait) = &self.rag_wait {
+            wait.retr.cancel();
+        }
         self.rag_wait = None;
         self.chat_history.clear();
         self.chat_extra.clear();
@@ -438,6 +444,9 @@ impl ChatController {
             return;
         }
         self.chat_pending = false;
+        if let Some(wait) = &self.rag_wait {
+            wait.retr.cancel();
+        }
         self.rag_wait = None;
         cx.cancel_http_request(self.chat_id);
         if !self.chat_buf.is_empty() {

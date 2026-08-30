@@ -216,14 +216,18 @@ impl DiagController {
         // so by the time the interview ends the result is ready and the
         // route request fires immediately. Only when the current map's index
         // actually has chunks (empty index would return no hits anyway).
-        route.route_prefetch = None;
+        // A stale prefetch from an earlier interview would never be adopted;
+        // cancel its retrieval instead of letting it burn CPU.
+        if let Some(p) = route.route_prefetch.take() {
+            p.retr.cancel();
+        }
         let map_file = self.ui.mind_map(cx, ids!(mindmap)).current_map_file();
         if let (Some(rag), Some(map)) = (rag, map_file) {
             if rag.models().is_some_and(|m| m.embedding_ready()) && rag.has_chunks_for(&map) {
-                let rx = rag.retrieve(&self.diag_goal);
+                let retr = rag.retrieve(&self.diag_goal);
                 route.route_prefetch = Some(RoutePrefetch {
                     goal: self.diag_goal.clone(),
-                    rx,
+                    retr,
                     started: Instant::now(),
                 });
             }

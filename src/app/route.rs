@@ -17,7 +17,7 @@ pub(crate) struct RouteWait {
     pub(crate) goal: String,
     /// Diagnostic transcript passed through to the route planner.
     pub(crate) diag: String,
-    pub(crate) rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    pub(crate) retr: rag::service::RetrievalHandle,
     pub(crate) fallback: String,
     pub(crate) started: Instant,
 }
@@ -27,7 +27,7 @@ pub(crate) struct RouteWait {
 /// by `start_route_plan` when the goal matches, dropped otherwise.
 pub(crate) struct RoutePrefetch {
     pub(crate) goal: String,
-    pub(crate) rx: std::sync::mpsc::Receiver<rag::service::RetrieveResult>,
+    pub(crate) retr: rag::service::RetrievalHandle,
     pub(crate) started: Instant,
 }
 
@@ -145,26 +145,31 @@ impl RouteController {
             r.models().is_some_and(|m| m.embedding_ready()) && r.has_chunks_for(&map_file)
         });
         // A prefetch fired at diagnostic start (goal matches) skips the
-        // retrieval wait entirely; a stale/goalless prefetch is dropped.
+        // retrieval wait entirely; a stale/goalless prefetch is cancelled
+        // and dropped.
         let prefetch = match self.route_prefetch.take() {
             Some(p) if p.goal == goal => Some(p),
-            _ => None,
+            Some(p) => {
+                p.retr.cancel();
+                None
+            }
+            None => None,
         };
         if let Some(p) = prefetch {
             self.route_wait = Some(RouteWait {
                 goal: goal.to_string(),
                 diag: diagnostics.to_string(),
-                rx: p.rx,
+                retr: p.retr,
                 fallback,
                 started: p.started,
             });
             show_toast(&self.ui, toast_until, cx, "正在检索参考资料…");
         } else if upgradeable {
-            let rx = rag.unwrap().retrieve(goal);
+            let retr = rag.unwrap().retrieve(goal);
             self.route_wait = Some(RouteWait {
                 goal: goal.to_string(),
                 diag: diagnostics.to_string(),
-                rx,
+                retr,
                 fallback,
                 started: Instant::now(),
             });
@@ -229,6 +234,9 @@ impl RouteController {
 
     /// Abort route planning and surface `msg` as a toast.
     pub(crate) fn abort_route(&mut self, cx: &mut Cx, msg: String, toast_until: &mut Option<Instant>) {
+        if let Some(wait) = &self.route_wait {
+            wait.retr.cancel();
+        }
         self.route_wait = None;
         self.route_id = LiveId::empty();
         self.ui.mind_map(cx, ids!(mindmap)).set_route_planning(cx, false);
@@ -369,11 +377,14 @@ impl RouteController {
     ) {
         let Some(wait) = &mut self.route_wait else { return };
         let now = Instant::now();
-        let hits = match wait.rx.try_recv() {
+        let hits = match wait.retr.rx.try_recv() {
             Ok(r) if r.query == wait.goal => Some(r.hits),
             Ok(_) => None,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if now.duration_since(wait.started) > RAG_RETRIEVE_TIMEOUT {
+                    // The plan fires on the BM25 fallback; stop the worker
+                    // from finishing a result nobody reads.
+                    wait.retr.cancel();
                     Some(Vec::new())
                 } else {
                     None

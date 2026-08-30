@@ -178,16 +178,19 @@ impl MatchEvent for App {
         // the SSE deltas; the finalize happens on completion (or on a
         // post-[DONE] transport error) in the handlers below.
         if self.struct_stream_mut(request_id).is_some() {
+            let is_quiz = request_id == self.quiz.quiz_id && self.quiz.quiz_id != LiveId::empty();
             let mut received = 0;
             if let Some(bytes) = data.body() {
                 let stream = self.struct_stream_mut(request_id).unwrap();
                 stream.feed(bytes);
-                received = stream.content_chars();
+                // content_chars() is O(full accumulated text); only the quiz
+                // progress label consumes it, so skip the scan for the other
+                // structured streams (gen/diag/grade) that never show it.
+                if is_quiz {
+                    received = stream.content_chars();
+                }
             }
-            if request_id == self.quiz.quiz_id
-                && self.quiz.quiz_id != LiveId::empty()
-                && received > 0
-            {
+            if received > 0 {
                 let title = self.quiz.quiz_title();
                 self.quiz_panel().update_loading_progress(
                     cx,

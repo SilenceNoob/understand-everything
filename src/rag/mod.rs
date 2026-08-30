@@ -99,6 +99,23 @@ impl RagIndex {
     }
 
     fn replace_source(&mut self, key: String, fp: u64, chunks: Vec<Chunk>) {
+        // A generation rewrites the same card file once per section; carry
+        // old vectors over to byte-identical chunks so each pass only
+        // embeds the actually-new tail instead of the whole card.
+        let old: HashMap<&str, &Vec<f32>> = self
+            .chunks
+            .iter()
+            .filter(|c| c.source.key() == key && !c.vector.is_empty())
+            .map(|c| (c.text.as_str(), &c.vector))
+            .collect();
+        let mut chunks = chunks;
+        for c in chunks.iter_mut() {
+            if c.vector.is_empty() {
+                if let Some(v) = old.get(c.text.as_str()) {
+                    c.vector = (*v).clone();
+                }
+            }
+        }
         self.chunks.retain(|c| c.source.key() != key);
         self.chunks.extend(chunks);
         self.fingerprints.insert(key, fp);
@@ -169,35 +186,44 @@ const RERANK_DOC_TOKENS: usize = 256;
 /// Full pipeline: dense cosine Top-5 ∪ BM25 Top-5, fused with RRF (rank-based,
 /// so the two incomparable score scales never fight), rerank the top 5, return
 /// top-k. Every step degrades: query embed failure skips dense, rerank
-/// failure keeps the pre-rerank score, missing models → pure BM25.
+/// failure keeps the pre-rerank score, missing models → pure BM25. `cancel`
+/// (set when the waiter gives up) skips the remaining expensive forwards —
+/// BM25 stays µs-cheap, so it runs unconditionally.
 pub fn retrieve_hybrid(
     chunks: &[Chunk],
     bm25: &Bm25Index,
     models: &model::Models,
     query: &str,
     top_k: usize,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Vec<RetrievedChunk> {
+    use std::sync::atomic::Ordering;
     const RRF_K: f32 = 60.0;
     let mut rrf: HashMap<usize, f32> = HashMap::new();
     for (rank, (i, _)) in bm25.search(query, RERANK_CANDIDATES).into_iter().enumerate() {
         *rrf.entry(i).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
     }
-    if let Ok(q) = models.embed(query, true) {
-        let mut dense: Vec<(usize, f32)> = chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.vector.is_empty())
-            .map(|(i, c)| (i, c.vector.iter().zip(&q).map(|(a, b)| a * b).sum()))
-            .collect();
-        dense.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (rank, (i, _)) in dense.into_iter().take(RERANK_CANDIDATES).enumerate() {
-            *rrf.entry(i).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+    if !cancel.load(Ordering::Relaxed) {
+        if let Ok(q) = models.embed(query, true) {
+            let mut dense: Vec<(usize, f32)> = chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.vector.is_empty())
+                .map(|(i, c)| (i, c.vector.iter().zip(&q).map(|(a, b)| a * b).sum()))
+                .collect();
+            dense.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (rank, (i, _)) in dense.into_iter().take(RERANK_CANDIDATES).enumerate() {
+                *rrf.entry(i).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+            }
         }
     }
     let mut cands: Vec<(usize, f32)> = rrf.into_iter().collect();
     cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     cands.truncate(RERANK_CANDIDATES);
     for (i, s) in cands.iter_mut() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let doc = model::truncate_tokens(&chunks[*i].text, RERANK_DOC_TOKENS);
         if let Ok(r) = models.rerank(query, &doc) {
             *s = r;
@@ -256,6 +282,46 @@ mod tests {
         // removed doc: chunks gone
         idx.sync_sources(&[]);
         assert!(idx.chunks.is_empty());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn replace_source_reuses_vectors_for_identical_chunks() {
+        // Sections big enough to stay above the merge threshold, so the
+        // rewritten prefix chunks are byte-identical across the edit.
+        let sec_a = format!("# A\n\n{}\n", "内容甲的说明句子。".repeat(120));
+        let sec_b = format!("## B\n\n{}\n", "内容乙的说明句子。".repeat(120));
+        let p = tmp_doc("reuse.md", &sec_a);
+        let src = |p: std::path::PathBuf| vec![(ChunkSource::RefDoc(p.clone()), p)];
+        let mut idx = RagIndex::default();
+        idx.sync_sources(&src(p.clone()));
+        assert!(!idx.chunks.is_empty());
+        // Simulate a completed embedding pass.
+        for c in idx.chunks.iter_mut() {
+            c.vector = vec![1.0];
+        }
+        let old_texts: Vec<String> = idx.chunks.iter().map(|c| c.text.clone()).collect();
+
+        // Append a section; the A chunks re-chunk to identical text.
+        std::fs::write(&p, format!("{sec_a}\n{sec_b}")).unwrap();
+        idx.sync_sources(&src(p.clone()));
+
+        let reused = idx
+            .chunks
+            .iter()
+            .filter(|c| c.vector == vec![1.0])
+            .count();
+        let fresh = idx.chunks.iter().filter(|c| c.vector.is_empty()).count();
+        assert!(reused >= 1, "identical prefix chunks must keep vectors");
+        assert!(
+            old_texts.len() + reused <= idx.chunks.len() && fresh >= 1,
+            "appended section must start unembedded (reused={reused}, fresh={fresh})"
+        );
+        for c in idx.chunks.iter() {
+            if old_texts.iter().any(|t| t == &c.text) {
+                assert_eq!(c.vector, vec![1.0], "unchanged text must reuse: {}", c.heading);
+            }
+        }
         std::fs::remove_file(&p).ok();
     }
 
@@ -386,7 +452,7 @@ mod tests {
             println!("  [{:.3}] {}", h.score, h.heading);
         }
         let t = Instant::now();
-        let hits = retrieve_hybrid(&chunks, &bm25, &models, query, 5);
+        let hits = retrieve_hybrid(&chunks, &bm25, &models, query, 5, &Default::default());
         let dt = t.elapsed();
         println!("hybrid({query}) → {:.1}s", dt.as_secs_f32());
         for h in &hits {
