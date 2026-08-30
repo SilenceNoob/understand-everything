@@ -607,6 +607,9 @@ fn stage_document(src: &std::path::Path) -> (String, bool) {
     });
     let out = converted_path(src);
     if is_md {
+        // docs/ may not exist yet (fresh data dir); don't depend on other
+        // code paths having created it.
+        let _ = std::fs::create_dir_all(out.parent().unwrap());
         return match std::fs::copy(src, &out) {
             Ok(_) => (out.to_string_lossy().into_owned(), false),
             Err(e) => {
